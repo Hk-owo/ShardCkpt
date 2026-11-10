@@ -27,10 +27,15 @@ class UnsupportedDeviceError(CheckpointError):
     """设备没有可用的 backend（例如请求了 cuda 但既无 GPU 也无 mock）。"""
 
 
+class PlanError(CheckpointError):
+    """读写计划不自洽：分片重叠、覆盖不全、越界、布局与索引对不上。"""
+
+
 __all__ = [
     "CheckpointError",
     "ChecksumError",
     "FormatError",
     "MissingTensorError",
+    "PlanError",
     "UnsupportedDeviceError",
 ]

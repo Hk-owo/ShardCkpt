@@ -20,6 +20,16 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from async_.machine import (
+    BufferPool,
+    MachineStats,
+    Snapshot,
+    SnapshotError,
+    SnapshotManager,
+    SnapshotState,
+    Trigger,
+    TriggerDecision,
+)
 from core import UnsupportedDeviceError
 from core.metadata import Device, numpy_dtype
 
@@ -220,11 +230,8 @@ class Tensor:
         return self._buffer.nbytes
 
     def tobytes(self) -> bytes:
-        """device -> host 的原始字节拷贝。"""
-        host = bytearray(self.nbytes)
-        self._backend.copy_d2h(memoryview(host), self._buffer)
-        self._backend.synchronize()
-        return bytes(host)
+        """device -> host 的原始字节拷贝（走 ``copy_to_host``，与搬运算子同一路径）。"""
+        return copy_to_host(self._buffer, device=self._device, backend=self._backend)
 
     def numpy(self) -> np.ndarray:
         """返回 host 上的数组副本（可写），不共享 device 内存。"""
@@ -237,9 +244,7 @@ class Tensor:
         if target == self._device:
             return self
 
-        host = bytearray(self.nbytes)
-        self._backend.copy_d2h(memoryview(host), self._buffer)
-        self._backend.synchronize()
+        host = copy_to_host(self._buffer, device=self._device, backend=self._backend)
 
         dst_backend = get_backend(target)
         dst_buffer = dst_backend.allocate(self.nbytes)
@@ -268,12 +273,24 @@ class Tensor:
 
 __all__ = [
     "BackendStats",
+    "BufferPool",
     "CpuBackend",
     "DeviceBackend",
+    "MachineStats",
     "MockCudaBackend",
+    "Snapshot",
+    "SnapshotError",
+    "SnapshotManager",
+    "SnapshotState",
     "Tensor",
+    "Trigger",
+    "TriggerDecision",
     "available_device_types",
+    "copy_to_host",
     "get_backend",
     "register_backend",
     "reset_registry",
 ]
+
+# 放在文件末尾导入：d2h 依赖本模块的 get_backend，提前导入会撞上未初始化的循环。
+from async_.d2h import copy_to_host  # noqa: E402,F401
