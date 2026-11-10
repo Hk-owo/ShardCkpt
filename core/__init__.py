@@ -31,11 +31,21 @@ class PlanError(CheckpointError):
     """读写计划不自洽：分片重叠、覆盖不全、越界、布局与索引对不上。"""
 
 
+class PoolError(CheckpointError):
+    """buffer 池的失败基类：重复归还、关闭后再借等。"""
+
+
+class PoolExhaustedError(PoolError):
+    """池里没有可用块且无法扩容：等不到归还、等待超时，或已达容量上限。"""
+
+
 __all__ = [
     "CheckpointError",
     "ChecksumError",
     "FormatError",
     "MissingTensorError",
     "PlanError",
+    "PoolError",
+    "PoolExhaustedError",
     "UnsupportedDeviceError",
 ]

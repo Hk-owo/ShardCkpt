@@ -11,13 +11,18 @@ from typing import TYPE_CHECKING, Any
 from storage.base import ObjectNotFoundError, StorageBackend, StorageError
 
 if TYPE_CHECKING:  # pragma: no cover - 仅用于类型检查
+    from storage.local import LocalStorage
     from storage.object import S3Config, S3Storage
 
-_LAZY = {"S3Config", "S3Storage"}
+_LAZY = {"LocalStorage", "S3Config", "S3Storage"}
 
 
 def __getattr__(name: str) -> Any:
     if name in _LAZY:
+        if name == "LocalStorage":
+            from storage import local as _local
+
+            return _local.LocalStorage
         from storage import object as _object
 
         return getattr(_object, name)
@@ -25,6 +30,7 @@ def __getattr__(name: str) -> Any:
 
 
 __all__ = [
+    "LocalStorage",
     "ObjectNotFoundError",
     "S3Config",
     "S3Storage",

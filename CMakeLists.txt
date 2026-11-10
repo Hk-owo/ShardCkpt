@@ -10,6 +10,7 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 option(CKPT_BUILD_TESTS "构建 C++ 单元测试" ON)
+option(CKPT_BUILD_PYTHON "构建 Python 扩展 ckpt_native（需要 pybind11）" ON)
 
 find_package(Threads REQUIRED)
 
@@ -37,4 +38,37 @@ if(CKPT_BUILD_TESTS)
   add_executable(ckpt_local_file_test tests/cpp/local_file_test.cpp)
   target_link_libraries(ckpt_local_file_test PRIVATE ckpt_core)
   add_test(NAME ckpt_local_file_test COMMAND ckpt_local_file_test)
+endif()
+
+# --- Python 扩展 -------------------------------------------------------------
+#
+# ckpt_native 是 ckpt_core 的薄包装：只做异常映射、GIL 释放、buffer 零拷贝和
+# 线程归属检查。构建期依赖 pybind11（不进 requirements.txt）：
+#
+#   uv pip install --python .venv/bin/python pybind11
+#   cmake -S . -B build -G Ninja \
+#         -DPython3_EXECUTABLE=.venv/bin/python \
+#         -Dpybind11_DIR=$(uv run --python .venv/bin/python python -m pybind11 --cmakedir)
+#
+# 必须显式给 Python3_EXECUTABLE：否则 CMake 可能找到系统里的另一个 python（版本
+# 不同会编出 ABI 对不上的 .so，导入时报 "compiled with ... but ... is required"）。
+#
+# 产物落在 build/python/ckpt_native*.so，native/__init__.py 负责把它挂上 sys.path。
+
+if(CKPT_BUILD_PYTHON)
+  find_package(Python3 COMPONENTS Interpreter Development.Module)
+  find_package(pybind11 CONFIG)
+  if(NOT Python3_FOUND OR NOT pybind11_FOUND)
+    message(FATAL_ERROR
+      "构建 ckpt_native 需要 Python3 开发头文件与 pybind11。\n"
+      "  uv pip install --python .venv/bin/python pybind11\n"
+      "  cmake ... -DPython3_EXECUTABLE=.venv/bin/python \\\n"
+      "        -Dpybind11_DIR=$(uv run --python .venv/bin/python python -m pybind11 --cmakedir)\n"
+      "只想构建 C++ 部分可以加 -DCKPT_BUILD_PYTHON=OFF")
+  endif()
+
+  pybind11_add_module(ckpt_native MODULE bindings/python.cpp)
+  target_link_libraries(ckpt_native PRIVATE ckpt_core)
+  set_target_properties(ckpt_native PROPERTIES
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/python")
 endif()

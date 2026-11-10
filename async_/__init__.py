@@ -17,6 +17,7 @@ from __future__ import annotations
 import abc
 import zlib
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 
@@ -29,6 +30,13 @@ from async_.machine import (
     SnapshotState,
     Trigger,
     TriggerDecision,
+)
+from async_.pinned import (
+    DEFAULT_CHUNK_BYTES,
+    PinnedBuffer,
+    PinnedBufferPool,
+    PoolStats,
+    aligned_allocator,
 )
 from core import UnsupportedDeviceError
 from core.metadata import Device, numpy_dtype
@@ -233,6 +241,16 @@ class Tensor:
         """device -> host 的原始字节拷贝（走 ``copy_to_host``，与搬运算子同一路径）。"""
         return copy_to_host(self._buffer, device=self._device, backend=self._backend)
 
+    def copy_to(self, buffer: Any, *, offset: int = 0) -> int:
+        """把整块数据 D2H 到调用方给的 host buffer（从 ``offset`` 起），返回字节数。
+
+        与 ``tobytes()`` 走同一个 ``copy_into``，区别只是不额外分配：pinned 池的块
+        直接当落点，省掉一次 host 侧拷贝。
+        """
+        return copy_into(
+            self._buffer, buffer, offset=offset, device=self._device, backend=self._backend
+        )
+
     def numpy(self) -> np.ndarray:
         """返回 host 上的数组副本（可写），不共享 device 内存。"""
         raw = np.frombuffer(self.tobytes(), dtype=numpy_dtype(self._dtype))
@@ -274,18 +292,27 @@ class Tensor:
 __all__ = [
     "BackendStats",
     "BufferPool",
+    "CopyHandle",
     "CpuBackend",
+    "D2HStream",
+    "DEFAULT_CHUNK_BYTES",
     "DeviceBackend",
     "MachineStats",
     "MockCudaBackend",
+    "PinnedBuffer",
+    "PinnedBufferPool",
+    "PoolStats",
     "Snapshot",
     "SnapshotError",
     "SnapshotManager",
     "SnapshotState",
+    "StreamStats",
     "Tensor",
     "Trigger",
     "TriggerDecision",
+    "aligned_allocator",
     "available_device_types",
+    "copy_into",
     "copy_to_host",
     "get_backend",
     "register_backend",
@@ -293,4 +320,10 @@ __all__ = [
 ]
 
 # 放在文件末尾导入：d2h 依赖本模块的 get_backend，提前导入会撞上未初始化的循环。
-from async_.d2h import copy_to_host  # noqa: E402,F401
+from async_.d2h import (  # noqa: E402
+    CopyHandle,
+    D2HStream,
+    StreamStats,
+    copy_into,
+    copy_to_host,
+)
