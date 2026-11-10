@@ -43,6 +43,16 @@ struct ReadResult {
   Status status;
 };
 
+// 同一文件上的一次批量读：从 offset 起读 length 字节到 dst。
+//
+// 读的典型用法是「按索引里的分片区间成批读回来」，所以这里只描述区间；
+// fd（以及 ring）由 LocalFile::ReadRanges 提供，不用每次重复填。
+struct RangeRead {
+  std::uint64_t offset = 0;
+  std::uint32_t length = 0;
+  void* dst = nullptr;
+};
+
 // 大文件顺序写的一段数据。data 必须在 Sync() 返回前保持有效：写路径零拷贝，
 // 不复制调用方的 buffer。
 struct Chunk {
@@ -88,7 +98,8 @@ class AlignedBuffer {
 //
 // 写模式：在已打开的大文件上按 offset 顺序追加多段（planner 规划好分段），
 // 内部攒批提交到 io_uring，不额外创建线程；Sync() 收完在途请求并 fsync。
-// 读模式：只提供 fd()，随机读统一走 ReadMany()，便于跨文件批量提交。
+// 读模式：打开时自带一个 ring，随机读走 ReadRanges()（一次提交、一次回收 +
+// 逐项结果）；跨文件批量读仍可用 ReadMany()。
 class LocalFile {
  public:
   ~LocalFile();
@@ -109,6 +120,10 @@ class LocalFile {
   // 顺序写：offset 必须等于上次写到的位置（首段为 0），direct_io 时 offset 与
   // data.size() 都要按 alignment 对齐。数据不拷贝，Sync() 前要一直有效。
   Status WriteAt(std::uint64_t offset, std::span<const std::byte> data);
+
+  // 批量随机读：一次提交、一次回收，短读报 kIoError（不会静默截断）。
+  // direct_io 打开时 offset 与 length 都要按 alignment 对齐。
+  Status ReadRanges(std::span<const RangeRead> ranges);
 
   // 等待所有在途写完成；fsync 为 true 时再 fsync 数据文件。
   Status Sync(bool fsync);

@@ -10,14 +10,15 @@
 
 恢复端只认带 ``COMMIT`` 的目录：没有 COMMIT 的版本一律视为未完成。
 
-校验和用 ``zlib.crc32``（与项目其余部分一致）；设计文档里写的是 crc32c，
-两者算法不同，改成 crc32c 需要全链路一起换，见 README 的已知差异。
+``COMMIT`` 只记 ``.metadata`` 的**字节数**，不记校验和：原子 rename/PUT 已经排除
+「半写」，剩下的「长度不变、内容被改坏」由 JSON 解析 + ``CheckpointIndex.validate()``
+兜住结构性问题，而字节级正确性交给上传时的对象级校验和（见 storage/object.py）。
+旧格式里的 ``metadata.crc32`` 仍能被解析，只是不再校验，也写不回去。
 """
 
 from __future__ import annotations
 
 import json
-import zlib
 from dataclasses import dataclass, field
 from typing import Mapping
 
@@ -43,10 +44,12 @@ class CommitRecord:
     """``COMMIT`` 的内容：恢复端据此确认数据完整，不需要扫全部对象。"""
 
     step: int
-    metadata_crc32: str
     metadata_bytes: int
     files: Mapping[str, int] = field(default_factory=dict)
     """版本目录内的文件清单：文件名 -> 字节数（含 O_DIRECT 尾块补齐）。"""
+
+    metadata_crc32: str | None = None
+    """旧格式里的 ``.metadata`` 校验和；只解析、不再生成也不再校验。"""
 
     format_version: int = COMMIT_FORMAT_VERSION
 
@@ -61,15 +64,14 @@ class CommitRecord:
         object.__setattr__(self, "files", dict(self.files))
 
     def dumps(self) -> str:
+        metadata: dict[str, object] = {"file": META_FILE, "bytes": self.metadata_bytes}
+        if self.metadata_crc32 is not None:  # 旧记录原样透传，新记录不带这个字段
+            metadata["crc32"] = self.metadata_crc32
         return json.dumps(
             {
                 "format_version": self.format_version,
                 "step": self.step,
-                "metadata": {
-                    "file": META_FILE,
-                    "bytes": self.metadata_bytes,
-                    "crc32": self.metadata_crc32,
-                },
+                "metadata": metadata,
                 "files": {name: int(size) for name, size in sorted(self.files.items())},
             },
             indent=2,
@@ -94,8 +96,10 @@ class CommitRecord:
         try:
             return cls(
                 step=int(data["step"]),
-                metadata_crc32=str(metadata["crc32"]),
                 metadata_bytes=int(metadata["bytes"]),
+                metadata_crc32=(
+                    str(metadata["crc32"]) if metadata.get("crc32") is not None else None
+                ),
                 files={str(name): int(size) for name, size in files.items()},
                 format_version=int(data.get("format_version", COMMIT_FORMAT_VERSION)),
             )
@@ -103,18 +107,12 @@ class CommitRecord:
             raise FormatError(f"COMMIT is malformed: {exc}") from exc
 
 
-def crc32_hex(payload: bytes) -> str:
-    return f"{zlib.crc32(payload) & 0xFFFFFFFF:08x}"
-
-
-def write_metadata(
-    storage: StorageBackend, step: int, index: CheckpointIndex
-) -> tuple[str, int]:
-    """写 ``.metadata``（索引本身也是提交点之一），返回 (crc32, 字节数)。"""
+def write_metadata(storage: StorageBackend, step: int, index: CheckpointIndex) -> int:
+    """写 ``.metadata``（索引本身也是提交点之一），返回字节数。"""
     text = index.dumps()
     payload = text.encode("utf-8")
     storage.write(f"{version_key(step)}/{META_FILE}", payload)
-    return crc32_hex(payload), len(payload)
+    return len(payload)
 
 
 def write_commit(storage: StorageBackend, record: CommitRecord) -> None:
@@ -190,7 +188,6 @@ __all__ = [
     "CommitRecord",
     "LATEST_FILE",
     "committed_steps",
-    "crc32_hex",
     "delete_version",
     "latest_step",
     "read_commit",

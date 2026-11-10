@@ -317,3 +317,64 @@ def test_copy_part_size_scales_for_huge_objects(storage: S3Storage) -> None:
     assert storage_object.MIN_PART_SIZE <= part_size <= storage_object.MAX_PART_SIZE
 
 
+
+
+# --- 对象级校验和：本地层不做字节校验后的唯一把关点 ---------------------------
+
+
+def test_put_carries_object_checksum(storage: S3Storage, s3_server) -> None:
+    """默认配置下每个 PUT 都带对象级校验和头，服务端会独立重算并比对。"""
+    s3_server.store.require_checksum = True  # 不带头的 PUT 直接 400
+
+    storage.write("tensors/a.bin", b"payload")
+
+    assert s3_server.store.objects["runs/step_0/tensors/a.bin"] == b"payload"
+    assert s3_server.store.checksum_headers, "客户端没有发送 x-amz-checksum-* 头"
+
+
+def test_multipart_parts_carry_checksum(multipart_storage: S3Storage, s3_server) -> None:
+    """multipart 的每一片也要带校验和，坏片在服务端就被拒掉。"""
+    multipart_storage.write("tensors/big.bin", payload_of(11 * 1024 * 1024))
+
+    algorithms = {algorithm for _, algorithm, _ in s3_server.store.checksum_headers}
+    assert algorithms == {"crc32"}
+    # 两片 + create 时的一条记录（create 不带 body，不会进 checksum_headers）
+    part_headers = [h for h in s3_server.store.checksum_headers if h[0].endswith("big.bin")]
+    assert len(part_headers) == 2
+
+
+def test_read_detects_corrupted_object(storage: S3Storage, s3_server) -> None:
+    """存储侧静默损坏：内容被改而校验和还停在写入时的值，读取必须报错。
+
+    这是本地层不再做 CRC 之后，唯一能抓住「存进去的东西坏了」的地方。
+    """
+    storage.write("tensors/a.bin", b"hello world" * 100)
+    key = "runs/step_0/tensors/a.bin"
+    s3_server.store.objects[key] = b"HELLO WORLD" * 100  # 同长度、不同内容
+
+    with pytest.raises(StorageError, match="checksum"):
+        storage.read("tensors/a.bin")
+
+
+def test_checksum_can_be_disabled_for_legacy_endpoints(s3_server) -> None:
+    """不认识 x-amz-checksum-* 的老实现：checksum_algorithm=None 退回旧行为。"""
+    legacy = S3Storage(
+        S3Config(
+            bucket="ckpt",
+            prefix="runs/step_0",
+            endpoint_url=s3_server.endpoint_url,
+            access_key_id="test-key",
+            secret_access_key="test-secret",
+            checksum_algorithm=None,
+        )
+    )
+
+    legacy.write("tensors/a.bin", b"payload")
+
+    assert legacy.read("tensors/a.bin") == b"payload"
+    assert s3_server.store.checksum_headers == [], "关掉之后不该再发校验和头"
+
+
+def test_config_rejects_unknown_checksum_algorithm() -> None:
+    with pytest.raises(ValueError, match="unsupported checksum_algorithm"):
+        S3Config(bucket="ckpt", checksum_algorithm="MD5")

@@ -118,6 +118,7 @@ _NAMES = (
     "DEFAULT_DEPTH",
     "LocalFile",
     "fsync_dir",
+    "read_file_ranges",
     "rename_atomic",
     "write_file",
 )

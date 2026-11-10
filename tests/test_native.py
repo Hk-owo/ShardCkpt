@@ -225,3 +225,72 @@ def test_pinned_block_flows_into_native_write(tmp_path: Path, dataset: Path) -> 
         assert target.read_bytes()[: tensor.nbytes] == tensor.tobytes()
     finally:
         block.release()
+
+
+# --- 批量读：read_file_ranges / LocalFile.read_ranges -----------------------
+
+
+def test_read_file_ranges_reads_multiple_regions(tmp_path: Path) -> None:
+    """多段随机读：每段的偏移与落点各自独立，一次调用全部填好。"""
+    target = tmp_path / "ranges.bin"
+    payload = bytes(range(256)) * 64
+    native_mod.write_file(str(target), [payload], direct_io=False)
+
+    buffer = bytearray(3 * 1024)
+    native_mod.read_file_ranges(
+        str(target),
+        [(0, 1024, 0), (2048, 512, 1024), (len(payload) - 1024, 1024, 1536)],
+        buffer,
+    )
+
+    assert bytes(buffer[:1024]) == payload[:1024]
+    assert bytes(buffer[1024:1536]) == payload[2048:2560]
+    assert bytes(buffer[1536:2560]) == payload[-1024:]
+
+
+def test_read_file_ranges_short_read_is_an_error(tmp_path: Path) -> None:
+    target = tmp_path / "short.bin"
+    native_mod.write_file(str(target), [b"x" * 4096], direct_io=False)
+
+    with pytest.raises(Exception) as info:
+        native_mod.read_file_ranges(str(target), [(4096 - 4, 16, 0)], bytearray(16))
+    # 短读走 kIoError -> 项目内的 StorageError
+    assert type(info.value).__name__ == "StorageError"
+
+
+def test_read_file_ranges_validates_destination(tmp_path: Path) -> None:
+    target = tmp_path / "bounds.bin"
+    native_mod.write_file(str(target), [b"y" * 4096], direct_io=False)
+
+    with pytest.raises(ValueError, match="exceeds the destination buffer"):
+        native_mod.read_file_ranges(str(target), [(0, 32, 24)], bytearray(32))
+    with pytest.raises(ValueError, match="length must be > 0"):
+        native_mod.read_file_ranges(str(target), [(0, 0, 0)], bytearray(32))
+
+
+def test_local_file_read_ranges_reuses_the_fd(tmp_path: Path) -> None:
+    """读模式句柄自带 ring/fd：多次批量读不必重复 open。"""
+    target = tmp_path / "reuse.bin"
+    payload = bytes(range(256)) * 16
+    native_mod.write_file(str(target), [payload], direct_io=False)
+
+    file = native_mod.LocalFile.open_read(str(target), direct_io=False)
+    try:
+        first = bytearray(64)
+        second = bytearray(64)
+        file.read_ranges([(0, 64, 0)], first)
+        file.read_ranges([(128, 64, 0)], second)
+    finally:
+        file.close()
+
+    assert bytes(first) == payload[:64]
+    assert bytes(second) == payload[128:192]
+
+
+def test_read_ranges_requires_read_mode(tmp_path: Path) -> None:
+    file = native_mod.LocalFile.open_write(str(tmp_path / "write.bin"), direct_io=False)
+    try:
+        with pytest.raises(ValueError):
+            file.read_ranges([(0, 16, 0)], bytearray(16))
+    finally:
+        file.close()

@@ -31,6 +31,7 @@ from planner.save_plan import (
     build_save_plan,
     default_writer,
 )
+from planner.targets import targets_for_layout
 
 __all__ = [
     "COLUMN_STRATEGIES",
@@ -48,4 +49,5 @@ __all__ = [
     "build_load_plan",
     "build_save_plan",
     "default_writer",
+    "targets_for_layout",
 ]

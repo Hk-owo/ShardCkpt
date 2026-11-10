@@ -8,8 +8,9 @@
 
 - ``engine="native"``：`ckpt_native.write_file`（临时文件 → 顺序 WRITE → fsync →
   rename → 目录 fsync），buffer 地址按 alignment 对齐时走 O_DIRECT，零拷贝；
-- ``engine="python"``：`tempfile` + `write` + `fsync` + `os.replace` + 目录 fsync，
-  功能等价，只是不绕 page cache。C++ 扩展没构建时自动回退到它。
+- ``engine="python"``：`write` + `fsync` + `os.replace` + 目录 fsync，临时文件名
+  与 C++ 侧同构（``<final>.tmp.<pid>.<序号>``），功能等价，只是不绕 page cache。
+  C++ 扩展没构建时自动回退到它。
 
 ``write_view()`` 是本地层特有的零拷贝入口：它接受任何实现了 buffer 协议的对象
 （pinned 块、`native.AlignedView`、memoryview），不经过 `bytes` 复制。
@@ -17,6 +18,7 @@
 
 from __future__ import annotations
 
+import itertools
 import os
 from pathlib import Path
 from typing import Any
@@ -26,6 +28,13 @@ from storage.base import ObjectNotFoundError, StorageBackend, StorageError
 
 DEFAULT_ALIGNMENT = 4096
 """O_DIRECT 的块大小；planner 的对齐补齐也用它。"""
+
+_TEMP_COUNTER = itertools.count()
+"""临时文件名里的序号，对应 C++ 侧 ``MakeTempPath`` 的 ``static std::atomic``。
+
+CPython 下 ``next(itertools.count())`` 是 C 实现的单次调用、不释放 GIL，因此与
+C++ 的 ``fetch_add`` 等价，足以保证同一进程内并发写不会共用同一个临时文件。
+"""
 
 
 def _normalize_key(key: str) -> str:
@@ -46,6 +55,17 @@ def _fsync_dir(path: Path) -> None:
         os.fsync(fd)
     finally:
         os.close(fd)
+
+
+def _temp_path(path: Path) -> Path:
+    """临时文件名：``<final>.tmp.<pid>.<序号>``，与 C++ ``MakeTempPath`` 逐字一致。
+
+    临时文件必须和目标文件同目录，rename 才是原子的；pid + 进程内自增序号让
+    并发写同一路径的两个写者各写各的临时文件，最后由 rename 决出胜者。
+    固定名字（``<final>.tmp``）会让两个写者交错写进同一个文件，rename 之后
+    可能得到一份混合内容。
+    """
+    return path.with_name(f"{path.name}.tmp.{os.getpid()}.{next(_TEMP_COUNTER)}")
 
 
 def _address_of(buffer: Any) -> int | None:
@@ -171,7 +191,7 @@ class LocalStorage(StorageBackend):
 
     def _write_python(self, path: Path, chunks: list[Any], *, direct_io: bool) -> None:
         # direct_io 在纯 Python 引擎下不可用（没有对齐 buffer 保证），忽略即可
-        temp = path.with_name(path.name + ".tmp")
+        temp = _temp_path(path)
         try:
             with open(temp, "wb") as fh:
                 for chunk in chunks:
@@ -218,6 +238,37 @@ class LocalStorage(StorageBackend):
                 f"{key}: short read at [{offset}, {offset + length}), got {len(payload)} bytes"
             )
         return payload
+
+    def read_range_into(self, key: str, offset: int, buffer: Any) -> int:
+        """把 ``[offset, offset + len(buffer))`` 直接读进调用方 buffer（零拷贝）。
+
+        读长度不符时报错而不是静默截断，与 :meth:`read_range` 一致。返回读到的字节数。
+        """
+        if offset < 0:
+            raise ValueError(f"offset must be >= 0, got {offset}")
+        view = _as_view(buffer)
+        length = len(view)
+        if length == 0:
+            return 0
+        path = self.path_for(key)
+        try:
+            fd = os.open(path, os.O_RDONLY)
+        except FileNotFoundError as exc:
+            raise ObjectNotFoundError(f"{key}: not found") from exc
+        except OSError as exc:
+            raise StorageError(f"{key}: {exc}") from exc
+        try:
+            # preadv 支持一次填多个（这里只有一个）写目标，且不需要先分配中间 bytes
+            got = os.preadv(fd, [view], offset)
+        except OSError as exc:
+            raise StorageError(f"{key}: {exc}") from exc
+        finally:
+            os.close(fd)
+        if got != length:
+            raise StorageError(
+                f"{key}: short read at [{offset}, {offset + length}), got {got} bytes"
+            )
+        return got
 
     # --- 提交原语 -----------------------------------------------------------
     def rename_or_put(self, src: str, dst: str) -> None:

@@ -208,8 +208,21 @@ Status LocalFile::OpenRead(std::string_view path, const LocalFileOptions& option
   CKPT_RETURN_IF_ERROR(ValidateOptions(options));
 
   const std::string name(path);
-  const int raw_fd = ::open(name.c_str(), O_RDONLY | O_CLOEXEC);
+  int read_flags = O_RDONLY | O_CLOEXEC;
+  if (options.direct_io) read_flags |= O_DIRECT;
+  const int raw_fd = ::open(name.c_str(), read_flags);
   if (raw_fd < 0) return ErrnoStatus(errno, "open " + name);
+
+  // 读也自带一个 ring：批量读走 io_uring，而 ring 只能给创建它的线程用。
+  // 一次提交的上限是 ReadMany 内部的 kMaxReadBatch，深度至少留两倍。
+  auto ring = std::make_unique<io::Ring>();
+  const unsigned entries =
+      std::max({options.depth * 2, static_cast<unsigned>(kMaxReadBatch * 2), 2u});
+  Status st = io::Ring::Create(entries, ring.get());
+  if (!st.ok()) {
+    (void)::close(raw_fd);
+    return st;
+  }
 
   auto file = std::unique_ptr<LocalFile>(new LocalFile());
   file->impl_ = std::make_unique<Impl>();
@@ -220,6 +233,7 @@ Status LocalFile::OpenRead(std::string_view path, const LocalFileOptions& option
   file->impl_->alignment = options.alignment;
   file->impl_->chunk_bytes = options.chunk_bytes;
   file->impl_->depth = options.depth;
+  file->impl_->ring = std::move(ring);
   *out = file.release();
   return Status::OK();
 }
@@ -311,6 +325,58 @@ Status LocalFile::WriteAt(std::uint64_t offset, std::span<const std::byte> data)
   self.next_offset = offset + data.size();
   self.dirty = true;
   return self.ring->Submit();
+}
+
+Status LocalFile::ReadRanges(std::span<const RangeRead> ranges) {
+  if (!impl_) {
+    return Status::Error(ErrorCode::kInvalidArgument, "file is not open");
+  }
+  Impl& self = *impl_;
+  if (self.writable) {
+    return Status::Error(ErrorCode::kInvalidArgument,
+                         "file is not opened for reading");
+  }
+  if (ranges.empty()) return Status::OK();
+  if (self.ring == nullptr) {
+    return Status::Error(ErrorCode::kIoError, "read ring is not initialized");
+  }
+
+  std::vector<ReadOp> ops;
+  ops.reserve(ranges.size());
+  for (const RangeRead& range : ranges) {
+    if (range.length == 0) {
+      return Status::Error(ErrorCode::kInvalidArgument, "read length must be > 0");
+    }
+    if (range.dst == nullptr) {
+      return Status::Error(ErrorCode::kInvalidArgument,
+                           "read destination must not be null");
+    }
+    if (range.offset > std::numeric_limits<std::uint64_t>::max() - range.length) {
+      return Status::Error(ErrorCode::kInvalidArgument, "offset + length overflows");
+    }
+    if (self.direct_io && (!IsAligned(range.offset, self.alignment) ||
+                           !IsAligned(range.length, self.alignment))) {
+      return Status::Error(ErrorCode::kInvalidArgument,
+                           "direct_io requires offset and length to be aligned to " +
+                               std::to_string(self.alignment) + " bytes");
+    }
+    ops.push_back(ReadOp{self.fd, range.offset, range.length, range.dst});
+  }
+
+  std::vector<ReadResult> results;
+  // ReadMany 负责「一次提交、收完所有 CQE」，但每个 CQE 的错误留在 results 里，
+  // 所以这里逐项检查：短读/失败必须报出去，不能返回半份数据。
+  CKPT_RETURN_IF_ERROR(ReadMany(self.ring.get(), ops, &results));
+  for (std::size_t i = 0; i < results.size(); ++i) {
+    if (!results[i].status.ok()) return results[i].status;
+    if (results[i].bytes != ranges[i].length) {
+      return Status::Error(ErrorCode::kIoError,
+                           "short read at offset " + std::to_string(ranges[i].offset) +
+                               ": got " + std::to_string(results[i].bytes) + " of " +
+                               std::to_string(ranges[i].length) + " bytes");
+    }
+  }
+  return Status::OK();
 }
 
 Status LocalFile::Sync(bool fsync) {

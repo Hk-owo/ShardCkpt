@@ -131,6 +131,7 @@ class ShardMeta:
     shape: Shape = ()
     flat: tuple[int, int] | None = None
     crc32c: str | None = None
+    """旧版本写下的分片校验和；现在不再生成，只在显式 ``verify_crc=True`` 时使用。"""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "offsets", tuple(int(v) for v in self.offsets))
@@ -424,6 +425,7 @@ class BlobMeta:
     byte_offset: int
     length: int
     crc32c: str | None = None
+    """旧版本写下的校验和；现在不再生成。"""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "byte_offset", int(self.byte_offset))

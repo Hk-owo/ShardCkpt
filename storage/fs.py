@@ -27,12 +27,12 @@ class LoadOptions:
     """加载选项。
 
     device:       目标设备，默认 CPU；可传 "cuda:0" 等。
-    verify_crc:   是否校验 manifest 里的 CRC32。
+    verify_crc:   是否校验 manifest 里的 CRC32；默认关闭（见 :func:`load_local` 的说明）。
     staging:      是否经 host staging buffer 中转（GPU 路径的默认行为）。
     """
 
     device: Device = CPU
-    verify_crc: bool = True
+    verify_crc: bool = False
     staging: bool = True
 
     def __post_init__(self) -> None:
@@ -118,7 +118,7 @@ class CheckpointReader:
         path: str | Path,
         *,
         device: "str | Device" = "cpu",
-        verify_crc: bool = True,
+        verify_crc: bool = False,
         staging: bool = True,
     ) -> "CheckpointReader":
         return cls(path, LoadOptions(device=Device.parse(device), verify_crc=verify_crc, staging=staging))

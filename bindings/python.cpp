@@ -16,10 +16,13 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -104,6 +107,66 @@ class SimpleBuffer {
   bool held_;
 };
 
+// 可写 buffer 的零拷贝视图：读的落点（staging 块）走这里，C++ 直接往里写。
+class WritableBuffer {
+ public:
+  explicit WritableBuffer(py::handle object) : held_(false) {
+    if (PyObject_GetBuffer(object.ptr(), &view_, PyBUF_WRITABLE) < 0) {
+      throw py::error_already_set();
+    }
+    held_ = true;
+  }
+
+  WritableBuffer(const WritableBuffer&) = delete;
+  WritableBuffer& operator=(const WritableBuffer&) = delete;
+
+  ~WritableBuffer() {
+    if (held_) PyBuffer_Release(&view_);
+  }
+
+  std::span<std::byte> bytes() const {
+    return {static_cast<std::byte*>(view_.buf), static_cast<std::size_t>(view_.len)};
+  }
+
+ private:
+  Py_buffer view_{};
+  bool held_;
+};
+
+// Python 侧的读区间：(offset, length, dst_offset)，dst_offset 是 buffer 内的偏移。
+// 解析时就做边界校验，避免把越界指针交给 io_uring。
+std::vector<ckpt::storage::RangeRead> BuildRangeReads(const py::sequence& ranges,
+                                                      std::span<std::byte> buffer) {
+  std::vector<ckpt::storage::RangeRead> out;
+  out.reserve(static_cast<std::size_t>(py::len(ranges)));
+  for (py::handle item : ranges) {
+    std::uint64_t offset = 0;
+    std::uint64_t length = 0;
+    std::uint64_t dst_offset = 0;
+    try {
+      std::tie(offset, length, dst_offset) =
+          py::cast<std::tuple<std::uint64_t, std::uint64_t, std::uint64_t>>(item);
+    } catch (const py::cast_error&) {
+      throw py::value_error("range must be a (offset, length, dst_offset) triple of ints");
+    }
+    if (length == 0) {
+      throw py::value_error("range length must be > 0");
+    }
+    if (length > std::numeric_limits<std::uint32_t>::max()) {
+      throw py::value_error("range length exceeds UINT32_MAX");
+    }
+    if (dst_offset > buffer.size() || length > buffer.size() - dst_offset) {
+      throw py::value_error("range [" + std::to_string(dst_offset) + ", " +
+                            std::to_string(dst_offset + length) +
+                            ") exceeds the destination buffer of " +
+                            std::to_string(buffer.size()) + " bytes");
+    }
+    out.push_back(ckpt::storage::RangeRead{offset, static_cast<std::uint32_t>(length),
+                                           buffer.data() + dst_offset});
+  }
+  return out;
+}
+
 // LocalFile 的 Python 句柄。绑定层额外记住创建它的线程：io_uring 的 SQ/CQ 不支持
 // 跨线程共享，误用要立刻报错，而不是留给用户踩未定义行为。
 class PyLocalFile {
@@ -129,10 +192,11 @@ class PyLocalFile {
   }
 
   static std::shared_ptr<PyLocalFile> OpenRead(const std::string& path, bool direct_io,
-                                               unsigned alignment) {
+                                               unsigned alignment, unsigned depth) {
     LocalFileOptions options;
     options.direct_io = direct_io;
     options.alignment = alignment;
+    options.depth = depth;
 
     LocalFile* file = nullptr;
     Status status;
@@ -147,6 +211,21 @@ class PyLocalFile {
   int fd() const { return file_ ? file_->fd() : -1; }
 
   const std::string& path() const { return path_; }
+
+  // 批量随机读：ranges 是 (offset, length, dst_offset) 三元组序列，数据直接落进
+  // 调用方的 buffer（staging 块），全程零拷贝。
+  void ReadRanges(const py::sequence& ranges, py::object buffer) {
+    EnsureOwnerThread();
+    WritableBuffer target(buffer);
+    const std::vector<ckpt::storage::RangeRead> raw = BuildRangeReads(ranges, target.bytes());
+
+    Status status;
+    {
+      py::gil_scoped_release release;
+      status = file_->ReadRanges(raw);
+    }
+    Check(status);
+  }
 
   void WriteAt(std::uint64_t offset, py::object data) {
     EnsureOwnerThread();
@@ -249,9 +328,7 @@ void RenameAtomicBinding(const std::string& src, const std::string& dst) {
     status = ckpt::storage::RenameAtomic(src, dst);
   }
   Check(status);
-}
-
-void FsyncDirBinding(const std::string& path) {
+}void FsyncDirBinding(const std::string& path) {
   Status status;
   {
     py::gil_scoped_release release;
@@ -259,6 +336,43 @@ void FsyncDirBinding(const std::string& path) {
   }
   Check(status);
 }
+
+// 一次性读完一个文件里的多段区间：打开 -> 批量读 -> 关闭。
+// 分片布局已经由 planner 算好，Python 侧只需要给区间；这里不解释几何。
+void ReadFileRangesBinding(const std::string& path, const py::sequence& ranges,
+                           py::object buffer, bool direct_io, unsigned alignment,
+                           unsigned depth) {
+  WritableBuffer target(buffer);
+  const std::vector<ckpt::storage::RangeRead> raw = BuildRangeReads(ranges, target.bytes());
+
+  LocalFileOptions options;
+  options.direct_io = direct_io;
+  options.alignment = alignment;
+  options.depth = depth;
+
+  LocalFile* file = nullptr;
+  Status status;
+  {
+    py::gil_scoped_release release;
+    status = LocalFile::OpenRead(path, options, &file);
+  }
+  Check(status);
+  std::unique_ptr<LocalFile> guard(file);
+
+  {
+    py::gil_scoped_release release;
+    status = guard->ReadRanges(raw);
+  }
+  // 读失败也要先关文件，再把错误抛给 Python
+  Status close_status;
+  {
+    py::gil_scoped_release release;
+    close_status = guard->Close();
+  }
+  Check(status);
+  Check(close_status);
+}
+
 
 class PyAlignedBuffer {
  public:
@@ -311,6 +425,13 @@ PYBIND11_MODULE(ckpt_native, m) {
         "rename(2)；同路径直接成功，跨文件系统失败。");
   m.def("fsync_dir", &FsyncDirBinding, py::arg("path"), "fsync 目录项（rename 之后调用）。");
 
+  m.def("read_file_ranges", &ReadFileRangesBinding, py::arg("path"), py::arg("ranges"),
+        py::arg("buffer"), py::arg("direct_io") = false,
+        py::arg("alignment") = ckpt::storage::kDefaultAlignment,
+        py::arg("depth") = ckpt::storage::kDefaultDepth,
+        "一次读完一个文件里的多段区间：ranges 为 ((offset, length, dst_offset), ...)，"
+        "数据直接写进 buffer（零拷贝）；短读报错，不静默截断。");
+
   py::class_<PyLocalFile, std::shared_ptr<PyLocalFile>>(m, "LocalFile")
       .def_static("open_write", &LocalFileOpenWrite, py::arg("path"), py::arg("direct_io") = true,
                   py::arg("alignment") = ckpt::storage::kDefaultAlignment,
@@ -319,7 +440,10 @@ PYBIND11_MODULE(ckpt_native, m) {
                   py::arg("fsync_on_sync") = true)
       .def_static("open_read", &PyLocalFile::OpenRead, py::arg("path"),
                   py::arg("direct_io") = false,
-                  py::arg("alignment") = ckpt::storage::kDefaultAlignment)
+                  py::arg("alignment") = ckpt::storage::kDefaultAlignment,
+                  py::arg("depth") = ckpt::storage::kDefaultDepth)
+      .def("read_ranges", &PyLocalFile::ReadRanges, py::arg("ranges"), py::arg("buffer"),
+           "批量读：(offset, length, dst_offset) 序列 -> 零拷贝写进 buffer。")
       .def("write_at", &PyLocalFile::WriteAt, py::arg("offset"), py::arg("data"),
            "顺序追加一段；offset 必须等于上次写到的位置。数据零拷贝，Sync() 前有效。")
       .def("sync", &PyLocalFile::Sync, py::arg("fsync") = true, "收完在途写，可选 fsync。")

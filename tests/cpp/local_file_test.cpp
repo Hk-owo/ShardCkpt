@@ -259,6 +259,130 @@ bool TestReadManyMissingFd(const fs::path& dir) {
   return true;
 }
 
+// --- LocalFile::ReadRanges（读模式自带 ring，一次提交读多段）----------------
+
+bool TestReadRangesBatch(const fs::path& dir) {
+  const fs::path path = dir / "ranges.bin";
+  std::vector<std::byte> data = MakeData(1u << 20, 51);
+  CHECK_TRUE(WriteChunks(path, {data}, WriteOptions{.direct_io = g_direct_io}));
+
+  LocalFile* file = nullptr;
+  CHECK_OK(LocalFile::OpenRead(path.string(), {}, &file));
+  std::unique_ptr<LocalFile> guard(file);
+
+  // 三段读进一个连续 buffer：验证区间与落点各自独立，且都按请求填满。
+  std::vector<std::byte> out(3 * 4096);
+  std::vector<ckpt::storage::RangeRead> ranges{
+      {0, 4096, out.data()},
+      {5000, 2048, out.data() + 4096},
+      {600000, 4096, out.data() + 4096 + 2048},
+  };
+  CHECK_OK(file->ReadRanges(ranges));
+
+  CHECK_TRUE(std::memcmp(out.data(), data.data(), 4096) == 0);
+  CHECK_TRUE(std::memcmp(out.data() + 4096, data.data() + 5000, 2048) == 0);
+  CHECK_TRUE(std::memcmp(out.data() + 4096 + 2048, data.data() + 600000, 4096) == 0);
+  return true;
+}
+
+bool TestReadRangesManySegments(const fs::path& dir) {
+  // 超过 ReadMany 内部的单批上限（64），逼出「多轮提交」这条路径。
+  const fs::path path = dir / "ranges-many.bin";
+  std::vector<std::byte> data = MakeData(128u * 4096, 52);
+  CHECK_TRUE(WriteChunks(path, {data}, WriteOptions{.direct_io = g_direct_io}));
+
+  LocalFile* file = nullptr;
+  CHECK_OK(LocalFile::OpenRead(path.string(), {}, &file));
+  std::unique_ptr<LocalFile> guard(file);
+
+  constexpr std::size_t kCount = 100;
+  std::vector<std::byte> out(kCount * 4096);
+  std::vector<ckpt::storage::RangeRead> ranges;
+  ranges.reserve(kCount);
+  for (std::size_t i = 0; i < kCount; ++i) {
+    // 逆序 + 稀疏：每段 4096 字节，起点在文件内不重叠
+    const std::size_t index = kCount - 1 - i;
+    ranges.push_back({index * 4096, 4096, out.data() + i * 4096});
+  }
+  CHECK_OK(file->ReadRanges(ranges));
+
+  for (std::size_t i = 0; i < kCount; ++i) {
+    const std::size_t index = kCount - 1 - i;
+    CHECK_TRUE(std::memcmp(out.data() + i * 4096, data.data() + index * 4096, 4096) == 0);
+  }
+  return true;
+}
+
+bool TestReadRangesShortRead(const fs::path& dir) {
+  const fs::path path = dir / "ranges-short.bin";
+  CHECK_TRUE(WriteChunks(path, {MakeData(4096, 53)}, WriteOptions{.direct_io = false}));
+
+  LocalFile* file = nullptr;
+  CHECK_OK(LocalFile::OpenRead(path.string(), {}, &file));
+  std::unique_ptr<LocalFile> guard(file);
+
+  std::vector<std::byte> out(16);
+  std::vector<ckpt::storage::RangeRead> ranges{{4096 - 4, 16, out.data()}};
+  // 短读必须报错，不能返回半份数据
+  CHECK_CODE(file->ReadRanges(ranges), ErrorCode::kIoError);
+  return true;
+}
+
+bool TestReadRangesRejectsBadArguments(const fs::path& dir) {
+  const fs::path path = dir / "ranges-bad.bin";
+  CHECK_TRUE(WriteChunks(path, {MakeData(8192, 54)}, WriteOptions{.direct_io = false}));
+
+  LocalFile* file = nullptr;
+  CHECK_OK(LocalFile::OpenRead(path.string(), {}, &file));
+  std::unique_ptr<LocalFile> guard(file);
+
+  std::vector<std::byte> out(32);
+  std::vector<ckpt::storage::RangeRead> zero_length{{0, 0, out.data()}};
+  CHECK_CODE(file->ReadRanges(zero_length), ErrorCode::kInvalidArgument);
+
+  std::vector<ckpt::storage::RangeRead> null_dst{{0, 16, nullptr}};
+  CHECK_CODE(file->ReadRanges(null_dst), ErrorCode::kInvalidArgument);
+
+  // 空区间序列是合法的空操作
+  CHECK_OK(file->ReadRanges({}));
+  return true;
+}
+
+bool TestReadRangesRequiresReadMode(const fs::path& dir) {
+  const fs::path path = dir / "ranges-write-mode.bin";
+  LocalFile* file = nullptr;
+  LocalFileOptions options;
+  options.direct_io = false;
+  CHECK_OK(LocalFile::OpenWrite(path.string(), options, &file));
+  std::unique_ptr<LocalFile> guard(file);
+
+  std::vector<std::byte> out(16);
+  std::vector<ckpt::storage::RangeRead> ranges{{0, 16, out.data()}};
+  CHECK_CODE(guard->ReadRanges(ranges), ErrorCode::kInvalidArgument);
+  return true;
+}
+
+bool TestReadRangesDirectIoAligned(const fs::path& dir) {
+  // O_DIRECT 读的区间必须按块对齐；写侧已按 4096 对齐落盘，所以整块读成立。
+  // 文件系统不支持 O_DIRECT（如 tmpfs）时这个用例整体跳过。
+  if (!g_direct_io) return true;
+  const fs::path path = dir / "ranges-direct.bin";
+  CHECK_TRUE(WriteChunks(path, {MakeData(8192, 55)}, WriteOptions{.direct_io = true}));
+
+  LocalFileOptions options;
+  options.direct_io = true;
+  LocalFile* file = nullptr;
+  CHECK_OK(LocalFile::OpenRead(path.string(), options, &file));
+  std::unique_ptr<LocalFile> guard(file);
+
+  std::vector<std::byte> out(8192);
+  std::vector<ckpt::storage::RangeRead> aligned{{4096, 4096, out.data()}};
+  CHECK_OK(guard->ReadRanges(aligned));
+  std::vector<ckpt::storage::RangeRead> misaligned{{100, 16, out.data()}};
+  CHECK_CODE(guard->ReadRanges(misaligned), ErrorCode::kInvalidArgument);
+  return true;
+}
+
 bool TestThreadCountStable(const fs::path& dir) {
   const fs::path path = dir / "threads.bin";
   const std::vector<std::byte> data = MakeData(1u << 20, 31);
@@ -429,6 +553,12 @@ int main() {
       {"read_many_across_fds", TestReadManyAcrossFds},
       {"read_many_short_read", TestReadManyShortRead},
       {"read_many_missing_fd", TestReadManyMissingFd},
+      {"read_ranges_batch", TestReadRangesBatch},
+      {"read_ranges_many_segments", TestReadRangesManySegments},
+      {"read_ranges_short_read", TestReadRangesShortRead},
+      {"read_ranges_bad_arguments", TestReadRangesRejectsBadArguments},
+      {"read_ranges_requires_read_mode", TestReadRangesRequiresReadMode},
+      {"read_ranges_direct_io_aligned", TestReadRangesDirectIoAligned},
       {"thread_count_stable", TestThreadCountStable},
       {"sequential_writer", TestSequentialWriter},
       {"direct_io_rejects_misaligned", TestDirectIoRejectsMisaligned},

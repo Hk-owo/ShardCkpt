@@ -17,7 +17,6 @@
 
 from __future__ import annotations
 
-import zlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -60,20 +59,86 @@ from core import (
 )
 from core.metadata import CPU, Device, cuda
 from storage.fs import CheckpointData, CheckpointReader, LoadOptions
+from storage.local_load import LoadReport, load_local
 
 
 def load(
     path: str | Path,
     *,
     device: "str | Device" = "cpu",
-    verify_crc: bool = True,
+    verify_crc: bool = False,
     staging: bool = True,
+    step: int | None = None,
+    tp: int = 1,
+    tp_rank: int = 0,
+    shard_dims: Mapping[str, int] | None = None,
 ) -> CheckpointData:
-    """便捷入口，对应 ``torch.load(path, map_location=device)``。"""
-    reader = CheckpointReader.open(
-        path, device=device, verify_crc=verify_crc, staging=staging
+    """便捷入口，对应 ``torch.load(path, map_location=device)``。
+
+    按目录内容自动选格式：有 ``manifest.json`` 走旧的整文件读取路径；
+    有 ``COMMIT`` / ``.metadata`` 走本地层读闭环（:func:`load_local`）。
+    """
+    root = Path(path)
+    if (root / "manifest.json").is_file():
+        reader = CheckpointReader.open(
+            path, device=device, verify_crc=verify_crc, staging=staging
+        )
+        return reader.read_all()
+
+    if _is_version_dir(root):
+        base, version = _resolve_version_root(root)
+        report = load_local(
+            base,
+            step=step if step is not None else version,
+            device=device,
+            tp=tp,
+            tp_rank=tp_rank,
+            shard_dims=shard_dims,
+            verify_crc=verify_crc,
+        )
+        return CheckpointData(
+            tensors=dict(report.tensors),
+            meta={
+                "format": "local",
+                "step": report.step,
+                "saved_layout": dict(report.index.saved_layout),
+                "files": report.files,
+                "blobs": sorted(report.blobs),
+            },
+            device=report.device,
+        )
+
+    raise FormatError(
+        f"{root}: neither manifest.json nor a committed version directory "
+        "(COMMIT / .metadata) found"
     )
-    return reader.read_all()
+
+
+def _is_version_dir(root: Path) -> bool:
+    """本地版本目录：根目录本身就是 ``step_N``，或者根下有带 COMMIT 的 step 目录。"""
+    if (root / "COMMIT").is_file() or (root / ".metadata").is_file():
+        return True
+    if not root.is_dir():
+        return False
+    return any(
+        child.is_dir() and (child / "COMMIT").is_file()
+        for child in root.iterdir()
+    )
+
+
+def _resolve_version_root(root: Path) -> tuple[Path, int | None]:
+    """``step_42`` 目录本身也接受：返回 (父目录, 42)，让 recover 能拼出 key。"""
+    if not (root / "COMMIT").is_file():
+        return root, None
+    name = root.name
+    if not name.startswith("step_"):
+        raise FormatError(
+            f"{root}: version directory must be named 'step_<N>' to be recovered by step"
+        )
+    try:
+        return root.parent, int(name[len("step_") :])
+    except ValueError:
+        raise FormatError(f"{root}: cannot parse step number from {name!r}") from None
 
 
 def save_async(state_dict: Any, path: str | Path, **options: Any) -> Any:
@@ -127,25 +192,22 @@ def _as_view(buffer: Any) -> memoryview:
     return view if isinstance(view, memoryview) else memoryview(buffer)
 
 
-def _crc32_hex(view: memoryview) -> str:
-    """直接对 buffer 切片算 CRC（零拷贝，zlib 接受 buffer 协议）。"""
-    return f"{zlib.crc32(view) & 0xFFFFFFFF:08x}"
-
-
 def _build_index(
     plan: SavePlan,
-    view: memoryview,
     *,
     step: int,
     layout: Mapping[str, int] | None,
 ) -> CheckpointIndex:
-    """从「已经躺在 buffer 里的字节」直接生成索引（顺带算每个分片的 CRC）。"""
+    """从「已经躺在 buffer 里的字节」直接生成索引。
+
+    不再计算分片 CRC：字节级完整性由上传时的对象级校验和负责（见
+    :mod:`storage.object`），索引里只留分片坐标。``crc32c`` 字段留空，旧版本
+    写下的值仍能解析（显式 ``verify_crc=True`` 时也仍然可用）。
+    """
     grouped: dict[str, list[ShardMeta]] = {}
     shapes: dict[str, tuple[tuple[int, ...], str]] = {}
     for item in plan.items:
-        # 字段名沿用索引格式里的 crc32c，值这里是 zlib.crc32（见 commit/local.py）
-        crc = _crc32_hex(view[item.byte_offset : item.end])
-        grouped.setdefault(item.fqn, []).append(item.to_shard_meta(crc32c=crc))
+        grouped.setdefault(item.fqn, []).append(item.to_shard_meta())
         shapes[item.fqn] = (item.global_shape, item.dtype)
 
     tensors = {
@@ -261,7 +323,7 @@ def save_local(
         _clear_padding(plan, view, aligned_size)
         snapshot.d2h_done()  # host 数据从这一刻起不可变
 
-        index = _build_index(plan, view, step=step, layout=layout)
+        index = _build_index(plan, step=step, layout=layout)
         index.validate()
 
         # 1) 数据文件：临时文件 -> fsync -> rename -> 目录 fsync
@@ -271,13 +333,12 @@ def save_local(
             raise PlanError(f"{key}/{plan.file}: 写入 {file_size} 字节，期望 {aligned_size}")
 
         # 2) 索引，也兼作提交点之一
-        metadata_crc32, metadata_bytes = write_metadata(storage, step, index)
+        metadata_bytes = write_metadata(storage, step, index)
         snapshot.persist_ok()  # 本 rank 的数据已落地
 
         # 3) COMMIT + latest：这两步之后这一版才可恢复
         record = CommitRecord(
             step=step,
-            metadata_crc32=metadata_crc32,
             metadata_bytes=metadata_bytes,
             files={plan.file: file_size},
         )
@@ -315,6 +376,7 @@ __all__ = [
     "DeviceBackend",
     "FormatError",
     "LoadOptions",
+    "LoadReport",
     "MissingTensorError",
     "MockCudaBackend",
     "PinnedBufferPool",
@@ -328,6 +390,7 @@ __all__ = [
     "cuda",
     "get_backend",
     "load",
+    "load_local",
     "register_backend",
     "reset_registry",
     "save_async",

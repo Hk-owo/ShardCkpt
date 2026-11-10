@@ -12,6 +12,14 @@
 超过 ``multipart_threshold``（默认 64 MiB）的对象切成分片上传，
 其余走单次 PUT。凭据为空时交给 boto3 的默认链
 （环境变量 / ~/.aws/credentials / IAM role）。
+
+**校验和是这条链路唯一的字节级把关点。** 本地层只做「临时文件 → fsync →
+rename → 目录 fsync」，不存也不校验分片 CRC（理由见 README「为什么本地层不做
+字节级校验」），于是「本地读出来 → 网络 → 落盘」这段的正确性由这里的对象级
+校验和负责：PUT / multipart 带 ``ChecksumAlgorithm``（默认 ``CRC32``），服务端
+独立重算并比对，不匹配回 400 ``BadDigest``；整对象 GET 带 ``ChecksumMode=
+ENABLED`` 让 botocore 回验返回值。不认识 ``x-amz-checksum-*`` 的端点把
+``S3Config.checksum_algorithm`` 设成 ``None`` 即可退回旧行为。
 """
 
 from __future__ import annotations
@@ -41,6 +49,21 @@ MAX_SINGLE_COPY_BYTES = MAX_PART_SIZE
 # 一次 multipart 最多 10000 片，分片大小要据此放大。
 MAX_MULTIPART_PARTS = 10000
 
+DEFAULT_CHECKSUM_ALGORITHM = "CRC32"
+"""上传时附带的对象级校验和算法。
+
+本地层不再做字节级校验，于是「从本地读出来 -> 网络 -> 落盘」这条链路唯一的
+把关点就是这里：PUT 带 ``x-amz-checksum-<alg>``，服务端独立重算并比对，不匹配
+直接 400 ``BadDigest``；GET 带 ``ChecksumMode=ENABLED`` 让 SDK 回验返回值。
+
+选 ``CRC32`` 而不是 ``CRC32C``：对象存储两种都认，而 Python 标准库只有
+``zlib.crc32``（IEEE），本仓库其余部分也用它，保持一致；换成 ``CRC32C`` 只需改
+这个默认值（botocore 自带两种算法的实现）。
+"""
+
+SUPPORTED_CHECKSUM_ALGORITHMS = frozenset({"CRC32", "CRC32C", "SHA1", "SHA256"})
+"""S3 认的校验和算法。"""
+
 # 对象不存在时 S3 可能用这几种 Code / 状态码，统一映射到 ObjectNotFoundError。
 _NOT_FOUND_CODES = frozenset({"NoSuchKey", "NoSuchBucket", "NotFound", "404"})
 
@@ -64,6 +87,9 @@ class S3Config:
     # 超过该字节数改用 multipart；分片大小对单次 PUT 也生效（单 PUT 上限 5 GiB）。
     multipart_threshold: int = DEFAULT_MULTIPART_THRESHOLD
     part_size: int = DEFAULT_PART_SIZE
+    # 上传/回读附带的对象级校验和算法；None 表示这条连接不带校验头。
+    # 老版本 SeaweedFS 之类不认识 x-amz-checksum-* 的端点需要显式设成 None。
+    checksum_algorithm: str | None = DEFAULT_CHECKSUM_ALGORITHM
 
     def __post_init__(self) -> None:
         if not self.bucket:
@@ -81,6 +107,14 @@ class S3Config:
             raise ValueError(
                 f"part_size must be <= {MAX_PART_SIZE} bytes (5 GiB, S3 limit), "
                 f"got {self.part_size}"
+            )
+        if (
+            self.checksum_algorithm is not None
+            and self.checksum_algorithm not in SUPPORTED_CHECKSUM_ALGORITHMS
+        ):
+            raise ValueError(
+                f"unsupported checksum_algorithm {self.checksum_algorithm!r}, "
+                f"expected one of {sorted(SUPPORTED_CHECKSUM_ALGORITHMS)} or None"
             )
         object.__setattr__(self, "prefix", self.prefix.strip("/"))
 
@@ -101,16 +135,17 @@ class S3Config:
 
 def _make_client(config: S3Config) -> "S3Client":
     """按配置创建 boto3 S3 client。"""
+    checksum_on = config.checksum_algorithm is not None
     kwargs: dict[str, object] = {
         "service_name": "s3",
         "region_name": config.region,
         "config": Config(
             s3={"addressing_style": "path" if config.path_style else "virtual"},
             retries={"max_attempts": 3, "mode": "standard"},
-            # 新版 botocore 默认给 PUT 附带 CRC32 校验头，部分 S3 兼容实现
-            # （老版本 SeaweedFS 等）不认识；改成「服务端要求时才计算」。
-            request_checksum_calculation="when_required",
-            response_checksum_validation="when_required",
+            # 校验头由 checksum_algorithm 控制：开启时让 SDK 自动算并校验，
+            # 关闭时保持 when_required（老版 SeaweedFS 等不认识 x-amz-checksum-*）。
+            request_checksum_calculation="when_supported" if checksum_on else "when_required",
+            response_checksum_validation="when_supported" if checksum_on else "when_required",
         ),
     }
     if config.endpoint_url:
@@ -176,6 +211,19 @@ class S3Storage(StorageBackend):
         """相对 key -> bucket 里的完整对象 key。"""
         return _join(self._config.prefix, _normalize_key(key))
 
+    def _checksum_kwargs(self) -> dict[str, str]:
+        """上传时附带对象级校验和：服务端独立重算并比对，不匹配回 400 ``BadDigest``。"""
+        algorithm = self._config.checksum_algorithm
+        return {"ChecksumAlgorithm": algorithm} if algorithm else {}
+
+    def _checksum_mode_kwargs(self) -> dict[str, str]:
+        """整对象 GET 时要求服务端回传校验和，由 botocore 回验返回值。
+
+        只用于整对象读取：``Range`` GET 拿到的是对象的一部分，整对象校验和无法
+        对局部内容验证，带上反而会被严格实现拒绝，所以 :meth:`read_range` 不传。
+        """
+        return {"ChecksumMode": "ENABLED"} if self._config.checksum_algorithm else {}
+
     def close(self) -> None:
         close = getattr(self._client, "close", None)
         if callable(close):
@@ -192,7 +240,10 @@ class S3Storage(StorageBackend):
             return
         try:
             self._client.put_object(
-                Bucket=self._config.bucket, Key=object_key, Body=payload
+                Bucket=self._config.bucket,
+                Key=object_key,
+                Body=payload,
+                **self._checksum_kwargs(),
             )
         except ClientError as exc:
             raise _translate(exc, object_key) from exc
@@ -204,7 +255,7 @@ class S3Storage(StorageBackend):
         part_size = self._config.part_size
         try:
             upload_id = self._client.create_multipart_upload(
-                Bucket=self._config.bucket, Key=object_key
+                Bucket=self._config.bucket, Key=object_key, **self._checksum_kwargs()
             )["UploadId"]
         except ClientError as exc:
             raise _translate(exc, object_key) from exc
@@ -221,6 +272,7 @@ class S3Storage(StorageBackend):
                     UploadId=upload_id,
                     PartNumber=number,
                     Body=chunk,
+                    **self._checksum_kwargs(),
                 )
                 # ETag 必须原样回传给 complete，不能去掉引号
                 parts.append({"ETag": response["ETag"], "PartNumber": number})
@@ -359,7 +411,9 @@ class S3Storage(StorageBackend):
     def read(self, key: str) -> bytes:
         object_key = self.object_key(key)
         try:
-            response = self._client.get_object(Bucket=self._config.bucket, Key=object_key)
+            response = self._client.get_object(
+                Bucket=self._config.bucket, Key=object_key, **self._checksum_mode_kwargs()
+            )
             return response["Body"].read()
         except ClientError as exc:
             raise _translate(exc, object_key) from exc
@@ -373,6 +427,8 @@ class S3Storage(StorageBackend):
             raise ValueError(f"length must be > 0, got {length}")
         object_key = self.object_key(key)
         try:
+            # 不带 ChecksumMode：Range GET 只拿到对象的一部分，整对象校验和对局部
+            # 内容无从验证；字节级的把关交给调用方（见 module docstring）。
             response = self._client.get_object(
                 Bucket=self._config.bucket,
                 Key=object_key,
@@ -420,4 +476,9 @@ class S3Storage(StorageBackend):
         return object_key[len(root) + 1 :] if object_key.startswith(root + "/") else object_key
 
 
-__all__ = ["S3Config", "S3Storage"]
+__all__ = [
+    "DEFAULT_CHECKSUM_ALGORITHM",
+    "SUPPORTED_CHECKSUM_ALGORITHMS",
+    "S3Config",
+    "S3Storage",
+]

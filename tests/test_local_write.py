@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import json
-import zlib
+import os
+import threading
 from pathlib import Path
 
 import pytest
@@ -89,17 +90,25 @@ def test_data_file_matches_tensor_bytes(saved) -> None:
             assert payload == expected, fqn
 
 
-def test_shard_crc_and_metadata_crc_match(saved) -> None:
+def test_index_carries_no_checksums(saved) -> None:
+    """索引不再存分片校验和，COMMIT 也不再记 ``.metadata`` 的 crc32。
+
+    字节级完整性由上传边界负责（``storage/object.py`` 的对象级校验和），本地层
+    只留「分片坐标 + 字节数」。字段仍在格式里，所以旧 checkpoint 照样能读。
+    """
     root, _, report = saved
     storage = LocalStorage(root)
 
     for meta in report.index.tensors.values():
         for shard in meta.shards:
-            payload = read_shard(storage, report, shard)
-            assert shard.crc32c == f"{zlib.crc32(payload) & 0xFFFFFFFF:08x}"
+            assert shard.crc32c is None
+    for blob in report.index.blobs.values():
+        assert blob.crc32c is None
 
+    assert report.commit.metadata_crc32 is None
+
+    # 长度照旧要对得上：COMMIT 里的字节数仍是索引完整性的唯一凭据
     metadata = storage.read(f"{version_key(42)}/{META_FILE}")
-    assert report.commit.metadata_crc32 == f"{zlib.crc32(metadata) & 0xFFFFFFFF:08x}"
     assert report.commit.metadata_bytes == len(metadata)
 
 
@@ -251,3 +260,69 @@ def test_commit_record_is_stable_json(saved) -> None:
     assert payload["metadata"]["file"] == META_FILE
     assert payload["format_version"] == 1
     assert list(payload["files"]) == [report.file]
+
+
+# --- 两条引擎的临时文件命名必须同构 -------------------------------------------
+
+
+def test_temp_path_matches_native_layout(tmp_path: Path) -> None:
+    """``<final>.tmp.<pid>.<序号>``：与 C++ ``MakeTempPath`` 逐字一致。
+
+    同目录是 rename 原子的前提；pid + 自增序号是两个写者不共用临时文件的保证。
+    """
+    import storage.local as local_backend  # noqa: PLC0415
+
+    target = tmp_path / "step_1" / "__0_0.distcp"
+    first = local_backend._temp_path(target)
+    second = local_backend._temp_path(target)
+
+    assert first != second, "同一进程内两次写入不能共用同一个临时文件"
+    assert first.parent == target.parent, "临时文件必须与目标文件同目录"
+    stem, pid, counter = first.name.rsplit(".", 2)
+    assert stem == "__0_0.distcp.tmp"
+    assert pid == str(os.getpid())
+    assert counter.isdigit()
+
+
+def test_concurrent_writers_get_distinct_temp_files(tmp_path: Path, monkeypatch) -> None:
+    """两个写者同时写同一个 key：各写各的临时文件，最终内容是完整的一份。
+
+    固定临时文件名（``<final>.tmp``）会让两个写者交错写进同一个文件，rename
+    之后可能留下混合内容；这条测试锁住的是「原子性 ≠ 互斥性」那一格。
+    """
+    import storage.local as local_backend  # noqa: PLC0415
+
+    seen: list[Path] = []
+    real = local_backend._temp_path
+
+    def spy(path: Path) -> Path:
+        temp = real(path)
+        seen.append(temp)
+        return temp
+
+    monkeypatch.setattr(local_backend, "_temp_path", spy)
+
+    storage = LocalStorage(tmp_path, engine="python")
+    payloads = [bytes([0xAA]) * 4096, bytes([0xBB]) * 4096]
+    barrier = threading.Barrier(2)
+    errors: list[BaseException] = []
+
+    def writer(payload: bytes) -> None:
+        barrier.wait()
+        try:
+            storage.write("step_1/data.bin", payload)
+        except BaseException as exc:  # pragma: no cover - 失败即测试失败
+            errors.append(exc)
+
+    threads = [threading.Thread(target=writer, args=(payload,)) for payload in payloads]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert not errors, f"并发写失败: {errors}"
+    assert len(seen) == 2 and seen[0] != seen[1], "两个写者必须使用不同的临时文件"
+
+    final = (tmp_path / "step_1" / "data.bin").read_bytes()
+    assert final in payloads, "最终内容必须是某个写者的完整内容，不能是交错的混合"
+    assert not [p.name for p in (tmp_path / "step_1").iterdir() if ".tmp." in p.name]

@@ -8,6 +8,9 @@
 - ``GET ?list-type=2`` 的 ListObjectsV2 单页列举
 - multipart：``POST ?uploads`` → ``PUT ?partNumber&uploadId`` → ``POST ?uploadId``，
   以及 ``DELETE ?uploadId`` 的 abort
+- 对象级校验和：PUT / upload_part 带 ``x-amz-checksum-*`` 时**真的重算并比对**，
+  不匹配回 400 ``BadDigest``；GET 带 ``x-amz-checksum-mode: ENABLED`` 时回传
+  服务端记录的值（所以把 ``store.objects`` 里的内容改掉就能模拟静默损坏）
 
 不校验签名，不分页（对象数远小于 1000），也不校验分片大小。响应格式对齐 S3，
 boto3 能直接解析；``ObjectStore.requests`` 记录请求流水，供测试断言走的哪条路径。
@@ -15,14 +18,53 @@ boto3 能直接解析；``ObjectStore.requests`` 记录请求流水，供测试�
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import struct
 import sys
 import threading
 import uuid
+import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Iterator
 from urllib.parse import parse_qs, unquote, urlparse
 from xml.sax.saxutils import escape
+
+# --- 校验和 -----------------------------------------------------------------
+
+_CHECKSUM_ALGORITHMS = ("crc32", "crc32c", "sha1", "sha256")
+"""S3 的校验和头是小写算法名：``x-amz-checksum-crc32`` / ``crc32c`` / ``sha1`` / ``sha256``。"""
+
+_CRC32C_POLY = 0x82F63B78
+_CRC32C_TABLE: list[int] = []
+for _i in range(256):
+    _c = _i
+    for _ in range(8):
+        _c = (_c >> 1) ^ _CRC32C_POLY if _c & 1 else _c >> 1
+    _CRC32C_TABLE.append(_c)
+
+
+def _crc32c(payload: bytes) -> int:
+    """CRC32C（Castagnoli）。纯 Python 查表：桩只处理测试规模的数据。"""
+    crc = 0xFFFFFFFF
+    for byte in payload:
+        crc = _CRC32C_TABLE[(crc ^ byte) & 0xFF] ^ (crc >> 8)
+    return crc ^ 0xFFFFFFFF
+
+
+def checksum_b64(payload: bytes, algorithm: str) -> str:
+    """按算法算 base64 摘要，格式与 ``x-amz-checksum-<alg>`` 头一致。"""
+    if algorithm == "crc32":
+        digest = struct.pack(">I", zlib.crc32(payload) & 0xFFFFFFFF)
+    elif algorithm == "crc32c":
+        digest = struct.pack(">I", _crc32c(payload))
+    elif algorithm == "sha1":
+        digest = hashlib.sha1(payload).digest()
+    elif algorithm == "sha256":
+        digest = hashlib.sha256(payload).digest()
+    else:  # pragma: no cover - 调用点只传上面四种
+        raise ValueError(f"unsupported checksum algorithm {algorithm!r}")
+    return base64.b64encode(digest).decode("ascii")
 
 
 class ObjectStore:
@@ -37,6 +79,14 @@ class ObjectStore:
         self.requests: list[tuple[str, str, dict[str, str]]] = []
         # 测试注入：让 upload_part 返回 500，验证 abort 清理
         self.fail_upload_part = False
+        # 对象 key -> {"algorithm", "value"}：服务端自己算的校验和，GET 带
+        # x-amz-checksum-mode: ENABLED 时回传。只改 objects 里的内容而不动这里，
+        # 就能模拟「存进去的字节坏了、而校验和还停在写入时的值」。
+        self.checksums: dict[str, dict[str, str]] = {}
+        # 客户端实际带来的校验和头：(object_key, algorithm, 头里的值)
+        self.checksum_headers: list[tuple[str, str, str]] = []
+        # 测试注入：打开后不带校验和头的 PUT 直接 400，用来证明客户端确实在发
+        self.require_checksum = False
 
 
 def _etag(payload: bytes) -> str:
@@ -88,6 +138,8 @@ def _make_handler(store: ObjectStore) -> type[BaseHTTPRequestHandler]:
                 return
 
             payload = self.rfile.read(length) if length else b""
+            if not self._verify_checksum(key, payload, required=store.require_checksum):
+                return
             with store.lock:
                 store.objects[key] = payload
             self._send(200, b"", etag=_etag(payload))
@@ -108,7 +160,13 @@ def _make_handler(store: ObjectStore) -> type[BaseHTTPRequestHandler]:
             if range_header:
                 self._send_range(payload, range_header)
                 return
-            self._send(200, payload, "application/octet-stream", etag=_etag(payload))
+            self._send(
+                200,
+                payload,
+                "application/octet-stream",
+                etag=_etag(payload),
+                extra_headers=self._checksum_response_headers(key),
+            )
 
         def do_HEAD(self) -> None:
             _, key = self._target()
@@ -120,6 +178,8 @@ def _make_handler(store: ObjectStore) -> type[BaseHTTPRequestHandler]:
             self.send_response(200)
             self.send_header("Content-Length", str(len(payload)))
             self.send_header("ETag", _etag(payload))
+            for name, value in self._checksum_response_headers(key).items():
+                self.send_header(name, value)
             self.end_headers()
 
         def do_POST(self) -> None:
@@ -189,6 +249,11 @@ def _make_handler(store: ObjectStore) -> type[BaseHTTPRequestHandler]:
                     return
                 payload = source_payload[self._copy_source_range(len(source_payload))]
 
+            if not copy_source and not self._verify_checksum(
+                key, payload, required=False, record=False
+            ):
+                return
+
             with store.lock:
                 upload = store.uploads.get(upload_id)
                 if upload is not None:
@@ -225,6 +290,11 @@ def _make_handler(store: ObjectStore) -> type[BaseHTTPRequestHandler]:
                 if parts is not None:
                     payload = b"".join(parts[n] for n in sorted(parts))
                     store.objects[key] = payload
+                    # 合成后的整对象由服务端自己算一份，GET 回验用
+                    store.checksums[key] = {
+                        "algorithm": "crc32",
+                        "value": checksum_b64(payload, "crc32"),
+                    }
             if parts is None:
                 self._error(404, "NoSuchUpload", upload_id)
                 return
@@ -292,13 +362,70 @@ def _make_handler(store: ObjectStore) -> type[BaseHTTPRequestHandler]:
             ).encode()
             self._send(status, body, "application/xml")
 
-        def _send(self, status: int, body: bytes, content_type: str = "", *, etag: str = "") -> None:
+        # --- 校验和 ---------------------------------------------------------
+        def _verify_checksum(
+            self, key: str, payload: bytes, *, required: bool, record: bool = True
+        ) -> bool:
+            """按客户端带来的 ``x-amz-checksum-*`` 头重算并比对。
+
+            不匹配回 400 ``BadDigest``（与真实 S3 一致），返回 False 让调用方提前结束。
+            ``record`` 为真时把服务端自己算的值记进 ``store.checksums``，供 GET 回传。
+            """
+            found = False
+            for algorithm in _CHECKSUM_ALGORITHMS:
+                header = self.headers.get(f"x-amz-checksum-{algorithm}")
+                if not header:
+                    continue
+                found = True
+                expected = checksum_b64(payload, algorithm)
+                with store.lock:
+                    store.checksum_headers.append((key, algorithm, header))
+                if header != expected:
+                    self._error(400, "BadDigest", f"{key}: checksum-{algorithm} mismatch")
+                    return False
+                if record:
+                    with store.lock:
+                        store.checksums[key] = {"algorithm": algorithm, "value": header}
+            if required and not found:
+                self._error(400, "InvalidRequest", f"{key}: checksum header required")
+                return False
+            if not found and record:
+                # 真实 S3 总会在服务端算一份并存下来；不带头的上传也照样记录
+                with store.lock:
+                    store.checksums[key] = {
+                        "algorithm": "crc32",
+                        "value": checksum_b64(payload, "crc32"),
+                    }
+            return True
+
+        def _checksum_response_headers(self, key: str) -> dict[str, str]:
+            """GET/HEAD 带 ``x-amz-checksum-mode: ENABLED`` 时回传记录的校验和。"""
+            mode = self.headers.get("x-amz-checksum-mode", "")
+            if mode.upper() != "ENABLED":
+                return {}
+            with store.lock:
+                entry = store.checksums.get(key)
+            if not entry:
+                return {}
+            return {f"x-amz-checksum-{entry['algorithm']}": entry["value"]}
+
+        def _send(
+            self,
+            status: int,
+            body: bytes,
+            content_type: str = "",
+            *,
+            etag: str = "",
+            extra_headers: dict[str, str] | None = None,
+        ) -> None:
             self.send_response(status)
             if content_type:
                 self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
             if etag:
                 self.send_header("ETag", etag)
+            for name, value in (extra_headers or {}).items():
+                self.send_header(name, value)
             self.end_headers()
             if body:
                 self.wfile.write(body)

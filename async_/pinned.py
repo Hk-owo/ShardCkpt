@@ -169,9 +169,12 @@ class PinnedBufferPool(BufferPool):
             while True:
                 if self._closed:
                     raise PoolError("池已关闭")
-                chunk = self._best_fit(nbytes)
-                if chunk is not None:
-                    self._free.remove(chunk)
+                position = self._best_fit(nbytes)
+                if position is not None:
+                    # 按位置取，不能 list.remove(array)：numpy 的 == 是逐元素比较，
+                    # 池里同时存在不同大小的块时广播会失败（同一对象的比较有短路，
+                    # 所以只有混装大小才暴露）。
+                    chunk = self._free.pop(position)
                     self._stats.reuses += 1
                     return self._take(chunk, nbytes)
 
@@ -251,11 +254,12 @@ class PinnedBufferPool(BufferPool):
             return True
         return self._stats.capacity_bytes + capacity <= self.max_bytes
 
-    def _best_fit(self, nbytes: int) -> np.ndarray | None:
-        best: np.ndarray | None = None
-        for array in self._free:
-            if array.nbytes >= nbytes and (best is None or array.nbytes < best.nbytes):
-                best = array
+    def _best_fit(self, nbytes: int) -> int | None:
+        """返回满足大小要求的最小空闲块的下标（没有就返回 None）。"""
+        best: int | None = None
+        for index, array in enumerate(self._free):
+            if array.nbytes >= nbytes and (best is None or array.nbytes < self._free[best].nbytes):
+                best = index
         return best
 
     def _take(self, array: np.ndarray, nbytes: int) -> PinnedBuffer:

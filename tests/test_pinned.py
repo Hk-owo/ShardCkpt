@@ -63,6 +63,19 @@ def test_best_fit_picks_smallest_sufficient_block() -> None:
     small.release()
 
 
+def test_best_fit_works_when_the_match_is_not_first() -> None:
+    """命中块不在空闲列表首位时也要能取到（numpy 的 == 不能拿来查列表）。"""
+    pool = PinnedBufferPool(chunk_bytes=4096, min_chunks=0)
+    big = pool.acquire(8192)
+    small = pool.acquire(4096)
+    big.release()  # 空闲: [8K]
+    small.release()  # 空闲: [8K, 4K]
+
+    got = pool.acquire(1024)
+    assert got.capacity == 4096, "best-fit 取 4K，而它在列表第二位"
+    got.release()
+
+
 def test_request_larger_than_chunk_rounds_up() -> None:
     pool = PinnedBufferPool(chunk_bytes=4096, min_chunks=0)
     buffer = pool.acquire(9000)
