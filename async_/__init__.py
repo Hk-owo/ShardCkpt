@@ -1,4 +1,4 @@
-"""设备内存后端。
+"""设备内存与拷贝后端：pinned buffer 池、D2H stream 的对接面。
 
 这是「接口与真实 GPU 读取一致」的关键：读取路径只依赖 DeviceBackend 的
 allocate / copy_h2d / copy_d2h / synchronize，不关心底层是显存还是普通内存。
@@ -7,17 +7,21 @@ allocate / copy_h2d / copy_d2h / synchronize，不关心底层是显存还是普
 - MockCudaBackend 用 host 内存模拟显存，供无 GPU 环境跑通完整读取路径
 - 将来接入真机：实现一个 CudaBackend 并 register_backend() 覆盖 "cuda" 即可，
   调用方代码与测试代码都不用改。
+
+Tensor 的 buffer 由 backend 分配，调用方拿不到裸指针，只能通过 ``tobytes()`` /
+``numpy()`` 取 host 副本，这样真实 GPU 实现与 mock 实现的调用方式完全一致。
 """
 
 from __future__ import annotations
 
 import abc
-from dataclasses import dataclass, field
+import zlib
+from dataclasses import dataclass
 
 import numpy as np
 
-from .device import Device
-from .errors import UnsupportedDeviceError
+from core import UnsupportedDeviceError
+from core.metadata import Device, numpy_dtype
 
 
 @dataclass
@@ -161,3 +165,115 @@ def reset_registry() -> None:
 
 
 reset_registry()
+
+
+class Tensor:
+    """一个位于 device 上的张量。
+
+    与 torch.Tensor 的对应关系：
+    - ``t.device`` / ``t.dtype`` / ``t.shape``
+    - ``t.to("cpu")``      设备迁移
+    - ``t.numpy()``        取 host 副本（真实 GPU 上等价于 D2H 拷贝）
+    """
+
+    __slots__ = ("_backend", "_buffer", "_device", "_dtype", "_name", "_shape")
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        buffer: np.ndarray,
+        device: Device,
+        dtype: str,
+        shape: tuple[int, ...],
+        backend: DeviceBackend,
+    ) -> None:
+        self._name = name
+        self._buffer = buffer
+        self._device = device
+        self._dtype = dtype
+        self._shape = tuple(shape)
+        self._backend = backend
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    @property
+    def device(self) -> Device:
+        return self._device
+
+    @property
+    def dtype(self) -> str:
+        return self._dtype
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        return self._shape
+
+    @property
+    def numel(self) -> int:
+        return int(np.prod(self._shape, dtype=np.int64)) if self._shape else 1
+
+    @property
+    def nbytes(self) -> int:
+        return self._buffer.nbytes
+
+    def tobytes(self) -> bytes:
+        """device -> host 的原始字节拷贝。"""
+        host = bytearray(self.nbytes)
+        self._backend.copy_d2h(memoryview(host), self._buffer)
+        self._backend.synchronize()
+        return bytes(host)
+
+    def numpy(self) -> np.ndarray:
+        """返回 host 上的数组副本（可写），不共享 device 内存。"""
+        raw = np.frombuffer(self.tobytes(), dtype=numpy_dtype(self._dtype))
+        return raw.reshape(self._shape).copy()
+
+    def to(self, device: "str | Device") -> "Tensor":
+        """迁移到另一个设备；同设备直接返回自身。"""
+        target = Device.parse(device)
+        if target == self._device:
+            return self
+
+        host = bytearray(self.nbytes)
+        self._backend.copy_d2h(memoryview(host), self._buffer)
+        self._backend.synchronize()
+
+        dst_backend = get_backend(target)
+        dst_buffer = dst_backend.allocate(self.nbytes)
+        dst_backend.copy_h2d(dst_buffer, memoryview(host))
+        dst_backend.synchronize()
+
+        return Tensor(
+            name=self._name,
+            buffer=dst_buffer,
+            device=target,
+            dtype=self._dtype,
+            shape=self._shape,
+            backend=dst_backend,
+        )
+
+    def crc32(self) -> int:
+        return zlib.crc32(self.tobytes()) & 0xFFFFFFFF
+
+    def __len__(self) -> int:
+        return self._shape[0] if self._shape else 0
+
+    def __repr__(self) -> str:
+        shape = "x".join(str(d) for d in self._shape) if self._shape else "scalar"
+        return f"Tensor({self._name!r}, dtype={self._dtype}, shape={shape}, device={self._device})"
+
+
+__all__ = [
+    "BackendStats",
+    "CpuBackend",
+    "DeviceBackend",
+    "MockCudaBackend",
+    "Tensor",
+    "available_device_types",
+    "get_backend",
+    "register_backend",
+    "reset_registry",
+]

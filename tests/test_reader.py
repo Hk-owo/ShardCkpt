@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-import ckpt
+import api as ckpt
 
 
 def manifest_of(root: Path) -> dict:

@@ -1,7 +1,7 @@
-"""ShardCkpt 读取相关异常。
+"""ShardCkpt 核心层：纯数据结构与异常，零依赖。
 
 核心层不抛裸异常，所有失败都收敛到 CheckpointError 的子类，
-后续 C++ 绑定时可以直接按异常类型映射。
+接入其他语言的绑定层时可以直接按异常类型映射。
 """
 
 from __future__ import annotations
@@ -25,3 +25,12 @@ class ChecksumError(CheckpointError):
 
 class UnsupportedDeviceError(CheckpointError):
     """设备没有可用的 backend（例如请求了 cuda 但既无 GPU 也无 mock）。"""
+
+
+__all__ = [
+    "CheckpointError",
+    "ChecksumError",
+    "FormatError",
+    "MissingTensorError",
+    "UnsupportedDeviceError",
+]

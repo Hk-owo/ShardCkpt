@@ -1,13 +1,9 @@
-"""ShardCkpt 数据读取接口。
+"""本地盘 / 并行文件系统后端：manifest 解析与按张量读取。
 
-接口形态按「从 GPU 读取」设计：
+读取路径固定为：host 文件 -> staging buffer -> H2D 拷贝 -> device buffer，
+迁移与取值都经过 backend，调用方从不直接触碰 device 内存。
 
-1. 加载时显式指定目标设备（对应 ``torch.load(map_location=...)``）
-2. 数据路径固定为  host 文件 -> staging buffer -> H2D 拷贝 -> device buffer
-3. 迁移与取值都经过 backend，调用方从不直接触碰 device 内存
-
-当前机器没有 GPU，cuda 分支由 MockCudaBackend 承载，读取路径与真机一致；
-接入真卡后只需注册一个真实的 cuda backend。
+当前机器没有 GPU，cuda 分支由 MockCudaBackend 承载，读取路径与真机一致。
 """
 
 from __future__ import annotations
@@ -17,11 +13,9 @@ import zlib
 from dataclasses import dataclass
 from pathlib import Path
 
-from .backend import DeviceBackend, get_backend
-from .device import CPU, Device
-from .dtype import itemsize
-from .errors import ChecksumError, FormatError, MissingTensorError
-from .tensor import Tensor
+from async_ import DeviceBackend, Tensor, get_backend
+from core import ChecksumError, FormatError, MissingTensorError
+from core.metadata import CPU, Device, itemsize
 
 # 真实实现里 staging 是 page-locked（cudaHostAlloc）内存；这里的 bytearray 只保证
 # 代码路径一致，不做 pinned 语义。
@@ -97,6 +91,13 @@ def _resolve(root: Path, rel: str) -> Path:
     if rel_path.is_absolute() or ".." in rel_path.parts:
         raise FormatError(f"invalid tensor path in manifest: {rel!r}")
     return root / rel_path
+
+
+def _numel(shape: tuple[int, ...]) -> int:
+    n = 1
+    for dim in shape:
+        n *= int(dim)
+    return n
 
 
 class CheckpointReader:
@@ -233,22 +234,4 @@ class CheckpointReader:
         return manifest
 
 
-def _numel(shape: tuple[int, ...]) -> int:
-    n = 1
-    for dim in shape:
-        n *= int(dim)
-    return n
-
-
-def load(
-    path: str | Path,
-    *,
-    device: "str | Device" = "cpu",
-    verify_crc: bool = True,
-    staging: bool = True,
-) -> CheckpointData:
-    """便捷入口，对应 ``torch.load(path, map_location=device)``。"""
-    reader = CheckpointReader.open(
-        path, device=device, verify_crc=verify_crc, staging=staging
-    )
-    return reader.read_all()
+__all__ = ["CheckpointData", "CheckpointReader", "LoadOptions"]

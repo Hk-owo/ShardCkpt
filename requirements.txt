@@ -1,0 +1,4 @@
+# Python 侧运行依赖
+numpy>=1.26
+# S3 兼容对象存储（SeaweedFS / MinIO / AWS S3），见 storage/object.py
+boto3>=1.34

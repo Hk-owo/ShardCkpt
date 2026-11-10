@@ -7,8 +7,8 @@ from pathlib import Path
 
 import pytest
 
-ROOT = Path(__file__).resolve().parents[2]
-for extra in (ROOT / "python" / "src", ROOT / "tests" / "fixtures"):
+ROOT = Path(__file__).resolve().parents[1]
+for extra in (ROOT, ROOT / "tests", ROOT / "tests" / "fixtures"):
     if str(extra) not in sys.path:
         sys.path.insert(0, str(extra))
 
@@ -16,7 +16,7 @@ for extra in (ROOT / "python" / "src", ROOT / "tests" / "fixtures"):
 @pytest.fixture(autouse=True)
 def _fresh_backends():
     """每个用例都从默认 backend 注册表开始，避免相互污染。"""
-    import ckpt
+    import api as ckpt  # noqa: PLC0415
 
     ckpt.reset_registry()
     yield

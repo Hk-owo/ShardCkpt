@@ -1,9 +1,21 @@
-"""设备描述：与 PyTorch 的 "cpu" / "cuda:N" 写法保持一致。"""
+"""分片元数据与索引的序列化基础：设备描述、dtype 映射。
+
+零依赖纯数据，供 storage/、async_/、api 共用：
+
+- ``Device``  设备端点，写法与 ``torch.device`` 的 ``"cpu"`` / ``"cuda:N"`` 一致
+- dtype 名称与 numpy 的映射，名称与测试数据 manifest 里的写法完全一致；
+  bf16 没有 numpy 原生类型，用 uint16 承载原始位模式
+  （与 tests/fixtures/make_data.py 一致）
+"""
 
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+
+import numpy as np
+
+# --- 设备 -------------------------------------------------------------------
 
 _DEVICE_RE = re.compile(r"^(cpu|cuda)(?::(\d+))?$")
 
@@ -49,3 +61,40 @@ CPU = Device("cpu")
 
 def cuda(index: int = 0) -> Device:
     return Device("cuda", index)
+
+
+# --- dtype ------------------------------------------------------------------
+
+DTYPE_TO_NUMPY: dict[str, np.dtype] = {
+    "f64": np.dtype(np.float64),
+    "f32": np.dtype(np.float32),
+    "f16": np.dtype(np.float16),
+    "bf16": np.dtype(np.uint16),
+    "i64": np.dtype(np.int64),
+    "i32": np.dtype(np.int32),
+    "i16": np.dtype(np.int16),
+    "i8": np.dtype(np.int8),
+    "u8": np.dtype(np.uint8),
+    "bool": np.dtype(np.uint8),
+}
+
+
+def numpy_dtype(name: str) -> np.dtype:
+    try:
+        return DTYPE_TO_NUMPY[name]
+    except KeyError:
+        raise ValueError(f"unsupported dtype {name!r}") from None
+
+
+def itemsize(name: str) -> int:
+    return numpy_dtype(name).itemsize
+
+
+__all__ = [
+    "CPU",
+    "DTYPE_TO_NUMPY",
+    "Device",
+    "cuda",
+    "itemsize",
+    "numpy_dtype",
+]

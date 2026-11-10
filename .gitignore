@@ -1,0 +1,38 @@
+# python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+
+# 生成的数据与构建产物
+build/
+build-*/
+cmake-build-debug/
+tests/fixtures/data/
+*.bin
+*.ckpt
+
+# 本地 S3 落盘目录
+s3data/
+data/
+tmp/
+
+# editors
+.idea/
+.vscode/
+
+# 本地凭据（禁止提交）
+.github_token
+*.token
+.env
+.env.*
+
+# 本地草稿（结构图草稿，不提交）
+Trans
+分布式训练Checkpoint训练方案.md
+
+# 隐藏文件：IDE / 工具目录 / 本地配置，只保留 .gitignore 与 .github/
+.*
+!.gitignore
+!.github/

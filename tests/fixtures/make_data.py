@@ -3,7 +3,7 @@
 
 只造数据，不做训练模拟：没有训练循环、没有参数演化、没有 loss/lr。
 数据形态对齐 PyTorch 训练时的 state_dict（模型参数 + optimizer 状态），
-输出为裸二进制 + manifest.json，C++ 与 Python 测试都能直接读。
+输出为裸二进制 + manifest.json，任何语言的测试都能直接读。
 
 用法：
     python tests/fixtures/make_data.py --out /tmp/ckpt-data --scale small
@@ -21,7 +21,7 @@ from typing import Iterator
 
 import numpy as np
 
-# dtype 名称与 C++ 侧 DType 枚举保持一致；bf16 没有 numpy 原生类型，用 uint16 承载原始位。
+# dtype 名称与 manifest 保持一致；bf16 没有 numpy 原生类型，用 uint16 承载原始位。
 DTYPE_TO_NUMPY: dict[str, np.dtype] = {
     "f64": np.dtype(np.float64),
     "f32": np.dtype(np.float32),

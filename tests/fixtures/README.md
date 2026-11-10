@@ -36,7 +36,7 @@ python tests/fixtures/make_data.py --out /tmp/ckpt-data --no-optimizer
 | `total_bytes` | 全部 tensor 字节数之和 |
 | `tensors[]` | 每项含 `name` / `file` / `kind` / `dtype` / `shape` / `nbytes` / `crc32` |
 
-`kind` 为 `model` 或 `optimizer`；`crc32` 是 zlib 的 CRC32（C++ 侧可直接用 zlib 校验）。
+`kind` 为 `model` 或 `optimizer`；`crc32` 是 zlib 的 CRC32。
 
 ## 规模
 
@@ -76,11 +76,3 @@ write_dataset("/tmp/b", seed=7, scale="tiny")  # 两个目录内容逐字节相�
 ```bash
 .venv/bin/python -m pytest tests/fixtures/test_make_data.py -q
 ```
-
-## 与 C++ 侧的衔接
-
-数据是裸二进制 + JSON，C++ 测试不依赖 Python 运行时：
-
-1. 用生成器产出一份数据到 `build/fixtures/`
-2. C++ 读 `manifest.json`（可用任意 JSON 库）与 `tensors/*.bin`
-3. 用 `crc32` 校验；`shape` + `dtype` 驱动 `TensorView` 的构造
