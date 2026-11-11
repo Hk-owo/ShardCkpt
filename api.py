@@ -38,9 +38,9 @@ from async_ import (
     register_backend,
     reset_registry,
 )
+from commit.gc import GcReport, GcWorker, collect, delete_local_version
 from commit.local import (
     CommitRecord,
-    update_latest,
     version_key,
     write_commit,
     write_metadata,
@@ -60,6 +60,15 @@ from core import (
 from core.metadata import CPU, Device, cuda
 from storage.fs import CheckpointData, CheckpointReader, LoadOptions
 from storage.local_load import LoadReport, load_local
+from storage.upload import (
+    DEFAULT_BUDGET_BYTES as DEFAULT_UPLOAD_BUDGET_BYTES,
+    ObjectLoadReport,
+    ObjectVersion,
+    UploadCommit,
+    finalize_upload as _finalize_upload,
+    load_object_version,
+    upload_rank as _upload_rank,
+)
 
 
 def load(
@@ -253,7 +262,7 @@ def save_local(
     """把一组 device 上的张量写成一份可恢复的本地 checkpoint（同步版本）。
 
     顺序固定：plan → 取 pinned 块 → 按 ``item.byte_offset`` D2H → 写数据文件 →
-    写 ``.metadata`` → 写 ``COMMIT`` → 更新 ``latest``，每一步都对应状态机的一条边。
+    写 ``.metadata`` → 写 ``COMMIT``，每一步都对应状态机的一条边。
 
     ``tensors``: FQN -> ``Tensor``（真机在 GPU 上，mock 下是 host 内存）
     ``blobs``:   小状态的**已序列化字节**（RNG / lr scheduler / dataloader 位置）
@@ -324,7 +333,10 @@ def save_local(
         snapshot.d2h_done()  # host 数据从这一刻起不可变
 
         index = _build_index(plan, step=step, layout=layout)
-        index.validate()
+        # 单 rank 只看得到自己那片：`complete=False` 只做局部自检。全局覆盖由
+        # 「汇总/恢复的一方」负责——本地多 rank 汇总后，或对象存储恢复端合并索引后。
+        # 用 ``complete=True`` 会让任何带分片的保存（TP/ZeRO）直接 PlanError。
+        index.validate(complete=False)
 
         # 1) 数据文件：临时文件 -> fsync -> rename -> 目录 fsync
         storage.write_view(f"{key}/{plan.file}", view[:aligned_size])
@@ -336,18 +348,26 @@ def save_local(
         metadata_bytes = write_metadata(storage, step, index)
         snapshot.persist_ok()  # 本 rank 的数据已落地
 
-        # 3) COMMIT + latest：这两步之后这一版才可恢复
+        # 3) COMMIT：这一步之后这一版才可恢复
         record = CommitRecord(
             step=step,
             metadata_bytes=metadata_bytes,
             files={plan.file: file_size},
         )
         write_commit(storage, record)
-        update_latest(storage, step)
         snapshot.commit_ok()
     except BaseException as exc:
         # 状态机自己区分：还没写过文件 -> DROPPED；有残缺目录 -> ABORTED
         snapshot.fail(f"{type(exc).__name__}: {exc}")
+        if snapshot.state is SnapshotState.ABORTED:
+            # 就地清掉残缺目录（先 COMMIT 再数据），然后把状态机的待清理标记结掉。
+            # 这样「本地无 COMMIT 的残目录」几乎只剩 SIGKILL 一种来源，定时 GC 只兜底。
+            # 清理失败不能掩盖原始异常。
+            try:
+                delete_local_version(root, step)
+                snapshot.mark_cleaned()
+            except Exception:  # pragma: no cover - 清理失败不掩盖原始异常
+                pass
         raise
 
     return SaveReport(
@@ -364,6 +384,91 @@ def save_local(
     )
 
 
+# --- 对象存储上传（每 rank 独立上传，rank 0 只 list 检查） -------------------
+
+
+def upload_local(
+    root: str | Path,
+    storage: Any,
+    *,
+    step: int,
+    rank: int,
+) -> int:
+    """把本地 ``step_<step>`` 里**本 rank** 的产物上传到对象存储，返回上传字节数。
+
+    每个 rank 只写自己的前缀（``step_42/rank_<i>/``），先数据文件、再索引、
+    最后 ``rank_<i>/COMMIT``；三个都落盘才算这个 rank 完成。这个提交点同时也是
+    「本地 ``step_<step>/`` 可以删了」的证据。
+    """
+    return _upload_rank(root, storage, step=step, rank=rank)
+
+
+def finalize_upload(
+    storage: Any,
+    *,
+    step: int,
+    ranks: "list[int] | tuple[int, ...]",
+    layout: Mapping[str, int] | None = None,
+) -> UploadCommit:
+    """rank 0 的提交动作：``list`` 一次前缀确认全部 rank 都传完了，再写 ``COMMIT``。
+
+    它**不读**任何 rank 的索引，也不汇总分片：齐全性由每个 rank 的 ``rank_<i>/COMMIT``
+    证明，分片怎么拼由各 rank 的 ``.metadata`` 在恢复端合并时证明。判据只看提交点在
+    不在，所以这一步可以幂等重跑（rank 0 崩了，重启补一次即可）。
+    """
+    return _finalize_upload(storage, step, ranks=ranks, layout=layout)
+
+
+def load_object(
+    storage: Any,
+    *,
+    step: int | None = None,
+    device: "str | Device" = "cpu",
+    tp: int = 1,
+    tp_rank: int = 0,
+    shard_dims: Mapping[str, int] | None = None,
+    budget_bytes: int = DEFAULT_UPLOAD_BUDGET_BYTES,
+    column_strategy: str = "whole",
+) -> ObjectLoadReport:
+    """从对象存储恢复：``COMMIT`` 门禁 → 读各 rank 索引合并 → Range GET → H2D。"""
+    return load_object_version(
+        storage,
+        step=step,
+        device=device,
+        tp=tp,
+        tp_rank=tp_rank,
+        shard_dims=shard_dims,
+        budget_bytes=budget_bytes,
+        column_strategy=column_strategy,
+    )
+
+
+# --- 本地暂存回收（上传完即删） --------------------------------------------
+
+
+def gc_local(
+    local_root: str | Path,
+    storage: Any,
+    *,
+    rank: int,
+    dry_run: bool = True,
+) -> GcReport:
+    """回收本地 ``step_N/``：已上传的版本、以及被更新版本越过的残片。
+
+    判据只依赖 step 单调性 —— **没有保留策略，没有租约，没有时间阈值**：
+
+    - 远端的 ``step_N/rank_<rank>/COMMIT`` 在 ⇒ 本 rank 的分片已经到远端 ⇒ 本地这份
+      是纯冗余（本 rank 传完就删，不等最慢的 rank，也不等 rank 0 写版本 COMMIT）；
+    - 存在比 N 更新的版本 ``COMMIT`` ⇒ 训练已经越过第 N 代 ⇒ 本地 ``step_N/``
+      （哪怕它从没上传成功）与远端整个 ``step_N/`` 前缀都是残片；
+    - 其余一律保留：最新且未完成的可能就是**正在写**（本地）或**正在传**（远端）。
+
+    ``dry_run=True``（默认）只返回计划。远端不可达时什么都不删（``GcReport.aborted``
+    里记原因）。周期调用用 :class:`commit.gc.GcWorker`。
+    """
+    return collect(local_root, storage, rank=rank, dry_run=dry_run)
+
+
 __all__ = [
     "CPU",
     "BackendStats",
@@ -375,6 +480,8 @@ __all__ = [
     "Device",
     "DeviceBackend",
     "FormatError",
+    "GcReport",
+    "GcWorker",
     "LoadOptions",
     "LoadReport",
     "MissingTensorError",
@@ -388,11 +495,18 @@ __all__ = [
     "UnsupportedDeviceError",
     "available_device_types",
     "cuda",
+    "gc_local",
     "get_backend",
+    "ObjectLoadReport",
+    "ObjectVersion",
+    "UploadCommit",
+    "finalize_upload",
     "load",
     "load_local",
+    "load_object",
     "register_backend",
     "reset_registry",
     "save_async",
     "save_local",
+    "upload_local",
 ]

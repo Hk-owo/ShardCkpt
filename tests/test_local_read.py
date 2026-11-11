@@ -21,7 +21,6 @@ from async_ import PinnedBufferPool, aligned_allocator
 from commit.local import (
     COMMIT_FILE,
     CommitRecord,
-    update_latest,
     version_key,
     write_commit,
     write_metadata,
@@ -132,7 +131,6 @@ def write_tp_version(root: Path, tensors, *, step: int, tp: int, dims) -> Checkp
         storage,
         CommitRecord(step=step, metadata_bytes=metadata_bytes, files=files),
     )
-    update_latest(storage, step)
     return index
 
 
@@ -188,7 +186,9 @@ def test_native_and_python_engines_agree(saved) -> None:
         assert native.tensors[name].numpy().tobytes() == python.tensors[name].numpy().tobytes()
 
 
-def test_latest_step_is_used_when_step_is_omitted(dataset: Path, tmp_path: Path) -> None:
+def test_newest_committed_step_is_used_when_step_is_omitted(
+    dataset: Path, tmp_path: Path
+) -> None:
     data = ckpt.load(dataset, device="cuda:0")
     root = tmp_path / "local"
     ckpt.save_local(data.tensors, root, step=10, blobs=BLOBS)

@@ -13,7 +13,6 @@ import api as ckpt
 from async_ import PinnedBufferPool, SnapshotManager, SnapshotState, aligned_allocator
 from commit.local import (
     COMMIT_FILE,
-    LATEST_FILE,
     committed_steps,
     delete_version,
     latest_step,
@@ -54,7 +53,6 @@ def test_save_local_produces_recoverable_version(saved) -> None:
     assert report.size % 4096 == 0
     assert (root / "step_42" / COMMIT_FILE).is_file()
     assert (root / "step_42" / META_FILE).is_file()
-    assert (root / LATEST_FILE).is_file()
 
     record = read_commit(LocalStorage(root), 42)
     assert record is not None
@@ -142,7 +140,7 @@ def test_padding_bytes_are_zero(saved) -> None:
     assert payload[cursor:] == b"\x00" * (len(payload) - cursor)
 
 
-def test_latest_points_to_newest_committed_step(dataset: Path, tmp_path: Path) -> None:
+def test_newest_committed_step_wins(dataset: Path, tmp_path: Path) -> None:
     data = ckpt.load(dataset, device="cuda:0")
     root = tmp_path / "local"
     storage = LocalStorage(root)
@@ -152,7 +150,7 @@ def test_latest_points_to_newest_committed_step(dataset: Path, tmp_path: Path) -
 
     assert committed_steps(storage) == [10, 20]
     assert latest_step(storage) == 20
-    assert storage.read(LATEST_FILE).decode().strip() == "20"
+    assert not (root / "latest").exists(), "没有 latest 指针：最新版本靠扫描得出"
 
 
 def test_python_engine_closes_the_loop(dataset: Path, tmp_path: Path) -> None:
@@ -169,7 +167,7 @@ def test_python_engine_closes_the_loop(dataset: Path, tmp_path: Path) -> None:
 
 
 def test_write_failure_leaves_no_commit(dataset: Path, tmp_path: Path, monkeypatch) -> None:
-    """写数据失败：状态机进 ABORTED，恢复端看不到这一版（没有 COMMIT/latest）。"""
+    """写数据失败：状态机进 ABORTED，恢复端看不到这一版（没有 COMMIT）。"""
     data = ckpt.load(dataset, device="cuda:0")
     root = tmp_path / "local"
 
@@ -192,7 +190,6 @@ def test_write_failure_leaves_no_commit(dataset: Path, tmp_path: Path, monkeypat
     assert manager.stats.aborted == 1
     storage = LocalStorage(root)
     assert read_commit(storage, 5) is None
-    assert not (root / LATEST_FILE).exists()
     assert committed_steps(storage) == []
 
 
@@ -230,7 +227,7 @@ def test_delete_version_makes_it_unrecoverable(dataset: Path, tmp_path: Path) ->
 
     assert read_commit(storage, 2) is None
     assert committed_steps(storage) == [1]
-    assert latest_step(storage) == 1, "latest 指针失效时回退到扫描"
+    assert latest_step(storage) == 1, "删掉较新版本后，最新的已提交版本退到 1"
     assert (root / version_key(1) / COMMIT_FILE).is_file()
 
 

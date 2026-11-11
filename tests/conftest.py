@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-for extra in (ROOT, ROOT / "tests", ROOT / "tests" / "fixtures"):
+for extra in (ROOT, ROOT / "tests", ROOT / "tests" / "fixtures", ROOT / "tests" / "sim"):
     if str(extra) not in sys.path:
         sys.path.insert(0, str(extra))
 
@@ -21,6 +21,14 @@ def _fresh_backends():
     ckpt.reset_registry()
     yield
     ckpt.reset_registry()
+
+
+@pytest.fixture
+def state():
+    """一份默认规模的伪训练状态（42 个张量，约 148 KB），仿真与上传用例共用。"""
+    import sim  # noqa: PLC0415
+
+    return sim.make_state(step=0)
 
 
 @pytest.fixture

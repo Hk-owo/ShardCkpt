@@ -32,6 +32,9 @@ tmp/
 Trans
 分布式训练Checkpoint训练方案.md
 
+# demo 实现规格（与设计文档有偏差，只在本地保留）
+docs/
+
 # 隐藏文件：IDE / 工具目录 / 本地配置，只保留 .gitignore 与 .github/
 .*
 !.gitignore

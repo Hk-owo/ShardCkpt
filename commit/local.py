@@ -5,10 +5,13 @@
 1. 各 rank 写数据文件并 fsync（由 storage 层保证，`write()` 返回即已落盘）
 2. 写 ``.metadata``（索引）并 fsync
 3. 写 ``COMMIT``：临时文件 → rename（原子）→ 目录 fsync
-4. 更新 ``latest`` 指针
-5. 删旧版本时先删 ``COMMIT`` 再删数据（与写入顺序镜像）
+4. 删旧版本时先删 ``COMMIT`` 再删数据（与写入顺序镜像）
 
 恢复端只认带 ``COMMIT`` 的目录：没有 COMMIT 的版本一律视为未完成。
+
+没有 ``latest`` 指针：``step=None`` 的答案恒等于「所有带 COMMIT 的版本里最大的
+step」。指针省下的只是一次 ``list``（反正不读对象内容），却会带来「指针失效就
+恢复不了」「删版本要维护指针」「谁能写指针」三类问题，所以直接扫描。
 
 ``COMMIT`` 只记 ``.metadata`` 的**字节数**，不记校验和：原子 rename/PUT 已经排除
 「半写」，剩下的「长度不变、内容被改坏」由 JSON 解析 + ``CheckpointIndex.validate()``
@@ -28,7 +31,6 @@ from storage.base import ObjectNotFoundError, StorageBackend
 
 COMMIT_FILE = "COMMIT"
 COMMIT_TEMP = "COMMIT.tmp"
-LATEST_FILE = "latest"
 COMMIT_FORMAT_VERSION = 1
 
 
@@ -150,34 +152,24 @@ def committed_steps(storage: StorageBackend) -> list[int]:
 
 
 def latest_step(storage: StorageBackend) -> int | None:
-    """最新的可恢复版本：优先读 ``latest`` 指针，并确认它真的有 COMMIT。"""
-    pointer: int | None = None
-    try:
-        text = storage.read(LATEST_FILE).decode("utf-8").strip()
-        pointer = int(text)
-    except (ObjectNotFoundError, ValueError):
-        pointer = None
-    if pointer is not None and read_commit(storage, pointer) is not None:
-        return pointer
+    """最新的可恢复版本：所有带 ``COMMIT`` 的版本里最大的 step。
+
+    没有 ``latest`` 指针需要校验，也没有「指针失效」这条分支：这一个函数就是
+    ``step=None`` 的全部语义。
+    """
     steps = committed_steps(storage)
     return steps[-1] if steps else None
 
 
-def update_latest(storage: StorageBackend, step: int) -> None:
-    storage.write(LATEST_FILE, f"{step}\n".encode("utf-8"))
-
-
-def delete_version(storage: StorageBackend, step: int, *, keep_metadata: bool = False) -> None:
+def delete_version(storage: StorageBackend, step: int) -> None:
     """删一个版本：先删 COMMIT（立刻不可恢复），再删数据。
 
-    ``keep_metadata`` 留给「远端已提交、只清本地数据」的场景。
+    顺序与写入镜像：``COMMIT`` 一删，这一版就既不可恢复也不可上传；剩下的数据
+    文件即使删到一半被打断，重跑一次也能接着删（判据只看 COMMIT 在不在）。
     """
     key = version_key(step)
     storage.delete(f"{key}/{COMMIT_FILE}")
     for item in storage.list(key):
-        name = item.rsplit("/", 1)[-1]
-        if keep_metadata and name == META_FILE:
-            continue
         storage.delete(item)
 
 
@@ -186,12 +178,10 @@ __all__ = [
     "COMMIT_FORMAT_VERSION",
     "COMMIT_TEMP",
     "CommitRecord",
-    "LATEST_FILE",
     "committed_steps",
     "delete_version",
     "latest_step",
     "read_commit",
-    "update_latest",
     "version_key",
     "write_commit",
     "write_metadata",

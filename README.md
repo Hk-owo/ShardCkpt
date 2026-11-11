@@ -22,9 +22,11 @@ ShardCkpt/
 │   ├── local.py        本地层后端（native O_DIRECT 写 / preadv 读 / 纯 Python 回退）
 │   ├── local_load.py   本地层读闭环：窗口化 staging + 批量读 + 拷贝 + H2D
 │   ├── recover.py      COMMIT 门禁：选版本、校验 .metadata、读出索引
-│   └── object.py       对象存储（boto3：PUT / Range GET / list / delete / copy+delete）
-├── commit/           提交协议、版本目录、清理、保留策略
-│   └── local.py        .metadata → COMMIT → latest，版本扫描与删除
+│   ├── object.py       对象存储（boto3：PUT / Range GET / list / delete / copy+delete）
+│   └── upload.py       上传闭环：每 rank 独立上传 + rank 0 只 list 检查 + 对象存储恢复
+├── commit/           提交协议、版本目录、垃圾回收
+│   ├── local.py        .metadata → COMMIT，版本扫描与删除
+│   └── gc.py           回收判据（纯函数）+ 执行器 + 周期线程
 ├── dist/             通信抽象：gather / broadcast / all-reduce，带超时
 ├── async_/           DeviceBackend / Tensor、D2H 搬运、pinned 池、拷贝 stream、状态机
 │                     （后台进程还没做）
@@ -36,7 +38,7 @@ ShardCkpt/
 ├── native/           ckpt_native（C++ 内核）的加载点与对齐 buffer 桥接
 ├── bindings/         Python 绑定源码：python.cpp（异常映射 / GIL / 零拷贝 / 线程归属）
 ├── api.py            save_local / load_local / load：唯一把以上组件串起来的地方
-├── tests/            pytest 与测试数据生成器（tests/fixtures/）、C++ 用例（tests/cpp/）
+├── tests/            pytest、测试数据生成器（tests/fixtures/）、仿真测试（tests/sim/）、C++ 用例（tests/cpp/）
 ├── requirements.txt  Python 依赖（numpy / boto3）
 ├── include/ckpt/     C++ 公共头文件：Status、io_uring 封装、本地文件读写
 ├── src/              C++ 实现：io/uring.cpp、storage/local/local_file.cpp
@@ -81,6 +83,12 @@ data = api.load("/ckpt", device="cuda:0")           # 本地版本目录自动�
 | `open_version()` | `storage/recover.py` | 恢复门禁：只认带 COMMIT 的版本，校验 `.metadata` 与数据文件 |
 | `targets_for_layout()` | `planner/targets.py` | 新布局 → 本 rank 的目标区域（`tp=1` 时整读） |
 | `load_local()` | `api.py` | 本地层读闭环：COMMIT → 读取计划 → io_uring 批量读 → staging → H2D |
+| `upload_local()` / `finalize_upload()` | `storage/upload.py` | 对象存储上传：每 rank 独立上传 + rank 0 只 `list` 检查 |
+| `load_object()` | `storage/upload.py` | 对象存储恢复：COMMIT → 合并各 rank 索引 → Range GET → H2D |
+| `RankCommit` | `storage/upload.py` | 分片提交点：`step_N/rank_i/COMMIT`，证明本 rank 传完了 |
+| `plan()` | `commit/gc.py` | 回收判据（纯函数）：删哪些、留哪些、为什么 |
+| `collect()` / `gc_local()` | `commit/gc.py` / `api.py` | 回收执行器：一次 `list` + 目录扫描 + 幂等删除，默认 `dry_run` |
+| `GcWorker` | `commit/gc.py` | 周期回收线程：启动时跑一次，之后每 `interval` 秒 |
 
 ## D2H 搬运
 
@@ -250,11 +258,78 @@ s3.delete("tensors/final.bin")                     # 幂等
 
 ```bash
 uv pip install --python .venv/bin/python -r requirements.txt   # numpy + boto3
-.venv/bin/python -m pytest      # 231 个用例：数据生成器 + 读取接口 + 对象存储 + D2H/stream/pinned 池 + GPU→S3
+.venv/bin/python -m pytest      # 292 个用例：数据生成器 + 读取接口 + 对象存储 + D2H/stream/pinned 池 + GPU→S3
 #              + 状态机 + 区域/索引/读写计划 + C++ 绑定（未构建时自动 skip）
 #              + 本地层写闭环（数据 + .metadata + COMMIT 可恢复）
 #              + 本地层读闭环（布局不变 / TP 换卡数 / CRC 与 COMMIT 门禁）
+#              + 对象存储上传（每 rank 独立上传 / rank 0 list 门禁 / 从 S3 恢复）
+#              + 垃圾回收（判据纯函数 / 上传后回收 / 残片 / 幂等 / 降级 / 周期线程）
+#              + 仿真：训练 loop / 多 rank 分片 / 故障注入（见 tests/sim/README.md）
+.venv/bin/python -m pytest tests/sim -m workload -s   # 规模与性能仿真，默认不跑
 ```
+
+`tests/sim/` 是模拟测试层：没有 GPU 与对象存储时，用伪训练 loop、多进程多 rank、
+故障注入（SIGKILL / 提交点缺失 / 破坏索引）和 64 MiB 规模仿真来验证生命周期行为。
+方案、覆盖矩阵与待补全清单见 [`tests/sim/README.md`](tests/sim/README.md)。
+
+## 对象存储上传（每 rank 独立上传）
+
+`storage/upload.py` 把本地版本推到对象存储，**每个 rank 各传各的**，rank 0 只在
+所有人都传完之后 `list` 一次前缀做检查，不做任何索引汇总：
+
+```
+每个 rank（独立进程，互不等）
+  save_local() ──> 本地 step_N/ 已提交（本地 COMMIT 是第一道门）
+  upload_local(root, s3, step=42, rank=i)
+      PUT step_42/rank_i/__i_0.distcp     数据
+      PUT step_42/rank_i/.metadata        本 rank 的分片索引
+      PUT step_42/rank_i/COMMIT           分片提交点（最后写；它一出现本地就能回收）
+
+rank 0
+  finalize_upload(s3, step=42, ranks=range(N))
+      list("step_42") ──> 每个 rank 的 .metadata + rank_i/COMMIT 都在？
+      PUT step_42/COMMIT                  版本提交点（只记 step / ranks / layout）
+```
+
+```python
+from storage.object import S3Config, S3Storage
+
+s3 = S3Storage(S3Config(bucket="ckpt", prefix="runs",
+                        endpoint_url="http://127.0.0.1:8333",   # SeaweedFS / MinIO
+                        access_key_id="...", secret_access_key="..."))
+
+api.upload_local("/ckpt", s3, step=42, rank=3)          # 每个 rank 调自己的
+api.finalize_upload(s3, step=42, ranks=range(8), layout={"tp": 8})   # 只有 rank 0 调
+
+report = api.load_object(s3, device="cuda:0")           # 取最新已提交版本
+report.step        # 42
+report.tensors["model.embed_tokens.weight"].numpy()
+report.amplification                                    # 读放大（Range GET / 真正用到的字节）
+```
+
+- **三层提交点**：本地 `step_N/COMMIT` 管「本 rank 写完了，可以传」；
+  `rank_i/COMMIT` 管「本 rank 传完了，本地可以删」；版本 `COMMIT` 管「这一版齐了，
+  可以恢复」。每一层只放开一个动作（见「垃圾回收」一节）
+- **rank 0 不读别人的索引**：`finalize_upload` 只有 `list` 和 `PUT`，`tests/`
+  里用 `s3_server.store.requests` 断言这一点。齐全性由每个 rank 的分片提交点证明 ——
+  「对象真的在」比「索引拼起来完整」更强，代价也不随 rank 数增长
+- **提交点顺序**：`rank_i/COMMIT` 是每个 rank 的最后一步；版本 `COMMIT` 在全部
+  分片提交点齐了之后写。少任何一个都让 `finalize_upload` 失败且不写 `COMMIT`，
+  这一版对恢复端不可见；反过来它是**幂等可重跑**的，rank 0 崩在最后一步，重启
+  补调一次就能把这一版补成可恢复
+- **恢复端才做全局校验**：`open_object_version` 按 `COMMIT` 的 rank 清单读各 rank 的
+  `.metadata`，把分片 `file` 加上 `rank_<i>/` 前缀后合并，再 `validate()` 查覆盖与重叠。
+  缺任何一个 rank 的索引都在读数据之前报错，不会交出半份张量
+- **rank 0 不逐个对象核对**：它只信分片提交点。真缺了数据对象由恢复端的 Range GET
+  （短读即报错）抓 —— 数据对象清单记在 `rank_i/COMMIT` 里，但那是给人和工具看的，
+  提交路径不为它付 `HEAD` 往返
+- **残片会被指出来**：`finalize_upload` 会把 `COMMIT` 没声明的 `rank_*` 前缀当错误
+  报出（多半是上一次重试的残留）。正式的 attempt/epoch 隔离还没做，见下
+- 字节级完整性仍在上传边界：`S3Storage` 的 PUT 带对象级校验和，服务端独立重算比对
+
+待补：`step_N/` 里带尝试号（避免重试残片混进同一前缀）、大文件分块流式上传、
+上传失败重试与后台上传队列（`save_async`）。上传成功后回收本地暂存已由
+「垃圾回收」一节覆盖。
 
 ## 本地读写（C++ / io_uring）
 
@@ -335,7 +410,7 @@ ctest --test-dir build --output-on-failure
 ```
 build_save_plan ──> trigger(拿对齐 pinned 块) ──> 按 item.byte_offset D2H
    ──> write_view(数据文件: 临时→fsync→rename→目录 fsync) ──> .metadata
-   ──> persist_ok() ──> COMMIT(临时→rename) + latest ──> commit_ok()
+   ──> persist_ok() ──> COMMIT(临时→rename) ──> commit_ok()
 ```
 
 产物就是设计文档 §5 的版本目录：
@@ -346,12 +421,14 @@ ckpt/
     __0_0.distcp      # 数据：planner 布局，按 4096 补齐到块边界
     .metadata         # 索引：分片全局坐标 + 字节区间
     COMMIT            # 提交标记：索引字节数 + 文件清单
-  latest              # 指向 42
 ```
+
+没有 `latest` 指针：`step=None` 的答案恒等于「所有带 `COMMIT` 的版本里最大的 step」，
+省下的只是一次 `list`（反正不读对象内容），却会带来「指针失效就恢复不了」这类问题。
 
 - **只有带 `COMMIT` 的目录算可恢复**：`committed_steps()` / `latest_step()` 只认它
 - 写失败或中途异常 → 状态机 `fail()`（未写文件则 `DROPPED`，有残缺目录则 `ABORTED`），
-  `latest` 不更新，这一版对恢复端不可见
+  `COMMIT` 不会写，这一版对恢复端不可见
 - 数据文件与 `.metadata` 都走「临时文件 → fsync → rename → 目录 fsync」，崩溃后只会留下
   一个完整的旧版本
 - 两块写入引擎：`engine="native"`（`ckpt_native`，O_DIRECT + io_uring）与 `"python"`
@@ -374,6 +451,50 @@ report.file_size    # 数据文件字节数（含尾块补齐）
 ```
 
 `save_async()` 仍是 `NotImplementedError`：后台进程与上传队列还没做。
+
+## 垃圾回收（上传完即回收）
+
+本地层只是**上传前的中转**：本 rank 的分片一到远端，本地那份就是纯冗余，可以直接删。
+判据只有一条不变量 —— **step 单调推进** —— 所以不需要保留策略、租约、时间阈值或
+尝试号（`commit/gc.py`）。
+
+| 位置 | 候选 | 删除条件 | 理由 |
+|---|---|---|---|
+| 本地 | `step_N/` | 远端有 `step_N/rank_<本rank>/COMMIT` | `uploaded`：本分片已到远端 |
+| 本地 | `step_N/` | 存在 `M > N` 的版本 `COMMIT` | `superseded`：训练已越过第 N 代 |
+| 远端 | `step_N/`（整个前缀） | 没有版本 `COMMIT` 且有 `M > N` 的版本 `COMMIT` | `superseded`：半途上传的残片 |
+
+**保留的一律是「最新且未完成」**：本地最新且没有自己的分片提交点 → 可能正在写；
+远端最新且没有版本提交点 → 可能正在传，也可能 rank 0 崩在最后一步（重跑
+`finalize_upload` 就能补成可恢复）。回收延迟上界是一个 checkpoint 间隔。
+
+```python
+import api as ckpt
+from commit.gc import GcWorker
+
+report = ckpt.gc_local("/ckpt/rank_0", s3, rank=0, dry_run=True)   # 默认只看计划
+report.planned      # 命中的候选 (location, step, reason)
+report.skipped      # 保留的版本与理由
+report.deleted      # 真跑时删掉的版本；远端字节记 0（list 不带对象大小）
+report.reclaimed_bytes
+report.versions     # 本次看到的已提交 step
+
+# 周期回收：进程启动时先跑一次（收掉上次崩溃的残目录），之后每 interval 秒一次
+with GcWorker("/ckpt/rank_0", s3, rank=0, interval=60.0) as worker:
+    ...                     # worker.reports / worker.last_error 可观测
+```
+
+- **不需要问「写入者是否还活着」**：兄弟 rank 正在写的目录一定是最新 step，两条判据
+  都不命中。这也是本地 root 必须**按 rank 独立**的原因 —— 本地判据删的是整个
+  `step_N/` 目录，只有目录里全是本 rank 的文件时这句话才成立
+- **删除顺序与写入镜像**：先删提交点（本地 `COMMIT` / 远端 `rank_*/COMMIT`），再删
+  数据，最后移空目录。判据只看提交点在不在，所以删到一半被打断、重跑一次就收敛
+- **远端不可达就什么都不删**：本地判据依赖远端状态，「查不到」不能当成「可以删」，
+  原因记在 `GcReport.aborted`，周期线程继续跑
+- **`save_local` 失败路径就地清理**：`ABORTED` 时直接删掉残缺目录并 `mark_cleaned()`，
+  所以「本地无 `COMMIT` 的残目录」几乎只剩 SIGKILL 一种来源，定时回收只兜底
+- **不做保留策略**：远端已提交的版本永不删除；本地不保留任何可恢复版本，正常恢复
+  一律走 `load_object()`
 
 ## 本地层读闭环
 
