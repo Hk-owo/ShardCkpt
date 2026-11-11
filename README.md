@@ -27,14 +27,15 @@ ShardCkpt/
 ├── commit/           提交协议、版本目录、垃圾回收
 │   ├── local.py        .metadata → COMMIT，版本扫描与删除
 │   └── gc.py           回收判据（纯函数）+ 执行器 + 周期线程
-├── dist/             通信抽象：gather / broadcast / all-reduce，带超时
+├── dist/             通信抽象：gather / broadcast / all-reduce，带超时（**未实现**，只有 docstring）
 ├── async_/           DeviceBackend / Tensor、D2H 搬运、pinned 池、拷贝 stream、状态机
-│                     （后台进程还没做）
+│                     （后台进程还没做，`save_async` 仍是 NotImplementedError）
 ├── adapters/         框架相关，把本地张量翻译成全局坐标
-│   ├── dtensor.py      FSDP2 / DTensor
-│   ├── megatron.py     PP 层号、EP 专家号、融合参数、vocab padding
-│   └── stateful.py     优化器状态转 FQN 键、小状态
-├── tiers/            分层存储、节点间副本、恢复时选版本（最后做）
+│   ├── dtensor.py      FSDP2 / DTensor：placements（Shard/Replicate）→ ShardSource
+│   ├── megatron.py     PP 层号、EP 专家号、融合参数、vocab padding（**未实现**）
+│   └── stateful.py     优化器状态转 FQN 键、小状态（**未实现**）
+├── tiers/            分层存储、节点间副本、恢复时选版本（**未实现**，只有 docstring）
+├── examples/         e2e_sim.py：端到端模拟（伪训练 → 保存 → 崩溃 → 上传 → 恢复 → 回收）
 ├── native/           ckpt_native（C++ 内核）的加载点与对齐 buffer 桥接
 ├── bindings/         Python 绑定源码：python.cpp（异常映射 / GIL / 零拷贝 / 线程归属）
 ├── api.py            save_local / load_local / load：唯一把以上组件串起来的地方
@@ -44,6 +45,36 @@ ShardCkpt/
 ├── src/              C++ 实现：io/uring.cpp、storage/local/local_file.cpp
 └── CMakeLists.txt    C++ 静态库 ckpt_core（liburing）+ Python 扩展 ckpt_native（pybind11）
 ```
+
+## 端到端模拟（先跑这个）
+
+一条命令跑完「伪训练 → 分片保存 → 崩溃 → 上传 → 从对象存储恢复 → 续训 → 回收」，
+**不需要 GPU，也不需要外部对象存储**：显存由 `MockCudaBackend` 用 host 内存承载，
+S3 用进程内的 `tests/s3_stub.py`。读取路径、提交点语义、Range GET、H2D 都是正式实现。
+
+```bash
+.venv/bin/python examples/e2e_sim.py              # 2 个 rank（TP=2），约 5 秒
+.venv/bin/python examples/e2e_sim.py --ranks 4    # 换 world size
+.venv/bin/python examples/e2e_sim.py --ranks 1 --keep   # 单 rank，保留工作目录供查看
+.venv/bin/python examples/e2e_sim.py --endpoint-url http://127.0.0.1:8333 \
+    --bucket ckpt --prefix runs/e2e --access-key ... --secret-key ...   # 真 SeaweedFS / MinIO
+```
+
+七个阶段，每一步都断言，任何一条不成立就非零退出：
+
+| 阶段 | 演示什么 |
+|---|---|
+| 1 | 伪训练 3/6/9 步，每 rank 存自己那片（TP 列切分）→ 独立上传 → rank 0 只 `list` 写版本 `COMMIT` |
+| 2 | 本地门禁：只有带 `COMMIT` 的版本可恢复；单 rank 目录单独读会被全局覆盖校验拒掉 |
+| 3 | 崩溃注入：step 12 的某个 rank 在写 `COMMIT` 前被 `SIGKILL`（数据齐、提交点缺失） |
+| 4 | 提交点语义：`finalize_upload(12)` 失败、`load_object(12)` 报错，最新仍是 9 |
+| 5 | 从对象存储恢复：整读一份 + 每 rank 取自己那片拼回全局，两者逐字节一致 |
+| 6 | 续训：从 step 9 恢复再跑 3 步 == 一口气训到 step 12（无容差） |
+| 7 | 回收：已上传的本地版本、被更新版本越过的残片都删掉；`dry_run` 出计划、重跑幂等 |
+
+脚本本身就是「外部调用方怎么用这套 API」的示例：`to_device()` 演示 host 数组 →
+device 张量，`sources_for_rank()` 演示分片全局坐标，`save_rank()` 是一个 rank 的完整动作。
+`tests/test_examples_e2e.py` 跑这个脚本（1 / 2 个 rank 各一遍），防止 demo 腐化。
 
 ## 读取接口
 
@@ -170,7 +201,8 @@ elif trigger.decision is TriggerDecision.SKIP:
 ```
 
 状态机不认识真实内存（buffer 是不透明句柄），所以整套转移在 mock 环境下可测；
-pinned 池、独立 stream、后台进程还没实现，那三样才需要真卡。
+pinned 池与 `D2HStream` 已经实现，还没做的是后台进程（`save_async`）和真卡上的
+`CudaBackend`。
 
 ## 读写计划（planner）
 
@@ -225,6 +257,38 @@ for window in load.windows(64 << 20):   # 按 64 MiB 切 staging 窗口
   自己那片），`CheckpointIndex.validate()` 在 rank 0 汇总后做全局覆盖 + 同一文件内
   字节区间不重叠。
 
+## 框架适配（`adapters/dtensor.py`）
+
+把 DTensor 的 `placements` 翻译成 `ShardSource` 的全局坐标，**不 import torch**：
+真 `torch.distributed.tensor.DTensor` 与测试里的 stub 走同一条鸭子类型路径
+（`placements` / `device_mesh` / `to_local()` / `shape` / `dtype`）。
+
+```python
+from adapters.dtensor import describe_state
+
+shards = describe_state(model.state_dict())       # 每个 DTensor -> 一个分片描述
+ckpt.save_local(
+    {s.fqn: to_device(s.local) for s in shards},  # 本地那片（数据）
+    "/ckpt", step=step,
+    sources=[s.source for s in shards],           # 全局坐标（metadata）
+)
+```
+
+| placement | 处理 |
+|---|---|
+| `Shard(dim)` | 沿 `dim` 切成 mesh 该维的份数，取本 rank 那一份；不整除时前 `shape[dim] % n` 份各多一个（与 FSDP2 / `torch.chunk` 一致） |
+| `Replicate()` | 该维上所有副本内容相同 → 只影响 `n_replicas` / `replica_index`，写者按 `hash(FQN) % n` 挑一个，不做内容比对 |
+| `Partial` / `_StridedShard` | 直接报错：前者要先 all-reduce，后者是交错切分，都不落成矩形区间 |
+
+多维 mesh 按 `placements[i]` 对应 `mesh.shape[i]`，可以混着来（`[Replicate(), Shard(1)]`
+= DP 副本 + TP 列切）。普通张量（没有 `placements`）当成 1 副本整体，可以和 DTensor
+混在同一个 `state_dict` 里。本地分片形状与推出的区域不一致会报错 —— `Partial` /
+交错切分正是靠这个前提被挡住的。
+
+`tests/test_dtensor_adapter.py` 覆盖：多维 Shard/Replicate 组合、不整除余数规则、
+dtype 归一（`torch.float32` / numpy / 短名）、各类拒绝路径，以及「每 rank 存自己那片 →
+上传 → rank 0 提交 → 从对象存储恢复拼回全局」的端到端往返。
+
 ## 对象存储后端（S3）
 
 `storage/object.py` 用 boto3 接 S3 兼容存储（SeaweedFS / MinIO / AWS S3），
@@ -258,13 +322,15 @@ s3.delete("tensors/final.bin")                     # 幂等
 
 ```bash
 uv pip install --python .venv/bin/python -r requirements.txt   # numpy + boto3
-.venv/bin/python -m pytest      # 292 个用例：数据生成器 + 读取接口 + 对象存储 + D2H/stream/pinned 池 + GPU→S3
-#              + 状态机 + 区域/索引/读写计划 + C++ 绑定（未构建时自动 skip）
+.venv/bin/python -m pytest      # 324 个用例：数据生成器 + 读取接口 + 对象存储 + D2H/stream/pinned 池 + GPU→S3
+#              + 状态机 + 区域/索引/读写计划 + C++ 绑定（**未构建 native 时相关用例自动 skip**）
 #              + 本地层写闭环（数据 + .metadata + COMMIT 可恢复）
 #              + 本地层读闭环（布局不变 / TP 换卡数 / CRC 与 COMMIT 门禁）
 #              + 对象存储上传（每 rank 独立上传 / rank 0 list 门禁 / 从 S3 恢复）
 #              + 垃圾回收（判据纯函数 / 上传后回收 / 残片 / 幂等 / 降级 / 周期线程）
 #              + 仿真：训练 loop / 多 rank 分片 / 故障注入（见 tests/sim/README.md）
+#              + DTensor 适配（placements → 全局坐标；每 rank 上传后恢复拼回全局）
+#              + examples/e2e_sim.py 端到端剧本（1 / 2 个 rank 各跑一遍）
 .venv/bin/python -m pytest tests/sim -m workload -s   # 规模与性能仿真，默认不跑
 ```
 
@@ -376,14 +442,18 @@ file->Close();
 ```
 
 - 随机读默认 buffered：读区间是张量在文件里的偏移，通常不按块对齐，O_DIRECT 会放大读
-  并失去 page cache；只有大块顺序读才建议 `direct_io = true`（此时 offset/length 都要对齐）
+  并失去 page cache；只有大块顺序读才建议 `direct_io = true`（此时 offset/length/落点
+  地址都要对齐）
 - `LocalFile::ReadRanges()` 是读侧的批量入口：打开时自带 ring（深度至少 2 × 单批上限），
   一次提交读多段；`RangeRead` 只描述「文件内 offset + length + 落点」，fd 由句柄提供
 - 顺序写默认 O_DIRECT：buffer 地址、offset、length 都要按 `alignment`（默认 4096）对齐；
-  offset 与 length 不对齐返回 `kInvalidArgument`（**buffer 地址目前没校验**，靠调用方保证，
-  `native.aligned_view()` 就是为此准备的）；补齐责任在 planner，C++ 层不做 read-modify-write
+  三者任一不对齐都返回 `kInvalidArgument`，由 C++ 层显式校验 —— 不同文件系统/内核对
+  非对齐 O_DIRECT 的宽容度不一样（ext4 读会报 EINVAL，某些内核的写会静默接受），
+  把判断留给内核会让同一次写入在不同机器上表现不一致。`native.aligned_view()` 就是
+  为拿对齐 buffer 准备的；补齐责任在 planner，C++ 层不做 read-modify-write
 - `WriteFile()` 是整文件便捷写法：临时文件 → 顺序 WRITE → fsync → rename → 目录 fsync，
-  最后一段不足一块时自动补零到块边界
+  最后一段不足一块时自动补零到块边界（这块兜底缓冲活到 fsync 之后，避免零拷贝写在途
+  时被释放）
 - `RenameAtomic()` / `FsyncDir()` 给 commit 层做原子提交（COMMIT 临时文件 + rename + 目录 fsync）
 - 短读不静默截断：`ReadMany` 返回 `kIoError`，同时 `bytes` 保留已读长度；
   `ReadRanges` 逐项检查结果，短读直接返回错误，不会交出半份数据
@@ -401,6 +471,14 @@ ctest --test-dir build --output-on-failure
 
 `Python3_EXECUTABLE` 必须显式给：CMake 默认可能找到系统里另一个版本的 python，
 编出来的 `.so` ABI 后缀会对不上（导入时报 "compiled with ... but ... is required"）。
+
+C++ 用例的临时目录读 `TMPDIR`（默认 `/tmp`），并会先探测该文件系统是否支持
+O_DIRECT：tmpfs 会被判为不支持、整组用例退回 buffered。要在真实文件系统上跑，
+显式给目录：
+
+```bash
+TMPDIR=$PWD/build/tmp ctest --test-dir build --output-on-failure
+```
 
 ## 本地层写闭环
 

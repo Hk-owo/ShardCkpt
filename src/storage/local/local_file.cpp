@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -46,6 +47,24 @@ Status ErrnoStatus(int err, std::string_view what) {
 bool IsPowerOfTwo(unsigned value) { return value != 0 && (value & (value - 1)) == 0; }
 
 bool IsAligned(std::uint64_t value, unsigned alignment) { return value % alignment == 0; }
+
+// O_DIRECT 除了 offset/length，还要求 buffer 地址对齐；不同文件系统与内核版本
+// 对非对齐 buffer 的宽容度不同（有的报 EINVAL，有的静默接受），所以显式校验。
+bool IsAddressAligned(const void* pointer, unsigned alignment) {
+  return reinterpret_cast<std::uintptr_t>(pointer) % alignment == 0;
+}
+
+// 向上取整到 alignment 边界；size 本身可能溢出，调用方需先判断。
+std::size_t RoundUp(std::size_t size, unsigned alignment) {
+  return (size + alignment - 1) / alignment * alignment;
+}
+
+std::string HexAddress(const void* pointer) {
+  char buffer[2 + sizeof(std::uintptr_t) * 2 + 1] = {};
+  std::snprintf(buffer, sizeof(buffer), "0x%zx",
+                static_cast<std::size_t>(reinterpret_cast<std::uintptr_t>(pointer)));
+  return buffer;
+}
 
 Status ValidateOptions(const LocalFileOptions& options) {
   if (!IsPowerOfTwo(options.alignment)) {
@@ -304,6 +323,13 @@ Status LocalFile::WriteAt(std::uint64_t offset, std::span<const std::byte> data)
                            "direct_io requires offset and size to be aligned to " +
                                std::to_string(self.alignment) + " bytes");
     }
+    if (!IsAddressAligned(data.data(), self.alignment)) {
+      return Status::Error(
+          ErrorCode::kInvalidArgument,
+          "direct_io requires the buffer address to be aligned to " +
+              std::to_string(self.alignment) + " bytes (got " + HexAddress(data.data()) +
+              "); allocate it with AlignedBuffer / native.aligned_view()");
+    }
   }
 
   std::size_t written = 0;
@@ -359,6 +385,13 @@ Status LocalFile::ReadRanges(std::span<const RangeRead> ranges) {
       return Status::Error(ErrorCode::kInvalidArgument,
                            "direct_io requires offset and length to be aligned to " +
                                std::to_string(self.alignment) + " bytes");
+    }
+    if (self.direct_io && !IsAddressAligned(range.dst, self.alignment)) {
+      return Status::Error(
+          ErrorCode::kInvalidArgument,
+          "direct_io requires the destination buffer address to be aligned to " +
+              std::to_string(self.alignment) + " bytes (got " + HexAddress(range.dst) +
+              "); allocate it with AlignedBuffer / native.aligned_view()");
     }
     ops.push_back(ReadOp{self.fd, range.offset, range.length, range.dst});
   }
@@ -521,6 +554,9 @@ Status WriteFile(std::string_view path, std::span<const Chunk> chunks,
   }
 
   std::uint64_t offset = 0;
+  // 最后一段的兜底对齐缓冲。WriteAt 是零拷贝的，这块内存必须活到 Sync() 之后，
+  // 所以声明在循环外。
+  AlignedBuffer bounce;
   for (std::size_t i = 0; i < chunks.size(); ++i) {
     const Chunk& chunk = chunks[i];
     if (chunk.size == 0) continue;
@@ -533,7 +569,8 @@ Status WriteFile(std::string_view path, std::span<const Chunk> chunks,
       continue;
     }
 
-    if (IsAligned(offset, options.alignment) && IsAligned(chunk.size, options.alignment)) {
+    if (IsAligned(offset, options.alignment) && IsAligned(chunk.size, options.alignment) &&
+        IsAddressAligned(chunk.data, options.alignment)) {
       Status st = file->WriteAt(offset, {chunk.data, chunk.size});
       if (!st.ok()) return fail(st);
       offset += chunk.size;
@@ -541,26 +578,27 @@ Status WriteFile(std::string_view path, std::span<const Chunk> chunks,
     }
 
     if (!last) {
-      return fail(Status::Error(ErrorCode::kInvalidArgument,
-                                "direct_io requires every non-final chunk to be aligned to " +
-                                    std::to_string(options.alignment) + " bytes"));
+      return fail(Status::Error(
+          ErrorCode::kInvalidArgument,
+          "direct_io requires every non-final chunk to be offset/size/buffer-address "
+          "aligned to " +
+              std::to_string(options.alignment) + " bytes (chunk " + std::to_string(i) +
+              ", buffer " + HexAddress(chunk.data) + ")"));
     }
 
-    // 最后一段不足一个块：先写对齐部分，再用零补齐一整块。
-    const std::size_t aligned = chunk.size - chunk.size % options.alignment;
-    if (aligned > 0) {
-      Status st = file->WriteAt(offset, {chunk.data, aligned});
-      if (!st.ok()) return fail(st);
-      offset += aligned;
+    // 最后一段：可能是长度不足一块，也可能只是 buffer 地址/起点没对齐。统一拷进
+    // 一块对齐缓冲、尾部补零到块边界再写，调用方不用关心自己的 buffer 对齐与否。
+    if (chunk.size > std::numeric_limits<std::size_t>::max() - options.alignment) {
+      return fail(Status::Error(ErrorCode::kInvalidArgument, "final chunk is too large"));
     }
-    AlignedBuffer tail;
-    Status st = AlignedBuffer::Allocate(options.alignment, options.alignment, &tail);
+    const std::size_t padded = RoundUp(chunk.size, options.alignment);
+    Status st = AlignedBuffer::Allocate(padded, options.alignment, &bounce);
     if (!st.ok()) return fail(st);
-    std::memset(tail.data(), 0, tail.size());
-    std::memcpy(tail.data(), chunk.data + aligned, chunk.size - aligned);
-    st = file->WriteAt(offset, {tail.data(), tail.size()});
+    std::memset(bounce.data(), 0, bounce.size());
+    std::memcpy(bounce.data(), chunk.data, chunk.size);
+    st = file->WriteAt(offset, {bounce.data(), bounce.size()});
     if (!st.ok()) return fail(st);
-    offset += tail.size();
+    offset += bounce.size();
   }
 
   Status st = file->Sync(options.fsync_data);

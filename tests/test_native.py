@@ -48,12 +48,56 @@ def test_write_file_roundtrip(tmp_path: Path) -> None:
 
 def test_write_file_multiple_chunks(tmp_path: Path) -> None:
     target = tmp_path / "multi.distcp"
-    chunks = [b"A" * 4096, b"B" * 4096, b"C" * 4096]
-
-    native_mod.write_file(str(target), chunks, direct_io=True)
+    payloads = [b"A" * 4096, b"B" * 4096, b"C" * 4096]
+    # O_DIRECT 要求 buffer 地址对齐：非末段不能直接用 bytes（地址由 CPython 给）。
+    views = [native.aligned_view(len(payload), 4096) for payload in payloads]
+    try:
+        for view, payload in zip(views, payloads):
+            view.view[:] = payload
+        native_mod.write_file(str(target), [view.view for view in views], direct_io=True)
+    finally:
+        for view in views:
+            view.release()
 
     written = target.read_bytes()
-    assert written[: len(b"".join(chunks))] == b"".join(chunks)
+    assert written[: len(b"".join(payloads))] == b"".join(payloads)
+
+
+def test_non_final_chunk_buffer_address_must_be_aligned(tmp_path: Path) -> None:
+    """非末段的 buffer 地址不对齐必须被显式拒绝。
+
+    不能把这条判断留给文件系统：不同内核对非对齐 O_DIRECT 的宽容度不同（有的
+    EINVAL，有的静默接受），那样同一个写入序列会在不同机器上表现不一致。
+    """
+    target = tmp_path / "mid.bin"
+    view = native.aligned_view(8192, 4096)
+    try:
+        view.view[:] = b"x" * 8192
+        with pytest.raises(ValueError):
+            native_mod.write_file(
+                str(target), [view.view[1:4097], view.view[4096:8192]], direct_io=True
+            )
+    finally:
+        view.release()
+
+
+def test_final_chunk_buffer_address_may_be_unaligned(tmp_path: Path) -> None:
+    """末段例外：内部转一次对齐缓冲并补零，调用方不用关心自己的 buffer 地址。"""
+    target = tmp_path / "tail-unaligned.bin"
+    payload = b"tail-unaligned" * 3
+    view = native.aligned_view(4096, 4096)
+    try:
+        start = 1  # 故意让 buffer 地址不对齐
+        view.view[start : start + len(payload)] = payload
+        native_mod.write_file(
+            str(target), [view.view[start : start + len(payload)]], direct_io=True
+        )
+    finally:
+        view.release()
+
+    written = target.read_bytes()
+    assert written[: len(payload)] == payload
+    assert len(written) == 4096
 
 
 def test_write_file_without_direct_io_accepts_unaligned(tmp_path: Path) -> None:

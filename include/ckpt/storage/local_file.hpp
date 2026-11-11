@@ -117,12 +117,14 @@ class LocalFile {
 
   int fd() const;
 
-  // 顺序写：offset 必须等于上次写到的位置（首段为 0），direct_io 时 offset 与
-  // data.size() 都要按 alignment 对齐。数据不拷贝，Sync() 前要一直有效。
+  // 顺序写：offset 必须等于上次写到的位置（首段为 0），direct_io 时 offset、
+  // data.size() 以及 data.data() 的地址都要按 alignment 对齐（O_DIRECT 不接受
+  // 非对齐 buffer，而不同文件系统/内核对这一点宽松程度不一样，所以显式校验）。
+  // 数据不拷贝，Sync() 前要一直有效。
   Status WriteAt(std::uint64_t offset, std::span<const std::byte> data);
 
   // 批量随机读：一次提交、一次回收，短读报 kIoError（不会静默截断）。
-  // direct_io 打开时 offset 与 length 都要按 alignment 对齐。
+  // direct_io 打开时 offset、length 以及 dst 的地址都要按 alignment 对齐。
   Status ReadRanges(std::span<const RangeRead> ranges);
 
   // 等待所有在途写完成；fsync 为 true 时再 fsync 数据文件。
@@ -143,8 +145,9 @@ class LocalFile {
 Status ReadMany(io::Ring* ring, std::span<const ReadOp> ops, std::vector<ReadResult>* out);
 
 // 整文件顺序写：临时文件 -> 顺序 WRITE -> fsync -> rename -> 目录 fsync。
-// direct_io 时除最后一段外的 Chunk 都要按 alignment 对齐，最后一段自动补零到
-// 块边界（文件因此可能比逻辑数据大，读取端按真实长度截断）。
+// direct_io 时除最后一段外的 Chunk 的 offset、长度与 buffer 地址都要按 alignment
+// 对齐；最后一段自动补零到块边界（文件因此可能比逻辑数据大，读取端按真实长度
+// 截断）。最后一段的 buffer 地址不对齐时内部转一次对齐缓冲，调用方无需关心。
 Status WriteFile(std::string_view path, std::span<const Chunk> chunks,
                  const WriteOptions& options = {});
 

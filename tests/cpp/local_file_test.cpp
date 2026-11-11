@@ -65,19 +65,53 @@ bool g_direct_io = false;
   } while (0)
 
 fs::path MakeTempDir() {
-  std::string templ = "/tmp/ckpt-local-test-XXXXXX";
+  // 临时目录可配：O_DIRECT 是否可用依赖文件系统（tmpfs 与 ext4/xfs 行为不同），
+  // 要在指定文件系统上跑用例，就设 TMPDIR。
+  const char* base = std::getenv("TMPDIR");
+  std::string templ =
+      (base != nullptr && base[0] == '/') ? std::string(base) : std::string("/tmp");
+  if (templ.back() != '/') templ += '/';
+  templ += "ckpt-local-test-XXXXXX";
   char* made = ::mkdtemp(templ.data());
   return made == nullptr ? fs::path() : fs::path(made);
 }
 
-std::vector<std::byte> MakeData(std::size_t size, std::uint32_t seed) {
-  std::mt19937 rng(seed);
-  std::vector<std::byte> data(size);
-  for (std::size_t i = 0; i < size; ++i) {
-    data[i] = static_cast<std::byte>(rng() & 0xFF);
+// O_DIRECT 要求 buffer 地址按块对齐，测试数据因此统一放在 AlignedBuffer 里；
+// 逻辑长度单独记（分配长度会被向上取整到块边界）。
+class Block {
+ public:
+  Block() = default;
+  Block(std::size_t size, std::uint32_t seed) { (void)Fill(size, seed); }
+
+  Block(const Block& other) { *this = other; }
+  Block& operator=(const Block& other) {
+    if (this == &other) return *this;
+    if (!Fill(other.size_, 0)) return *this;
+    if (size_ != 0) std::memcpy(data(), other.data(), size_);
+    return *this;
   }
-  return data;
-}
+  Block(Block&&) noexcept = default;
+  Block& operator=(Block&&) noexcept = default;
+
+  // 按 4096 对齐分配并用固定种子填满（确定性数据，便于逐字节比对）。
+  bool Fill(std::size_t size, std::uint32_t seed) {
+    if (!AlignedBuffer::Allocate(size, 4096, &buffer_).ok()) return false;
+    size_ = size;
+    std::mt19937 rng(seed);
+    for (std::size_t i = 0; i < size_; ++i) {
+      data()[i] = static_cast<std::byte>(rng() & 0xFF);
+    }
+    return true;
+  }
+
+  std::byte* data() { return buffer_.data(); }
+  const std::byte* data() const { return buffer_.data(); }
+  std::size_t size() const { return size_; }
+
+ private:
+  AlignedBuffer buffer_;
+  std::size_t size_ = 0;
+};
 
 std::vector<std::byte> ReadWholeFile(const fs::path& path) {
   std::vector<std::byte> out;
@@ -102,7 +136,7 @@ std::vector<std::byte> ReadWholeFile(const fs::path& path) {
   return out;
 }
 
-bool WriteChunks(const fs::path& path, const std::vector<std::vector<std::byte>>& parts,
+bool WriteChunks(const fs::path& path, const std::vector<Block>& parts,
                  const WriteOptions& options) {
   std::vector<Chunk> chunks;
   chunks.reserve(parts.size());
@@ -114,8 +148,7 @@ bool WriteChunks(const fs::path& path, const std::vector<std::vector<std::byte>>
 
 bool DirectIoSupported(const fs::path& dir) {
   const fs::path probe = dir / "direct-probe.bin";
-  const std::vector<std::byte> data = MakeData(4096, 1);
-  const std::vector<std::vector<std::byte>> parts{data};
+  const std::vector<Block> parts{Block(4096, 1)};
   const bool ok = WriteChunks(probe, parts, WriteOptions{.direct_io = true});
   std::error_code ec;
   fs::remove(probe, ec);
@@ -136,8 +169,8 @@ std::size_t CountThreads() {
 
 bool TestWriteFileRoundTrip(const fs::path& dir) {
   const fs::path path = dir / "roundtrip.bin";
-  std::vector<std::vector<std::byte>> parts{
-      MakeData(1u << 20, 1), MakeData(1u << 20, 2), MakeData(1u << 20, 3)};
+  const std::vector<Block> parts{Block(1u << 20, 1), Block(1u << 20, 2),
+                                 Block(1u << 20, 3)};
 
   WriteOptions options;
   options.direct_io = g_direct_io;
@@ -164,28 +197,71 @@ bool TestWriteFileRoundTrip(const fs::path& dir) {
 
 bool TestWriteFileTailPadding(const fs::path& dir) {
   const fs::path path = dir / "tail.bin";
-  std::vector<std::byte> first = MakeData(4096, 7);
-  std::vector<std::byte> tail = MakeData(1000, 8);
-  std::vector<std::vector<std::byte>> parts{first, tail};
+  // 尾段故意用非块对齐长度：direct_io 时应补零到块边界，buffered 时按原样写。
+  const std::vector<Block> parts{Block(4096, 7), Block(1000, 8)};
 
   WriteOptions options;
   options.direct_io = g_direct_io;
   CHECK_TRUE(WriteChunks(path, parts, options));
 
   const std::vector<std::byte> got = ReadWholeFile(path);
-  // direct_io 时尾段补零到块边界；buffered 模式按原样写。
   CHECK_TRUE(got.size() == (options.direct_io ? 4096u + 4096u : 4096u + 1000u));
-  CHECK_TRUE(std::memcmp(got.data(), first.data(), first.size()) == 0);
-  CHECK_TRUE(std::memcmp(got.data() + 4096, tail.data(), tail.size()) == 0);
+  CHECK_TRUE(std::memcmp(got.data(), parts[0].data(), parts[0].size()) == 0);
+  CHECK_TRUE(std::memcmp(got.data() + 4096, parts[1].data(), parts[1].size()) == 0);
   if (options.direct_io) CHECK_TRUE(got[4096 + 1000] == std::byte{0});
+  return true;
+}
+
+bool TestWriteFileUnalignedTailBuffer(const fs::path& dir) {
+  // 最后一段的 buffer 地址不对齐也必须能写：内部转一次对齐缓冲并把尾部补零。
+  const fs::path path = dir / "tail-unaligned.bin";
+  Block data(4096, 91);
+  CHECK_TRUE(data.data() != nullptr);
+  const Chunk chunks[] = {{data.data() + 3, data.size() - 3}};
+
+  WriteOptions options;
+  options.direct_io = true;
+  const Status st = WriteFile(path.string(), std::span<const Chunk>(chunks, 1), options);
+  std::error_code ec;
+  const auto written = fs::file_size(path, ec);
+  fs::remove(path, ec);
+  if (!g_direct_io) {
+    // 文件系统不支持 O_DIRECT 时 open 就会失败；这条用例只要求不崩。
+    std::printf("     (skip: O_DIRECT unsupported on this filesystem)\n");
+    return true;
+  }
+  CHECK_OK(st);
+  CHECK_TRUE(!ec);
+  CHECK_TRUE(written == 4096);
+  return true;
+}
+
+bool TestWriteFileRejectsUnalignedNonFinalBuffer(const fs::path& dir) {
+  // 非末段的 buffer 地址不对齐必须报错：不同内核对非对齐 O_DIRECT 的宽容度不同
+  // （有的 EINVAL，有的静默接受），把判断留在内核里会让行为随环境漂移。
+  const fs::path path = dir / "mid-unaligned.bin";
+  if (!g_direct_io) {
+    std::printf("     (skip: O_DIRECT unsupported on this filesystem)\n");
+    return true;
+  }
+  Block first(4096, 92);
+  Block second(4096, 93);
+  CHECK_TRUE(first.data() != nullptr && second.data() != nullptr);
+  const Chunk chunks[] = {{first.data() + 1, first.size()}, {second.data(), second.size()}};
+
+  WriteOptions options;
+  options.direct_io = true;
+  CHECK_CODE(WriteFile(path.string(), std::span<const Chunk>(chunks, 2), options),
+             ErrorCode::kInvalidArgument);
+  CHECK_TRUE(!fs::exists(path));
   return true;
 }
 
 bool TestReadManyAcrossFds(const fs::path& dir) {
   const fs::path a = dir / "a.bin";
   const fs::path b = dir / "b.bin";
-  std::vector<std::byte> data_a = MakeData(1u << 20, 11);
-  std::vector<std::byte> data_b = MakeData(512u << 10, 12);
+  const Block data_a(1u << 20, 11);
+  const Block data_b(512u << 10, 12);
 
   CHECK_TRUE(WriteChunks(a, {data_a}, WriteOptions{.direct_io = g_direct_io}));
   CHECK_TRUE(WriteChunks(b, {data_b}, WriteOptions{.direct_io = g_direct_io}));
@@ -201,7 +277,7 @@ bool TestReadManyAcrossFds(const fs::path& dir) {
   CHECK_OK(Ring::Create(128, &ring));
 
   // 交错、乱序地读两个文件的不同区间。
-  std::vector<std::byte> out(6 * 4096);
+  Block out(6 * 4096, 0);
   std::vector<ReadOp> ops{
       {fa->fd(), 3 * 4096, 4096, out.data() + 0 * 4096},
       {fb->fd(), 7 * 4096, 4096, out.data() + 1 * 4096},
@@ -226,8 +302,7 @@ bool TestReadManyAcrossFds(const fs::path& dir) {
 
 bool TestReadManyShortRead(const fs::path& dir) {
   const fs::path path = dir / "short.bin";
-  const std::vector<std::byte> data = MakeData(4096, 21);
-  CHECK_TRUE(WriteChunks(path, {data}, WriteOptions{.direct_io = g_direct_io}));
+  CHECK_TRUE(WriteChunks(path, {Block(4096, 21)}, WriteOptions{.direct_io = g_direct_io}));
 
   LocalFile* file = nullptr;
   CHECK_OK(LocalFile::OpenRead(path.string(), {}, &file));
@@ -236,7 +311,7 @@ bool TestReadManyShortRead(const fs::path& dir) {
   Ring ring;
   CHECK_OK(Ring::Create(16, &ring));
 
-  std::vector<std::byte> out(8192);
+  Block out(8192, 0);
   ReadOp op{file->fd(), 0, 8192, out.data()};
   std::vector<ReadResult> results;
   CHECK_OK(ReadMany(&ring, std::span<const ReadOp>(&op, 1), &results));
@@ -251,7 +326,7 @@ bool TestReadManyMissingFd(const fs::path& dir) {
   Ring ring;
   CHECK_OK(Ring::Create(16, &ring));
 
-  std::vector<std::byte> out(4096);
+  Block out(4096, 0);
   ReadOp op{-1, 0, 4096, out.data()};
   std::vector<ReadResult> results;
   CHECK_CODE(ReadMany(&ring, std::span<const ReadOp>(&op, 1), &results),
@@ -263,7 +338,7 @@ bool TestReadManyMissingFd(const fs::path& dir) {
 
 bool TestReadRangesBatch(const fs::path& dir) {
   const fs::path path = dir / "ranges.bin";
-  std::vector<std::byte> data = MakeData(1u << 20, 51);
+  const Block data(1u << 20, 51);
   CHECK_TRUE(WriteChunks(path, {data}, WriteOptions{.direct_io = g_direct_io}));
 
   LocalFile* file = nullptr;
@@ -271,7 +346,7 @@ bool TestReadRangesBatch(const fs::path& dir) {
   std::unique_ptr<LocalFile> guard(file);
 
   // 三段读进一个连续 buffer：验证区间与落点各自独立，且都按请求填满。
-  std::vector<std::byte> out(3 * 4096);
+  Block out(3 * 4096, 0);
   std::vector<ckpt::storage::RangeRead> ranges{
       {0, 4096, out.data()},
       {5000, 2048, out.data() + 4096},
@@ -288,7 +363,7 @@ bool TestReadRangesBatch(const fs::path& dir) {
 bool TestReadRangesManySegments(const fs::path& dir) {
   // 超过 ReadMany 内部的单批上限（64），逼出「多轮提交」这条路径。
   const fs::path path = dir / "ranges-many.bin";
-  std::vector<std::byte> data = MakeData(128u * 4096, 52);
+  const Block data(128u * 4096, 52);
   CHECK_TRUE(WriteChunks(path, {data}, WriteOptions{.direct_io = g_direct_io}));
 
   LocalFile* file = nullptr;
@@ -296,7 +371,7 @@ bool TestReadRangesManySegments(const fs::path& dir) {
   std::unique_ptr<LocalFile> guard(file);
 
   constexpr std::size_t kCount = 100;
-  std::vector<std::byte> out(kCount * 4096);
+  Block out(kCount * 4096, 0);
   std::vector<ckpt::storage::RangeRead> ranges;
   ranges.reserve(kCount);
   for (std::size_t i = 0; i < kCount; ++i) {
@@ -315,13 +390,13 @@ bool TestReadRangesManySegments(const fs::path& dir) {
 
 bool TestReadRangesShortRead(const fs::path& dir) {
   const fs::path path = dir / "ranges-short.bin";
-  CHECK_TRUE(WriteChunks(path, {MakeData(4096, 53)}, WriteOptions{.direct_io = false}));
+  CHECK_TRUE(WriteChunks(path, {Block(4096, 53)}, WriteOptions{.direct_io = false}));
 
   LocalFile* file = nullptr;
   CHECK_OK(LocalFile::OpenRead(path.string(), {}, &file));
   std::unique_ptr<LocalFile> guard(file);
 
-  std::vector<std::byte> out(16);
+  Block out(16, 0);
   std::vector<ckpt::storage::RangeRead> ranges{{4096 - 4, 16, out.data()}};
   // 短读必须报错，不能返回半份数据
   CHECK_CODE(file->ReadRanges(ranges), ErrorCode::kIoError);
@@ -330,13 +405,13 @@ bool TestReadRangesShortRead(const fs::path& dir) {
 
 bool TestReadRangesRejectsBadArguments(const fs::path& dir) {
   const fs::path path = dir / "ranges-bad.bin";
-  CHECK_TRUE(WriteChunks(path, {MakeData(8192, 54)}, WriteOptions{.direct_io = false}));
+  CHECK_TRUE(WriteChunks(path, {Block(8192, 54)}, WriteOptions{.direct_io = false}));
 
   LocalFile* file = nullptr;
   CHECK_OK(LocalFile::OpenRead(path.string(), {}, &file));
   std::unique_ptr<LocalFile> guard(file);
 
-  std::vector<std::byte> out(32);
+  Block out(32, 0);
   std::vector<ckpt::storage::RangeRead> zero_length{{0, 0, out.data()}};
   CHECK_CODE(file->ReadRanges(zero_length), ErrorCode::kInvalidArgument);
 
@@ -356,18 +431,18 @@ bool TestReadRangesRequiresReadMode(const fs::path& dir) {
   CHECK_OK(LocalFile::OpenWrite(path.string(), options, &file));
   std::unique_ptr<LocalFile> guard(file);
 
-  std::vector<std::byte> out(16);
+  Block out(16, 0);
   std::vector<ckpt::storage::RangeRead> ranges{{0, 16, out.data()}};
   CHECK_CODE(guard->ReadRanges(ranges), ErrorCode::kInvalidArgument);
   return true;
 }
 
 bool TestReadRangesDirectIoAligned(const fs::path& dir) {
-  // O_DIRECT 读的区间必须按块对齐；写侧已按 4096 对齐落盘，所以整块读成立。
-  // 文件系统不支持 O_DIRECT（如 tmpfs）时这个用例整体跳过。
+  // O_DIRECT 读的区间与落点都必须按块对齐；写侧已按 4096 对齐落盘，所以整块读成立。
+  // 文件系统不支持 O_DIRECT（如部分 tmpfs 配置）时这个用例整体跳过。
   if (!g_direct_io) return true;
   const fs::path path = dir / "ranges-direct.bin";
-  CHECK_TRUE(WriteChunks(path, {MakeData(8192, 55)}, WriteOptions{.direct_io = true}));
+  CHECK_TRUE(WriteChunks(path, {Block(8192, 55)}, WriteOptions{.direct_io = true}));
 
   LocalFileOptions options;
   options.direct_io = true;
@@ -375,18 +450,21 @@ bool TestReadRangesDirectIoAligned(const fs::path& dir) {
   CHECK_OK(LocalFile::OpenRead(path.string(), options, &file));
   std::unique_ptr<LocalFile> guard(file);
 
-  std::vector<std::byte> out(8192);
+  Block out(8192, 0);
   std::vector<ckpt::storage::RangeRead> aligned{{4096, 4096, out.data()}};
   CHECK_OK(guard->ReadRanges(aligned));
+  // offset/length 不对齐：拒绝
   std::vector<ckpt::storage::RangeRead> misaligned{{100, 16, out.data()}};
   CHECK_CODE(guard->ReadRanges(misaligned), ErrorCode::kInvalidArgument);
+  // 落点地址不对齐：也拒绝（否则 EINVAL 会晚一步才从 io_uring 里冒出来）
+  std::vector<ckpt::storage::RangeRead> bad_dst{{0, 4096, out.data() + 1}};
+  CHECK_CODE(guard->ReadRanges(bad_dst), ErrorCode::kInvalidArgument);
   return true;
 }
 
 bool TestThreadCountStable(const fs::path& dir) {
   const fs::path path = dir / "threads.bin";
-  const std::vector<std::byte> data = MakeData(1u << 20, 31);
-  CHECK_TRUE(WriteChunks(path, {data}, WriteOptions{.direct_io = g_direct_io}));
+  CHECK_TRUE(WriteChunks(path, {Block(1u << 20, 31)}, WriteOptions{.direct_io = g_direct_io}));
 
   LocalFile* file = nullptr;
   CHECK_OK(LocalFile::OpenRead(path.string(), {}, &file));
@@ -396,7 +474,7 @@ bool TestThreadCountStable(const fs::path& dir) {
   CHECK_OK(Ring::Create(128, &ring));
 
   const std::size_t before = CountThreads();
-  std::vector<std::byte> out(64 * 4096);
+  Block out(64 * 4096, 0);
   std::vector<ReadOp> ops;
   ops.reserve(64);
   for (std::size_t i = 0; i < 64; ++i) {
@@ -422,8 +500,8 @@ bool TestSequentialWriter(const fs::path& dir) {
   CHECK_OK(LocalFile::OpenWrite(path.string(), options, &file));
   std::unique_ptr<LocalFile> guard(file);
 
-  const std::vector<std::byte> first = MakeData(64u << 10, 41);
-  const std::vector<std::byte> second = MakeData(32u << 10, 42);
+  const Block first(64u << 10, 41);
+  const Block second(32u << 10, 42);
   CHECK_OK(file->WriteAt(0, {first.data(), first.size()}));
   // 非递增的 offset 必须被拒绝，否则随机写会把顺序写的优势抹掉。
   CHECK_CODE(file->WriteAt(first.size() + 4096, {second.data(), second.size()}),
@@ -453,9 +531,12 @@ bool TestDirectIoRejectsMisaligned(const fs::path& dir) {
   CHECK_OK(LocalFile::OpenWrite(path.string(), options, &file));
   std::unique_ptr<LocalFile> guard(file);
 
-  const std::vector<std::byte> data = MakeData(4096, 51);
+  const Block data(4096, 51);
   CHECK_CODE(file->WriteAt(100, {data.data(), data.size()}), ErrorCode::kInvalidArgument);
   CHECK_CODE(file->WriteAt(0, {data.data(), 1000}), ErrorCode::kInvalidArgument);
+  // offset 与长度都对、只有 buffer 地址不对：同样必须拒绝
+  CHECK_CODE(file->WriteAt(0, {data.data() + 1, data.size()}),
+             ErrorCode::kInvalidArgument);
   CHECK_OK(file->WriteAt(0, {data.data(), data.size()}));
   CHECK_OK(file->Sync());
   return true;
@@ -470,8 +551,9 @@ bool TestBufferedWrite(const fs::path& dir) {
   CHECK_OK(LocalFile::OpenWrite(path.string(), options, &file));
   std::unique_ptr<LocalFile> guard(file);
 
-  const std::vector<std::byte> first = MakeData(1000, 61);
-  const std::vector<std::byte> second = MakeData(500, 62);
+  // buffered 模式不要求对齐：普通 vector 也能当数据源。
+  const std::vector<std::byte> first(1000, std::byte{0xAB});
+  const std::vector<std::byte> second(500, std::byte{0xCD});
   CHECK_OK(file->WriteAt(0, {first.data(), first.size()}));
   CHECK_OK(file->WriteAt(first.size(), {second.data(), second.size()}));
   CHECK_OK(file->Sync());
@@ -487,7 +569,7 @@ bool TestBufferedWrite(const fs::path& dir) {
 bool TestRenameAndFsyncDir(const fs::path& dir) {
   const fs::path src = dir / "commit.tmp";
   const fs::path dst = dir / "COMMIT";
-  CHECK_TRUE(WriteChunks(src, {MakeData(128, 71)}, WriteOptions{.direct_io = false}));
+  CHECK_TRUE(WriteChunks(src, {Block(128, 71)}, WriteOptions{.direct_io = false}));
   CHECK_OK(ckpt::storage::RenameAtomic(src.string(), dst.string()));
   CHECK_TRUE(fs::exists(dst));
   CHECK_TRUE(!fs::exists(src));
@@ -524,7 +606,7 @@ bool TestFlushWithoutFsync(const fs::path& dir) {
   LocalFile* file = nullptr;
   CHECK_OK(LocalFile::OpenWrite(path.string(), options, &file));
   std::unique_ptr<LocalFile> guard(file);
-  const std::vector<std::byte> data = MakeData(8192, 81);
+  const Block data(8192, 81);
   CHECK_OK(file->WriteAt(0, {data.data(), data.size()}));
   // Sync(false) 只等写完，不 fsync；数据此时仍在 page cache 里。
   CHECK_OK(file->Sync(false));
@@ -542,6 +624,8 @@ int main() {
     return 1;
   }
   g_direct_io = DirectIoSupported(dir);
+  std::printf("temp dir: %s (O_DIRECT %s)\n", dir.string().c_str(),
+              g_direct_io ? "supported" : "unsupported -> buffered only");
 
   struct Case {
     const char* name;
@@ -550,6 +634,9 @@ int main() {
   const Case cases[] = {
       {"write_file_roundtrip", TestWriteFileRoundTrip},
       {"write_file_tail_padding", TestWriteFileTailPadding},
+      {"write_file_unaligned_tail_buffer", TestWriteFileUnalignedTailBuffer},
+      {"write_file_rejects_unaligned_non_final_buffer",
+       TestWriteFileRejectsUnalignedNonFinalBuffer},
       {"read_many_across_fds", TestReadManyAcrossFds},
       {"read_many_short_read", TestReadManyShortRead},
       {"read_many_missing_fd", TestReadManyMissingFd},

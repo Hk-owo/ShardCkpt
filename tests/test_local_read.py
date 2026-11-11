@@ -17,6 +17,7 @@ import numpy as np
 import pytest
 
 import api as ckpt
+import native
 from async_ import PinnedBufferPool, aligned_allocator
 from commit.local import (
     COMMIT_FILE,
@@ -34,6 +35,11 @@ from storage.local import LocalStorage
 from storage.local_load import load_local
 
 BLOBS = {"lr_scheduler": b"L" * 32, "rng/rank_0": bytes(range(64))}
+
+#: 显式要求 `engine="native"` 的用例：扩展没构建时跳过，而不是 ImportError。
+requires_native = pytest.mark.skipif(
+    not native.available(), reason="ckpt_native 未构建（构建命令见 native/__init__.py）"
+)
 
 
 # --- 夹具 -------------------------------------------------------------------
@@ -177,13 +183,18 @@ def test_python_engine_reads_the_same_bytes(saved) -> None:
         assert array_of(report.tensors[name]).tobytes() == array_of(data[name]).tobytes(), name
 
 
+@requires_native
 def test_native_and_python_engines_agree(saved) -> None:
     root, data, _ = saved
-    native = load_local(root, step=42, engine="native", device="cpu")
-    python = load_local(root, step=42, engine="python", device="cpu")
+    # 局部名不叫 native：会把同名的 native 包遮住，读代码时容易误解
+    via_native = load_local(root, step=42, engine="native", device="cpu")
+    via_python = load_local(root, step=42, engine="python", device="cpu")
 
     for name in data.names():
-        assert native.tensors[name].numpy().tobytes() == python.tensors[name].numpy().tobytes()
+        assert (
+            via_native.tensors[name].numpy().tobytes()
+            == via_python.tensors[name].numpy().tobytes()
+        )
 
 
 def test_newest_committed_step_is_used_when_step_is_omitted(
@@ -288,6 +299,7 @@ def test_unchanged_tp_degrades_to_one_read_per_shard(dataset: Path, tmp_path: Pa
 # --- 窗口与 staging 复用 ----------------------------------------------------
 
 
+@requires_native
 def test_small_budget_splits_windows_and_reuses_one_block(saved) -> None:
     root, data, _ = saved
     pool = PinnedBufferPool(
