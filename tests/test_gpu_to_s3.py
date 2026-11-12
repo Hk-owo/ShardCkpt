@@ -33,16 +33,8 @@ def make_storage(server, *, prefix: str = "runs/step_0", **overrides: object) ->
     return S3Storage(config)
 
 
-def manifest_of(root: Path) -> dict:
-    return json.loads((root / "manifest.json").read_text(encoding="utf-8"))
-
-
 def test_gpu_tensors_roundtrip_through_object_storage(dataset: Path, s3_server) -> None:
-    """GPU 上的全部张量搬回 host、PUT 到对象存储，读回后与磁盘上的 bin 逐字节一致。"""
-    manifest = manifest_of(dataset)
-    files = {entry["name"]: entry["file"] for entry in manifest["tensors"]}
-    crcs = {entry["name"]: entry["crc32"] for entry in manifest["tensors"]}
-
+    """GPU 上的全部张量搬回 host、PUT 到对象存储，读回后与源张量逐字节一致。"""
     data = ckpt.load(dataset, device="cuda:0")
     backend = get_backend(data.device)
     assert backend.is_mock, "当前环境应使用 mock cuda backend"
@@ -52,10 +44,13 @@ def test_gpu_tensors_roundtrip_through_object_storage(dataset: Path, s3_server) 
 
     # GPU -> host -> 对象存储：tensor.tobytes() 就是 copy_to_host 的调用方入口
     keys = {}
+    sources = {}
     for name, tensor in data.items():
         key = f"tensors/{name.replace('.', '_')}.bin"
-        s3.write(key, tensor.tobytes())
+        payload = tensor.tobytes()
+        s3.write(key, payload)
         keys[name] = key
+        sources[name] = payload
 
     # 每个张量恰好一次 D2H，字节数与张量总长一致
     assert backend.stats.device_to_host_copies == len(data)
@@ -64,19 +59,19 @@ def test_gpu_tensors_roundtrip_through_object_storage(dataset: Path, s3_server) 
     # 写入的对象集合与张量一一对应（key 相对 prefix）
     assert s3.list("tensors") == sorted(keys.values())
 
-    # 读回：整对象逐字节等于源文件，CRC32 与 manifest 一致，Range 读同样可用
+    # 读回：整对象逐字节等于源张量，CRC32 与源一致，Range 读同样可用
     for name, key in keys.items():
         payload = s3.read(key)
-        assert payload == (dataset / files[name]).read_bytes(), name
-        assert zlib.crc32(payload) & 0xFFFFFFFF == crcs[name], name
+        assert payload == sources[name], name
+        assert zlib.crc32(payload) & 0xFFFFFFFF == zlib.crc32(sources[name]) & 0xFFFFFFFF, name
         head = s3.read_range(key, 0, min(64, len(payload)))
         assert head == payload[: len(head)], name
 
     # 索引最后写：读得到索引才说明这批对象可以恢复
-    s3.write("manifest.json", json.dumps({**manifest, "keys": keys}).encode("utf-8"))
-    index = json.loads(s3.read("manifest.json").decode("utf-8"))
+    s3.write("index.json", json.dumps({"keys": keys}).encode("utf-8"))
+    index = json.loads(s3.read("index.json").decode("utf-8"))
     assert index["keys"] == keys
-    assert s3.list("") == sorted([*keys.values(), "manifest.json"])
+    assert s3.list("") == sorted([*keys.values(), "index.json"])
 
 
 def test_large_gpu_tensor_streams_through_multipart(s3_server) -> None:

@@ -165,7 +165,12 @@ class WriteItem:
         """下一项的开始偏移（含 padding）。"""
         return self.end + self.padding
 
-    def to_shard_meta(self, *, crc32c: str | None = None) -> ShardMeta:
+    def to_shard_meta(
+        self,
+        *,
+        crc_chunk_bytes: int | None = None,
+        crc32c_chunks: tuple[str, ...] = (),
+    ) -> ShardMeta:
         if self.flat is not None:
             return ShardMeta.flattened(
                 file=self.file,
@@ -173,7 +178,8 @@ class WriteItem:
                 length=self.length,
                 start=self.flat.start,
                 elements=self.flat.length,
-                crc32c=crc32c,
+                crc_chunk_bytes=crc_chunk_bytes,
+                crc32c_chunks=crc32c_chunks,
             )
         assert self.region is not None
         return ShardMeta.rectangular(
@@ -182,7 +188,8 @@ class WriteItem:
             length=self.length,
             offsets=self.region.offsets,
             shape=self.region.shape,
-            crc32c=crc32c,
+            crc_chunk_bytes=crc_chunk_bytes,
+            crc32c_chunks=crc32c_chunks,
         )
 
 
@@ -204,9 +211,18 @@ class BlobItem:
     def next_offset(self) -> int:
         return self.end + self.padding
 
-    def to_blob_meta(self, *, crc32c: str | None = None) -> BlobMeta:
+    def to_blob_meta(
+        self,
+        *,
+        crc_chunk_bytes: int | None = None,
+        crc32c_chunks: tuple[str, ...] = (),
+    ) -> BlobMeta:
         return BlobMeta(
-            file=self.file, byte_offset=self.byte_offset, length=self.length, crc32c=crc32c
+            file=self.file,
+            byte_offset=self.byte_offset,
+            length=self.length,
+            crc_chunk_bytes=crc_chunk_bytes,
+            crc32c_chunks=crc32c_chunks,
         )
 
 

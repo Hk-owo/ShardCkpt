@@ -13,18 +13,20 @@
 其余走单次 PUT。凭据为空时交给 boto3 的默认链
 （环境变量 / ~/.aws/credentials / IAM role）。
 
-**校验和是这条链路唯一的字节级把关点。** 本地层只做「临时文件 → fsync →
-rename → 目录 fsync」，不存也不校验分片 CRC（理由见 README「为什么本地层不做
-字节级校验」），于是「本地读出来 → 网络 → 落盘」这段的正确性由这里的对象级
-校验和负责：PUT / multipart 带 ``ChecksumAlgorithm``（默认 ``CRC32``），服务端
-独立重算并比对，不匹配回 400 ``BadDigest``；整对象 GET 带 ``ChecksumMode=
-ENABLED`` 让 botocore 回验返回值。不认识 ``x-amz-checksum-*`` 的端点把
+**对象存储只负责「发回来的 = 存的」。** 本地层的块级 CRC-32C 由 ``save_local``
+写进索引，恢复端把版本数据文件整文件下载到本地临时目录后，再由
+``storage.local_load.load_local`` 按索引里的 CRC 块校验（理由见 README「本地分片
+CRC 与对象存储校验的分工」）。对象存储这一侧的传输/落盘由这里的对象级校验和负责：
+PUT / multipart 带 ``ChecksumAlgorithm``（默认 ``CRC32``），服务端独立重算并比对，
+不匹配回 400 ``BadDigest``；整对象 GET / 下载带 ``ChecksumMode=ENABLED`` 让
+botocore 回验返回值。不认识 ``x-amz-checksum-*`` 的端点把
 ``S3Config.checksum_algorithm`` 设成 ``None`` 即可退回旧行为。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
@@ -39,6 +41,9 @@ S3Client = Any
 
 DEFAULT_REGION = "us-east-1"
 
+DEFAULT_DOWNLOAD_CHUNK_BYTES = 8 << 20
+"""整对象下载时每次从 ``StreamingBody`` 读多少字节写盘；不把整个对象读进内存。"""
+
 # S3 规定：除最后一片外，每个分片至少 5 MiB；单次 PUT / copy_object 上限 5 GiB。
 MIN_PART_SIZE = 5 * 1024 * 1024
 DEFAULT_PART_SIZE = 8 * 1024 * 1024
@@ -52,13 +57,20 @@ MAX_MULTIPART_PARTS = 10000
 DEFAULT_CHECKSUM_ALGORITHM = "CRC32"
 """上传时附带的对象级校验和算法。
 
-本地层不再做字节级校验，于是「从本地读出来 -> 网络 -> 落盘」这条链路唯一的
-把关点就是这里：PUT 带 ``x-amz-checksum-<alg>``，服务端独立重算并比对，不匹配
-直接 400 ``BadDigest``；GET 带 ``ChecksumMode=ENABLED`` 让 SDK 回验返回值。
+「从本地读出来 -> 网络 -> 落盘」这条链路唯一的把关点就是这里：PUT 带
+``x-amz-checksum-<alg>``，服务端独立重算并比对，不匹配直接 400 ``BadDigest``；
+GET 带 ``ChecksumMode=ENABLED`` 让 SDK 回验返回值。
 
-选 ``CRC32`` 而不是 ``CRC32C``：对象存储两种都认，而 Python 标准库只有
-``zlib.crc32``（IEEE），本仓库其余部分也用它，保持一致；换成 ``CRC32C`` 只需改
-这个默认值（botocore 自带两种算法的实现）。
+选 ``CRC32`` 而不是 ``CRC32C``，这是与本地层**故意不同**的选择，不是遗漏：
+
+- 这里的校验和是**服务端**独立算的，客户端只负责声明算法，检错能力与 CRC32C 同
+  量级（都是 32 位），换算法带不来任何强度收益。
+- botocore 在没有 ``awscrt`` 时只实现了 ``crc32``/``sha1``/``sha256``/``sha512``
+  （``_CHECKSUM_CLS`` 里没有 ``crc32c``），改成 ``CRC32C`` 要么引入 ``awscrt``，
+  要么自己算并显式写 ``x-amz-checksum-crc32c`` 头（multipart 还要逐片处理）。
+- 本地层（:mod:`storage.checksum`）用 CRC-32C，是因为那边**需要自己算**才有得比，
+  而 ``google-crc32c`` 走 SSE4.2 / ARMv8 硬件指令。两层的算法互不影响：本地校验
+  和不上传，上传校验和不落本地索引。
 """
 
 SUPPORTED_CHECKSUM_ALGORITHMS = frozenset({"CRC32", "CRC32C", "SHA1", "SHA256"})
@@ -419,6 +431,40 @@ class S3Storage(StorageBackend):
             raise _translate(exc, object_key) from exc
         except BotoCoreError as exc:
             raise StorageError(f"{object_key}: {exc}") from exc
+
+    def download(self, key: str, path: str | Path) -> int:
+        """流式下载整个对象到本地文件，返回字节数。
+
+        整对象 GET 带 ``ChecksumMode=ENABLED``，由 botocore 在读完流时回验；不把
+        整个对象读进内存，峰值内存是 ``DEFAULT_DOWNLOAD_CHUNK_BYTES`` 一块。
+        """
+        object_key = self.object_key(key)
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        body = None
+        written = 0
+        try:
+            response = self._client.get_object(
+                Bucket=self._config.bucket, Key=object_key, **self._checksum_mode_kwargs()
+            )
+            body = response["Body"]
+            with target.open("wb") as fh:
+                while True:
+                    chunk = body.read(DEFAULT_DOWNLOAD_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    fh.write(chunk)
+                    written += len(chunk)
+            return written
+        except ClientError as exc:
+            target.unlink(missing_ok=True)
+            raise _translate(exc, object_key) from exc
+        except (BotoCoreError, OSError) as exc:
+            target.unlink(missing_ok=True)
+            raise StorageError(f"{object_key}: {exc}") from exc
+        finally:
+            if body is not None:
+                body.close()
 
     def read_range(self, key: str, offset: int, length: int) -> bytes:
         if offset < 0:

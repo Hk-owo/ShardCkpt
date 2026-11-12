@@ -14,6 +14,7 @@ planner 产出的读写计划只依赖这个接口，不关心底层是本地盘
 from __future__ import annotations
 
 import abc
+from pathlib import Path
 
 from core import CheckpointError
 
@@ -40,6 +41,18 @@ class StorageBackend(abc.ABC):
     @abc.abstractmethod
     def read_range(self, key: str, offset: int, length: int) -> bytes:
         """读取 ``[offset, offset + length)`` 区间，长度不符时报错而非静默截断。"""
+
+    def download(self, key: str, path: "str | Path") -> int:
+        """把整对象写到本地文件，返回字节数。
+
+        默认实现是「整对象读进内存再落盘」，只适合小对象或测试；对象存储后端覆盖
+        成流式写，避免把整个 checkpoint 数据文件读进内存。
+        """
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        payload = self.read(key)
+        target.write_bytes(payload)
+        return len(payload)
 
     @abc.abstractmethod
     def rename_or_put(self, src: str, dst: str) -> None:

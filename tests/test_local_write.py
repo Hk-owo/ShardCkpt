@@ -21,8 +21,10 @@ from commit.local import (
 )
 from core import PlanError
 from core.index import META_FILE, CheckpointIndex
+from core.metadata import numpy_dtype
 from core.region import Region
 from planner.save_plan import ShardSource
+from storage.checksum import crc32c_chunks
 from storage.local import LocalStorage
 
 BLOBS = {"lr_scheduler": b"L" * 32, "rng/rank_0": bytes(range(64))}
@@ -88,24 +90,28 @@ def test_data_file_matches_tensor_bytes(saved) -> None:
             assert payload == expected, fqn
 
 
-def test_index_carries_no_checksums(saved) -> None:
-    """索引不再存分片校验和，COMMIT 也不再记 ``.metadata`` 的 crc32。
+def test_index_carries_crc32c_for_every_shard(saved) -> None:
+    """索引为每个分片与小状态记块级 CRC-32C；``.metadata`` 自身不记 crc32。
 
-    字节级完整性由上传边界负责（``storage/object.py`` 的对象级校验和），本地层
-    只留「分片坐标 + 字节数」。字段仍在格式里，所以旧 checkpoint 照样能读。
+    CRC-32C 是读路径 ``verify_crc=True`` 的依据（默认开启）；索引自身的完整性
+    继续由 COMMIT 的字节数 + JSON 结构校验负责。
     """
-    root, _, report = saved
+    root, data, report = saved
     storage = LocalStorage(root)
 
-    for meta in report.index.tensors.values():
+    for name, meta in report.index.tensors.items():
+        expected = data[name].tobytes()
+        itemsize = numpy_dtype(meta.dtype).itemsize
+        _, chunks = crc32c_chunks(expected, itemsize=itemsize)
         for shard in meta.shards:
-            assert shard.crc32c is None
-    for blob in report.index.blobs.values():
-        assert blob.crc32c is None
+            assert shard.crc_chunk_bytes is not None, name
+            assert shard.crc32c_chunks == chunks, name
+            assert read_shard(storage, report, shard) == expected, name
+    for name, blob in report.index.blobs.items():
+        _, chunks = crc32c_chunks(BLOBS[name])
+        assert blob.crc32c_chunks == chunks, name
 
-    assert report.commit.metadata_crc32 is None
-
-    # 长度照旧要对得上：COMMIT 里的字节数仍是索引完整性的唯一凭据
+    # 长度照旧要对得上：COMMIT 里的字节数仍是索引完整性的凭据之一
     metadata = storage.read(f"{version_key(42)}/{META_FILE}")
     assert report.commit.metadata_bytes == len(metadata)
 

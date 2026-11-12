@@ -5,7 +5,7 @@
 
 ## 为什么需要这一层
 
-现有 261 个用例大多是**单点**的：保存能写、索引能解析、planner 求交正确、S3 后端
+现有 333 个用例大多是**单点**的：保存能写、索引能解析、planner 求交正确、S3 后端
 语义对。它们各自的假设没人交叉验证过：
 
 - 「保存时写的字节」和「恢复时读的字节」是不是同一份（版本隔离、换布局）
@@ -98,7 +98,7 @@ collective。真 gather 落地后把这个函数换成通信实现，**用例一
 | `test_crash_before_commit_leaves_version_invisible` | 子进程写完数据与 `.metadata`、在写 COMMIT 前被 `SIGKILL`：目录有残缺、无 COMMIT，没有更新的提交，旧版本仍完整可读 |
 | `test_commit_gate_rejects_damaged_version[5 种]` | COMMIT 缺失 / `.metadata` 截断 / 数据文件缺失 / 数据文件截断 / COMMIT 清单漏文件 —— 全部在读第一个张量前 `FormatError` |
 | `test_write_failure_leaves_no_newer_commit` | 写失败 → 没有更新的已提交版本，`latest_step()` 仍指向上一个版本 |
-| `test_local_layer_does_not_checksum_bytes` | 改一个字节本地层不报错（设计决定），`verify_crc=True` 时如实报告「校验不了」 |
+| `test_local_corruption_detected_by_default` | 改一个字节：默认按块 CRC-32C 校验，在读数据前抛 `ChecksumError`；显式 `verify_crc=False` 时才放行 |
 
 崩溃注入是**确定性**的：不按时间随机 kill，而是让 `write_commit` 那一步直接
 `SIGKILL`，所以每次留下的都是「数据齐、提交点缺失」这一种半成品。

@@ -16,12 +16,15 @@ import multiprocessing
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 import api as ckpt
 import s3_stub
 import sim
-from core import CheckpointError, FormatError
+from async_ import Tensor, get_backend
+from core import CheckpointError, ChecksumError, FormatError
+from core.metadata import CPU
 from storage.base import ObjectNotFoundError, StorageError
 from storage.object import S3Config, S3Storage
 from storage.upload import commit_key, data_key, index_key, rank_commit_key, version_prefix
@@ -332,3 +335,63 @@ def test_unfinalized_version_is_invisible_until_commit(
 
     ckpt.finalize_upload(storage, step=STEP, ranks=[0, 1], layout={"tp": 2})
     assert ckpt.load_object(storage, step=STEP, device=DEVICE).step == STEP
+
+
+# --- 方案 B：整文件下载 + 本地块校验 ----------------------------------------
+
+
+MiB = 1 << 20
+
+
+def make_large_tensor(name: str, array: np.ndarray) -> Tensor:
+    backend = get_backend(CPU)
+    payload = np.ascontiguousarray(array).tobytes()
+    buffer = backend.allocate(len(payload))
+    backend.copy_h2d(buffer, memoryview(payload))
+    return Tensor(
+        name=name,
+        buffer=buffer,
+        device=CPU,
+        dtype="f32",
+        shape=array.shape,
+        backend=backend,
+    )
+
+
+def test_large_object_restore_downloads_and_verifies_chunks(tmp_path, storage) -> None:
+    array = np.arange(3 * MiB, dtype=np.float32)  # 12 MiB -> 3 个 4 MiB 块
+    local = tmp_path / "local"
+    ckpt.save_local({"big": make_large_tensor("big", array)}, local, step=1)
+    ckpt.upload_local(local, storage, step=1, rank=0)
+    ckpt.finalize_upload(storage, step=1, ranks=[0], layout={})
+
+    report = ckpt.load_object(storage, step=1, device="cpu")
+
+    assert report.download_bytes > 0
+    assert report.crc_verified is True
+    assert report.verified_blocks == 12
+    assert report.io_requests == 1
+    assert report.unverified == ()
+    assert report.tensors["big"].numpy().tobytes() == array.tobytes()
+    assert report.local_staging is not None
+    assert not Path(report.local_staging).exists(), "临时目录应在返回前清理"
+
+
+def test_object_restore_detects_middle_chunk_corruption(tmp_path, storage) -> None:
+    array = np.arange(3 * MiB, dtype=np.float32)
+    local = tmp_path / "local"
+    ckpt.save_local({"big": make_large_tensor("big", array)}, local, step=1)
+    ckpt.upload_local(local, storage, step=1, rank=0)
+    ckpt.finalize_upload(storage, step=1, ranks=[0], layout={})
+
+    key = data_key(1, 0, "__0_0.distcp")
+    payload = bytearray(storage.read(key))
+    payload[4 * MiB] ^= 0xFF  # 第二块开头，长度不变
+    storage.write(key, bytes(payload))
+
+    with pytest.raises(ChecksumError, match="crc32c"):
+        ckpt.load_object(storage, step=1, device="cpu")
+
+    # 显式关掉校验仍能下载、能读
+    unchecked = ckpt.load_object(storage, step=1, device="cpu", verify_crc=False)
+    assert unchecked.step == 1

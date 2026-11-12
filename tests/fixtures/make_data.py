@@ -3,7 +3,7 @@
 
 只造数据，不做训练模拟：没有训练循环、没有参数演化、没有 loss/lr。
 数据形态对齐 PyTorch 训练时的 state_dict（模型参数 + optimizer 状态），
-输出为裸二进制 + manifest.json，任何语言的测试都能直接读。
+输出为新的本地 checkpoint 格式（`.metadata` + `COMMIT` + 默认 1 MiB 块 CRC-32C）。
 
 用法：
     python tests/fixtures/make_data.py --out /tmp/ckpt-data --scale small
@@ -13,7 +13,7 @@
 from __future__ import annotations
 
 import argparse
-import json
+import sys
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,7 +21,15 @@ from typing import Iterator
 
 import numpy as np
 
-# dtype 名称与 manifest 保持一致；bf16 没有 numpy 原生类型，用 uint16 承载原始位。
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+import api as ckpt  # noqa: E402
+from async_ import Tensor, get_backend  # noqa: E402
+from core.metadata import CPU  # noqa: E402
+
+# dtype 名称与索引保持一致；bf16 没有 numpy 原生类型，用 uint16 承载原始位。
 DTYPE_TO_NUMPY: dict[str, np.dtype] = {
     "f64": np.dtype(np.float64),
     "f32": np.dtype(np.float32),
@@ -170,7 +178,7 @@ def write_dataset(
     vocab: int | None = None,
     intermediate: int | None = None,
 ) -> DatasetInfo:
-    """把一份数据集写到 out_dir：tensors/*.bin + manifest.json。"""
+    """把一份数据集写成新的本地 checkpoint（``.metadata`` + ``COMMIT``）。"""
     if scale not in SCALES:
         raise ValueError(f"unknown scale {scale!r}, expected one of {sorted(SCALES)}")
     if not 0 <= rank < max(1, world_size):
@@ -183,46 +191,29 @@ def write_dataset(
     specs = build_specs(dtype=dtype, with_optimizer=with_optimizer, **cfg)
 
     out_dir = Path(out_dir)
-    tensor_dir = out_dir / "tensors"
-    tensor_dir.mkdir(parents=True, exist_ok=True)
-
-    entries = []
+    backend = get_backend(CPU)
+    tensors: dict[str, Tensor] = {}
     total_bytes = 0
     for spec, array in iter_tensors(specs, seed=seed, world_size=world_size, rank=rank):
         payload = np.ascontiguousarray(array).tobytes()
         if len(payload) != spec.nbytes:
             raise AssertionError(f"{spec.name}: expected {spec.nbytes} bytes, got {len(payload)}")
-        (tensor_dir / spec.filename).write_bytes(payload)
-        entries.append(
-            {
-                "name": spec.name,
-                "file": f"tensors/{spec.filename}",
-                "kind": spec.kind,
-                "dtype": spec.dtype,
-                "shape": list(spec.shape),
-                "nbytes": spec.nbytes,
-                "crc32": zlib.crc32(payload) & 0xFFFFFFFF,
-            }
+        buffer = backend.allocate(len(payload))
+        backend.copy_h2d(buffer, memoryview(payload))
+        tensors[spec.name] = Tensor(
+            name=spec.name,
+            buffer=buffer,
+            device=CPU,
+            dtype=spec.dtype,
+            shape=spec.shape,
+            backend=backend,
         )
         total_bytes += spec.nbytes
 
-    manifest = {
-        "format": "ckpt-fixture/1",
-        "step": step,
-        "seed": seed,
-        "dtype": dtype,
-        "world_size": world_size,
-        "rank": rank,
-        "model": cfg,
-        "total_bytes": total_bytes,
-        "tensors": entries,
-    }
-    (out_dir / "manifest.json").write_text(
-        json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
-    )
+    ckpt.save_local(tensors, out_dir, step=step)
 
     return DatasetInfo(
-        out_dir=out_dir, step=step, tensor_count=len(entries), total_bytes=total_bytes
+        out_dir=out_dir, step=step, tensor_count=len(tensors), total_bytes=total_bytes
     )
 
 
@@ -232,7 +223,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--scale", default="small", choices=sorted(SCALES))
     parser.add_argument("--dtype", default="f32", choices=sorted(DTYPE_TO_NUMPY))
     parser.add_argument("--seed", type=int, default=1234)
-    parser.add_argument("--step", type=int, default=0, help="写进 manifest 的 step 编号，仅作标记")
+    parser.add_argument("--step", type=int, default=0, help="写进 checkpoint 的 step 编号")
     parser.add_argument("--world-size", type=int, default=1)
     parser.add_argument("--rank", type=int, default=0)
     parser.add_argument("--no-optimizer", action="store_true", help="只生成模型参数")

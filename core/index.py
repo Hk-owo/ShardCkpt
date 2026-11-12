@@ -61,6 +61,36 @@ def _int(value: Any, field_name: str) -> int:
     return int(value)
 
 
+def _check_crc_chunks(
+    label: str,
+    length: int,
+    chunk_bytes: int | None,
+    chunks: tuple[str, ...],
+) -> None:
+    """块 CRC 的结构校验：块大小、块数、每块 8 位十六进制。"""
+    if chunk_bytes is None:
+        if chunks:
+            raise FormatError(f"{label} crc32c_chunks requires crc_chunk_bytes")
+        return
+    if isinstance(chunk_bytes, bool) or not isinstance(chunk_bytes, int) or chunk_bytes <= 0:
+        raise FormatError(f"{label} crc_chunk_bytes must be > 0, got {chunk_bytes!r}")
+    if not chunks:
+        raise FormatError(f"{label} crc_chunk_bytes requires crc32c_chunks")
+    expected = -(-length // chunk_bytes)
+    if len(chunks) != expected:
+        raise FormatError(
+            f"{label} crc32c_chunks has {len(chunks)} entries, expected {expected} "
+            f"for length {length} with chunk {chunk_bytes}"
+        )
+    for crc in chunks:
+        if (
+            not isinstance(crc, str)
+            or len(crc) != 8
+            or any(char not in "0123456789abcdefABCDEF" for char in crc)
+        ):
+            raise FormatError(f"{label} crc32c chunk must be 8 hex chars, got {crc!r}")
+
+
 # --- 放置方式 ---------------------------------------------------------------
 
 
@@ -130,19 +160,34 @@ class ShardMeta:
     offsets: Shape = ()
     shape: Shape = ()
     flat: tuple[int, int] | None = None
-    crc32c: str | None = None
-    """旧版本写下的分片校验和；现在不再生成，只在显式 ``verify_crc=True`` 时使用。"""
+    crc_chunk_bytes: int | None = None
+    """CRC 块大小（字节），``save_local`` 写入。
+
+    块边界从分片起点算：第 ``k`` 块是 ``[k*chunk, min((k+1)*chunk, length))``。
+    读取端直接用这个值定位块，不重新推导，保证写读一致。
+    """
+
+    crc32c_chunks: tuple[str, ...] = ()
+    """每块的 CRC-32C（8 位小写十六进制），与 ``crc_chunk_bytes`` 配套。
+
+    长度必须等于 ``ceil(length / crc_chunk_bytes)``。旧 checkpoint 没有这个字段，
+    读路径不会假装校验过（见 :func:`storage.local_load.load_local`）。
+    """
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "offsets", tuple(int(v) for v in self.offsets))
         object.__setattr__(self, "shape", tuple(int(v) for v in self.shape))
         object.__setattr__(self, "byte_offset", int(self.byte_offset))
         object.__setattr__(self, "length", int(self.length))
+        object.__setattr__(self, "crc32c_chunks", tuple(self.crc32c_chunks))
         _check_key(self.file)
         if self.byte_offset < 0:
             raise FormatError(f"byte_offset must be >= 0, got {self.byte_offset}")
         if self.length <= 0:
             raise FormatError(f"shard length must be > 0, got {self.length}")
+        _check_crc_chunks(
+            "shard", self.length, self.crc_chunk_bytes, self.crc32c_chunks
+        )
         if self.flat is not None:
             if self.offsets or self.shape:
                 raise FormatError("shard cannot be both flat and rectangular")
@@ -171,7 +216,8 @@ class ShardMeta:
         length: int,
         offsets: Shape,
         shape: Shape,
-        crc32c: str | None = None,
+        crc_chunk_bytes: int | None = None,
+        crc32c_chunks: tuple[str, ...] = (),
     ) -> "ShardMeta":
         return cls(
             file=file,
@@ -179,7 +225,8 @@ class ShardMeta:
             length=length,
             offsets=offsets,
             shape=shape,
-            crc32c=crc32c,
+            crc_chunk_bytes=crc_chunk_bytes,
+            crc32c_chunks=crc32c_chunks,
         )
 
     @classmethod
@@ -191,14 +238,16 @@ class ShardMeta:
         length: int,
         start: int,
         elements: int,
-        crc32c: str | None = None,
+        crc_chunk_bytes: int | None = None,
+        crc32c_chunks: tuple[str, ...] = (),
     ) -> "ShardMeta":
         return cls(
             file=file,
             byte_offset=byte_offset,
             length=length,
             flat=(start, elements),
-            crc32c=crc32c,
+            crc_chunk_bytes=crc_chunk_bytes,
+            crc32c_chunks=crc32c_chunks,
         )
 
     @property
@@ -242,8 +291,9 @@ class ShardMeta:
         else:
             data["offsets"] = list(self.offsets)
             data["shape"] = list(self.shape)
-        if self.crc32c is not None:
-            data["crc32c"] = self.crc32c
+        if self.crc_chunk_bytes is not None:
+            data["crc_chunk_bytes"] = self.crc_chunk_bytes
+            data["crc32c_chunks"] = list(self.crc32c_chunks)
         return data
 
     @classmethod
@@ -253,9 +303,13 @@ class ShardMeta:
         for required in ("file", "byte_offset", "length"):
             if required not in data:
                 raise FormatError(f"shard entry missing {required!r}: {data!r}")
-        crc = data.get("crc32c")
-        if crc is not None and not isinstance(crc, str):
-            raise FormatError(f"shard crc32c must be a hex string, got {crc!r}")
+        chunk_bytes = data.get("crc_chunk_bytes")
+        if chunk_bytes is not None:
+            chunk_bytes = _int(chunk_bytes, "crc_chunk_bytes")
+        chunks_raw = data.get("crc32c_chunks", [])
+        if not isinstance(chunks_raw, (list, tuple)):
+            raise FormatError(f"shard crc32c_chunks must be a list, got {chunks_raw!r}")
+        chunks = tuple(str(item) for item in chunks_raw)
 
         if "flat" in data:
             flat = data["flat"]
@@ -270,7 +324,8 @@ class ShardMeta:
                 length=_int(data["length"], "length"),
                 start=values[0],
                 elements=values[1],
-                crc32c=crc,
+                crc_chunk_bytes=chunk_bytes,
+                crc32c_chunks=chunks,
             )
 
         return cls.rectangular(
@@ -279,7 +334,8 @@ class ShardMeta:
             length=_int(data["length"], "length"),
             offsets=_ints(data.get("offsets", ()), "offsets"),
             shape=_ints(data.get("shape", ()), "shape"),
-            crc32c=crc,
+            crc_chunk_bytes=chunk_bytes,
+            crc32c_chunks=chunks,
         )
 
 
@@ -424,17 +480,23 @@ class BlobMeta:
     file: str
     byte_offset: int
     length: int
-    crc32c: str | None = None
-    """旧版本写下的校验和；现在不再生成。"""
+    crc_chunk_bytes: int | None = None
+    """小状态的 CRC 块大小；小状态通常只有一个块。"""
+    crc32c_chunks: tuple[str, ...] = ()
+    """每块的 CRC-32C（8 位小写十六进制）。"""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "byte_offset", int(self.byte_offset))
         object.__setattr__(self, "length", int(self.length))
+        object.__setattr__(self, "crc32c_chunks", tuple(self.crc32c_chunks))
         _check_key(self.file)
         if self.byte_offset < 0:
             raise FormatError(f"byte_offset must be >= 0, got {self.byte_offset}")
         if self.length <= 0:
             raise FormatError(f"blob length must be > 0, got {self.length}")
+        _check_crc_chunks(
+            "byte", self.length, self.crc_chunk_bytes, self.crc32c_chunks
+        )
 
     @property
     def end(self) -> int:
@@ -446,8 +508,9 @@ class BlobMeta:
             "byte_offset": self.byte_offset,
             "length": self.length,
         }
-        if self.crc32c is not None:
-            data["crc32c"] = self.crc32c
+        if self.crc_chunk_bytes is not None:
+            data["crc_chunk_bytes"] = self.crc_chunk_bytes
+            data["crc32c_chunks"] = list(self.crc32c_chunks)
         return data
 
     @classmethod
@@ -457,14 +520,18 @@ class BlobMeta:
         for required in ("file", "byte_offset", "length"):
             if required not in data:
                 raise FormatError(f"byte entry missing {required!r}: {data!r}")
-        crc = data.get("crc32c")
-        if crc is not None and not isinstance(crc, str):
-            raise FormatError(f"byte crc32c must be a hex string, got {crc!r}")
+        chunk_bytes = data.get("crc_chunk_bytes")
+        if chunk_bytes is not None:
+            chunk_bytes = _int(chunk_bytes, "crc_chunk_bytes")
+        chunks_raw = data.get("crc32c_chunks", [])
+        if not isinstance(chunks_raw, (list, tuple)):
+            raise FormatError(f"byte crc32c_chunks must be a list, got {chunks_raw!r}")
         return cls(
             file=data["file"],
             byte_offset=_int(data["byte_offset"], "byte_offset"),
             length=_int(data["length"], "length"),
-            crc32c=crc,
+            crc_chunk_bytes=chunk_bytes,
+            crc32c_chunks=tuple(str(item) for item in chunks_raw),
         )
 
 

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import itertools
 import os
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -216,6 +217,19 @@ class LocalStorage(StorageBackend):
             raise ObjectNotFoundError(f"{key}: not found") from exc
         except OSError as exc:
             raise StorageError(f"{key}: {exc}") from exc
+
+    def download(self, key: str, path: str | Path) -> int:
+        """本地文件的整文件拷贝：不经过 bytes，直接把对象文件复制到目标路径。"""
+        source = self.path_for(key)
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            shutil.copyfile(source, target)
+        except FileNotFoundError as exc:
+            raise ObjectNotFoundError(f"{key}: not found") from exc
+        except OSError as exc:
+            raise StorageError(f"{key}: {exc}") from exc
+        return target.stat().st_size
 
     def read_range(self, key: str, offset: int, length: int) -> bytes:
         if offset < 0 or length < 0:

@@ -16,27 +16,15 @@ python tests/fixtures/make_data.py --out /tmp/ckpt-data --no-optimizer
 
 ```
 <out>/
-├── manifest.json          数据清单
-└── tensors/
-    ├── model_embed_tokens_weight.bin
-    ├── model_blocks_0_attn_qkv_weight.bin
-    └── ...
+└── step_0/
+    ├── .metadata          索引：张量/分片坐标 + 默认每 1 MiB 块一个 CRC-32C
+    ├── COMMIT             提交点：step、metadata 字节数、文件清单
+    └── __0_0.distcp       数据文件：分片与小状态按 4096 对齐存放
 ```
 
-`manifest.json` 字段：
-
-| 字段 | 含义 |
-|---|---|
-| `format` | 夹具格式版本，当前 `ckpt-fixture/1` |
-| `step` | 仅作标记的 step 编号（不影响数据内容） |
-| `seed` | 生成种子 |
-| `dtype` | 全局 dtype |
-| `world_size` / `rank` | 分片配置 |
-| `model` | 模型规模：`hidden` / `layers` / `vocab` / `intermediate` |
-| `total_bytes` | 全部 tensor 字节数之和 |
-| `tensors[]` | 每项含 `name` / `file` / `kind` / `dtype` / `shape` / `nbytes` / `crc32` |
-
-`kind` 为 `model` 或 `optimizer`；`crc32` 是 zlib 的 CRC32。
+读回来用 `api.load(out, device="cpu")`：走本地读闭环，按块 CRC-32C 校验。
+`kind` 为 `model` 或 `optimizer`；optimizer 状态按参数名 CRC32 分到某个 rank，
+各 rank 不重不漏。
 
 ## 规模
 

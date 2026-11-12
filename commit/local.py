@@ -15,8 +15,8 @@ step」。指针省下的只是一次 ``list``（反正不读对象内容），�
 
 ``COMMIT`` 只记 ``.metadata`` 的**字节数**，不记校验和：原子 rename/PUT 已经排除
 「半写」，剩下的「长度不变、内容被改坏」由 JSON 解析 + ``CheckpointIndex.validate()``
-兜住结构性问题，而字节级正确性交给上传时的对象级校验和（见 storage/object.py）。
-旧格式里的 ``metadata.crc32`` 仍能被解析，只是不再校验，也写不回去。
+兜住结构性问题，而字节级正确性由索引里的块级 CRC-32C（读路径）与上传时的对象级
+校验和（``storage/object.py``）负责。
 """
 
 from __future__ import annotations
@@ -50,9 +50,6 @@ class CommitRecord:
     files: Mapping[str, int] = field(default_factory=dict)
     """版本目录内的文件清单：文件名 -> 字节数（含 O_DIRECT 尾块补齐）。"""
 
-    metadata_crc32: str | None = None
-    """旧格式里的 ``.metadata`` 校验和；只解析、不再生成也不再校验。"""
-
     format_version: int = COMMIT_FORMAT_VERSION
 
     def __post_init__(self) -> None:
@@ -67,8 +64,6 @@ class CommitRecord:
 
     def dumps(self) -> str:
         metadata: dict[str, object] = {"file": META_FILE, "bytes": self.metadata_bytes}
-        if self.metadata_crc32 is not None:  # 旧记录原样透传，新记录不带这个字段
-            metadata["crc32"] = self.metadata_crc32
         return json.dumps(
             {
                 "format_version": self.format_version,
@@ -99,9 +94,6 @@ class CommitRecord:
             return cls(
                 step=int(data["step"]),
                 metadata_bytes=int(metadata["bytes"]),
-                metadata_crc32=(
-                    str(metadata["crc32"]) if metadata.get("crc32") is not None else None
-                ),
                 files={str(name): int(size) for name, size in files.items()},
                 format_version=int(data.get("format_version", COMMIT_FORMAT_VERSION)),
             )

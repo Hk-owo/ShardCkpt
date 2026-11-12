@@ -3,9 +3,10 @@
 守的是恢复端的承诺：**要么读到完整的旧版本，要么在读第一个张量之前报错**。
 没有任何一条用例允许「返回半份数据」。
 
-本地层不做字节级校验和（见 README「为什么本地层不做字节级校验」），所以这里
-也不假装能抓到「长度不变、内容被改」—— 那条用 ``test_local_layer_does_not_
-checksum_bytes`` 明确锁住，避免以后有人误以为它是 bug。
+本地层的字节级校验**默认开启**（见 README「本地分片 CRC 与对象存储校验的分工」）：
+``save_local`` 把每个分片按默认 1 MiB 切块写 CRC-32C，读路径按块比对，
+「长度不变、内容被改」会在返回数据前抛 ``ChecksumError``。显式 ``verify_crc=False``
+才会放行——那条也锁住，避免以后有人把「关掉校验」当成默认。
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ import api as ckpt
 import sim
 from async_ import PinnedBufferPool, aligned_allocator
 from commit.local import COMMIT_FILE, latest_step
-from core import CheckpointError, FormatError, PlanError
+from core import CheckpointError, ChecksumError, FormatError, PlanError
 from core.index import META_FILE
 from storage.local import LocalStorage
 from storage.local_load import load_local
@@ -192,12 +193,11 @@ def test_write_failure_leaves_no_newer_commit(saved) -> None:
 # --- 设计边界：本地层不校验字节 --------------------------------------------
 
 
-def test_local_layer_does_not_checksum_bytes(saved) -> None:
-    """改一个字节不会被发现 —— 这是设计决定，不是缺陷。
+def test_local_corruption_detected_by_default(saved) -> None:
+    """改一个字节：默认校验必须报 ChecksumError；显式关掉才放行。
 
-    本地版本目录只是上传对象存储之前的暂存：完整性由「COMMIT 清单 + 原子 rename」
-    和上传边界的对象级校验和负责（见 README「为什么本地层不做字节级校验」）。
-    新写的索引里没有 ``crc32c``，所以 ``verify_crc=True`` 也只会如实报告「没校验成」。
+    本地版本目录的完整性由「COMMIT 清单 + 原子 rename」兜结构性问题，字节级
+    正确性由分片块 CRC-32C 兜；默认开启，需要跳过时可以显式 ``verify_crc=False``。
     """
     root, committed = saved
     path = data_file(root, 1)
@@ -205,15 +205,14 @@ def test_local_layer_does_not_checksum_bytes(saved) -> None:
     payload[0] ^= 0xFF
     path.write_bytes(bytes(payload))
 
-    report = load_local(root, step=1, device=DEVICE)
+    # 默认校验：坏字节在读第一个张量之前就被抓住，不会返回坏数据
+    with pytest.raises(ChecksumError, match="crc32c"):
+        load_local(root, step=1, device=DEVICE)
+
+    # 显式关掉校验：读得出来，而且差异确实在（这是选择，不是默认）
+    report = load_local(root, step=1, device=DEVICE, verify_crc=False)
     assert report.step == 1
-
-    report = load_local(root, step=1, device=DEVICE, verify_crc=True)
-    assert report.crc_verified is True
-    assert report.verified_blocks == 0, "新索引不写 crc32c，没有可校验的整分片"
-    assert report.unverified, "开了校验却校验不了时，必须如实报告"
-
-    # 差异确实没被发现：内容已经被改过了
+    assert report.crc_verified is False
     assert any(
         tensor.numpy().tobytes() != committed.values[name].tobytes()
         for name, tensor in report.tensors.items()

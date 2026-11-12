@@ -10,7 +10,6 @@
 from __future__ import annotations
 
 import json
-import zlib
 from pathlib import Path
 
 import numpy as np
@@ -28,9 +27,11 @@ from commit.local import (
 )
 from core import ChecksumError, FormatError, PlanError
 from core.index import META_FILE, CheckpointIndex, ShardMeta, TensorMeta
+from core.metadata import numpy_dtype
 from core.region import Region, split
 from planner.save_plan import ShardSource, build_save_plan
 from planner.targets import targets_for_layout
+from storage.checksum import crc32c_chunks
 from storage.local import LocalStorage
 from storage.local_load import load_local
 
@@ -73,7 +74,7 @@ def write_tp_version(root: Path, tensors, *, step: int, tp: int, dims) -> Checkp
     """按 TP=tp 切分写一个「多 rank」版本目录（每个 rank 一个数据文件）。
 
     ``save_local`` 只写单 rank，换布局恢复需要多个分片写在同一个版本里，所以这里
-    直接用 planner + commit 组装：每个分片的 crc32 与 ``save_local`` 保持同一种算法。
+    直接用 planner + commit 组装：每个分片的 CRC-32C 与 ``save_local`` 保持同一种算法。
     """
     storage = LocalStorage(root)
     shards: dict[str, list[ShardMeta]] = {}
@@ -112,8 +113,13 @@ def write_tp_version(root: Path, tensors, *, step: int, tp: int, dims) -> Checkp
             chunk = array[item.region.slices].tobytes()
             assert len(chunk) == item.length, (item.fqn, len(chunk), item.length)
             payload[item.byte_offset : item.end] = chunk
+            chunk_bytes, chunks = crc32c_chunks(
+                chunk, itemsize=numpy_dtype(item.dtype).itemsize
+            )
             shards.setdefault(item.fqn, []).append(
-                item.to_shard_meta(crc32c=f"{zlib.crc32(chunk) & 0xFFFFFFFF:08x}")
+                item.to_shard_meta(
+                    crc_chunk_bytes=chunk_bytes, crc32c_chunks=chunks
+                )
             )
 
         storage.write(f"{version_key(step)}/{plan.file}", bytes(payload))
@@ -251,11 +257,10 @@ def test_whole_strategy_reads_whole_shards_and_still_verifies_crc(
     assert report.unverified == ()
 
 
-def test_strided_strategy_reports_unverified_blocks(dataset: Path, tmp_path: Path) -> None:
-    """逐行读的块只是分片的一部分，没有可用的整分片 crc，必须如实记进 unverified。
-
-    校验默认关闭，所以这里显式打开：测的是「要求校验时做不到」的诚实标注。
-    """
+def test_strided_strategy_pads_to_crc_blocks_by_default(
+    dataset: Path, tmp_path: Path
+) -> None:
+    """默认 ``crc_padding="block"``：逐行读的块扩读到完整 CRC 块，全部可校验。"""
     data = ckpt.load(dataset, device="cuda:0")
     root = tmp_path / "local"
     dims = column_dims(data.tensors)
@@ -273,7 +278,38 @@ def test_strided_strategy_reports_unverified_blocks(dataset: Path, tmp_path: Pat
     )
 
     assert report.crc_verified is True
-    assert report.unverified, "strided 读到的是分片切片，不能静默当成校验过"
+    assert report.unverified == (), "扩读后每个完整块都应校验过"
+    assert report.unverified_bytes == 0
+    assert report.amplification > 1.0, "扩读的代价就是读放大"
+    for target in targets_for_layout(report.index, tp=4, tp_rank=3, shard_dims=dims):
+        expected = array_of(data[target.fqn])[target.region.slices]
+        assert report.tensors[target.fqn].numpy().tobytes() == expected.tobytes(), target.fqn
+
+
+def test_strided_strategy_without_padding_reports_unverified_blocks(
+    dataset: Path, tmp_path: Path
+) -> None:
+    """``crc_padding="none"``：不扩读，部分块如实记进 unverified。"""
+    data = ckpt.load(dataset, device="cuda:0")
+    root = tmp_path / "local"
+    dims = column_dims(data.tensors)
+    write_tp_version(root, data.tensors, step=10, tp=2, dims=dims)
+
+    report = load_local(
+        root,
+        step=10,
+        tp=4,
+        tp_rank=3,
+        shard_dims=dims,
+        column_strategy="strided",
+        device="cpu",
+        verify_crc=True,
+        crc_padding="none",
+    )
+
+    assert report.crc_verified is True
+    assert report.unverified, "不扩读时不能假装校验过"
+    assert report.unverified_bytes > 0
     assert report.amplification == pytest.approx(1.0)
     for target in targets_for_layout(report.index, tp=4, tp_rank=3, shard_dims=dims):
         expected = array_of(data[target.fqn])[target.region.slices]
@@ -325,10 +361,10 @@ def test_small_budget_splits_windows_and_reuses_one_block(saved) -> None:
 
 
 def test_corrupted_data_byte_raises_checksum_error(dataset: Path, tmp_path: Path) -> None:
-    """索引里带分片 crc32c（旧格式）且显式开校验时，坏字节会被抓住。
+    """同长度改内容、显式开校验时，坏字节会被抓住。
 
-    新写的 checkpoint 不再生成分片 crc32c（字节级把关移到上传边界），所以这条
-    能力只对旧索引有效；它是本地层保留的唯一「自证」入口。
+    这条链路现在是默认关闭的「自证」入口：``save_local`` 总会把分片 CRC-32C 写进
+    索引，但读路径只在 ``verify_crc=True`` 时重算（默认把字节级把关交给上传边界）。
     """
     data = ckpt.load(dataset, device="cuda:0")
     root = tmp_path / "local"
@@ -339,7 +375,7 @@ def test_corrupted_data_byte_raises_checksum_error(dataset: Path, tmp_path: Path
         entry
         for meta in index.tensors.values()
         for entry in meta.shards
-        if entry.crc32c is not None and entry.file == "__0_0.distcp"
+        if entry.crc32c_chunks and entry.file == "__0_0.distcp"
     )
     storage = LocalStorage(root)
     key = f"{version_key(13)}/{shard.file}"
@@ -353,10 +389,10 @@ def test_corrupted_data_byte_raises_checksum_error(dataset: Path, tmp_path: Path
         )
 
 
-def test_corrupted_data_byte_is_not_detected_by_default(saved) -> None:
-    """默认不校验：坏字节会被静默接受——这是显式选择，代价由上传侧 checksum 兜。
+def test_corrupted_data_byte_is_ignored_when_verification_is_off(saved) -> None:
+    """显式 ``verify_crc=False``：坏字节会被静默接受——这是显式选择。
 
-    记在这里是为了让「默认关掉校验」这个决定有一个可执行的证据，而不是口头承诺。
+    默认路径校验（见上一个用例）；关掉校验时，代价由上传侧的对象级 checksum 兜。
     """
     root, _, report = saved
     storage = LocalStorage(root)
@@ -365,7 +401,7 @@ def test_corrupted_data_byte_is_not_detected_by_default(saved) -> None:
     payload[0] ^= 0xFF
     storage.write(key, bytes(payload))
 
-    report = load_local(root, step=42, device="cpu")
+    report = load_local(root, step=42, verify_crc=False, device="cpu")
     assert report.crc_verified is False
     assert report.verified_blocks == 0
     assert report.unverified == ()
@@ -434,6 +470,43 @@ def test_verify_crc_can_be_turned_off(saved) -> None:
     storage.write(key, bytes(payload))
 
     # 关掉校验就读得出来 —— 差别正是「有没有校验」，不是「能不能读」
+    unchecked = load_local(root, step=42, verify_crc=False, device="cpu")
+    assert unchecked.step == 42
+
+
+def test_saved_index_carries_crc32c_for_every_shard(saved) -> None:
+    """写侧为每个分片与小状态算块级 CRC-32C：值是 Castagnoli，不是 zlib 的 IEEE CRC-32。"""
+    root, data, report = saved
+    for name, meta in report.index.tensors.items():
+        for shard in meta.shards:
+            assert shard.crc_chunk_bytes is not None, name
+            assert shard.crc32c_chunks, name
+            assert shard.crc32c_chunks[0] != "", name
+    assert report.index.blobs, "夹具里带了小状态，必须也有校验和"
+    for name, blob in report.index.blobs.items():
+        assert blob.crc_chunk_bytes is not None, name
+        assert blob.crc32c_chunks, name
+
+    verified = load_local(root, step=42, verify_crc=True, device="cpu")
+    assert verified.crc_verified is True
+    assert verified.unverified == ()
+    assert verified.verified_blocks == sum(
+        len(meta.shards) for meta in report.index.tensors.values()
+    )
+
+
+def test_saved_checkpoint_detects_corruption_when_verifying(saved) -> None:
+    """同长度改内容：默认校验必须报 ChecksumError；显式关闭才放行。"""
+    root, _, report = saved
+    storage = LocalStorage(root)
+    key = f"{version_key(42)}/{report.file}"
+    payload = bytearray(storage.read(key))
+    payload[0] ^= 0xFF  # 长度不变，只有内容坏了
+    storage.write(key, bytes(payload))
+
+    with pytest.raises(ChecksumError, match="crc32c"):
+        load_local(root, step=42, device="cpu")
+
     unchecked = load_local(root, step=42, verify_crc=False, device="cpu")
     assert unchecked.step == 42
 

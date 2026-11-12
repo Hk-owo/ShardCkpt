@@ -5,20 +5,22 @@
 ```
 open_version(选版本 + 校验索引) ──> targets_for_layout(新布局的目标区域)
    ──> build_load_plan(求交 → 读取计划) ──> 按窗口取 pinned staging 块
-   ──> io_uring 批量 read_ranges(零拷贝落进 staging) ──> [可选] crc32 校验
-   ──> 按 CopySpan 拷进目标 host 数组 ──> H2D ──> Tensor
+   ──> 按索引里的 CRC 块切/扩读 ──> io_uring 批量 read_ranges(零拷贝落进 staging)
+   ──> 逐块 CRC-32C 校验 ──> 按 CopySpan 拷进目标 host 数组 ──> H2D ──> Tensor
 ```
 
-**CRC 默认不校验**（``verify_crc=False``）。本地目录在这里只是「上传对象存储之前的
-暂存」：完整性由 rename + ``COMMIT`` 的文件清单兜底，字节正确性由上传时的对象级
-校验和（``storage/object.py``）兜底，读路径再逐块重算一遍纯属重复开销。需要自证
-（离线排查、介质可疑、恢复演练）时显式传 ``verify_crc=True``。
+**CRC 默认校验**（``verify_crc=True``）。写路径把每个分片/小状态按
+``crc_chunk_max``（默认 1 MiB）切块，每块一个 CRC-32C 写进索引；读路径按同样的
+块边界切 IO，默认还把不完整的读块扩读到完整块（``crc_padding="block"``），
+读一块校验一块，不需要把整个分片/文件读进来。校验不通过就在**返回坏数据之前**
+抛 :class:`ChecksumError`。
 
 三个容易做错的地方，这里都定死了：
 
-- **读块与分片的区别**：``ReadItem.length`` 是「读进来的字节」（``whole`` 策略下有读
-  放大），索引里的分片 crc32 只对**整分片读**成立，所以 ``verify_crc`` 只校验读块
-  与分片字节区间完全一致的那些项，其余记进 ``LoadReport.unverified``（不静默假装校验过）。
+- **读块与分片的区别**：``ReadItem.length`` 是「逻辑读块」。默认扩读到完整 CRC
+  块，``LoadReport.verified_blocks`` 是校验过的块数；只有在 ``crc_padding="none"``
+  或 ``"auto"`` 未达阈值时，跨块边界的头/尾部分块才记进 ``unverified``，并计入
+  ``unverified_bytes``，不静默假装校验过。
 - **staging 生命周期**：块从 pinned 池借出，窗口内读完、拷完才归还；H2D 之后 device
   内存自己持有数据，与 staging 无关。
 - **短读不静默截断**：C++ 侧 ``ReadRanges`` 与 Python 回退都报错，不会返回半份张量。
@@ -26,7 +28,6 @@ open_version(选版本 + 校验索引) ──> targets_for_layout(新布局的�
 
 from __future__ import annotations
 
-import zlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -42,10 +43,12 @@ from async_ import (
     get_backend,
 )
 from core import ChecksumError, PlanError
-from core.index import CheckpointIndex, ShardMeta
+from core.index import CheckpointIndex
 from core.metadata import Device, numpy_dtype
 from planner.load_plan import ReadItem, TargetTensor, build_load_plan
 from planner.targets import targets_for_layout
+from storage.checksum import crc32c_hex
+from storage.crc_io import ReadUnit, crc_read_units, item_label
 from storage.local import DEFAULT_ALIGNMENT, LocalStorage
 from storage.recover import RecoveredVersion, recover_version
 
@@ -66,17 +69,21 @@ class LoadReport:
     read_bytes: int
     copied_bytes: int
     h2d_bytes: int
-    crc_verified: bool = False
-    """本次是否执行了分片 CRC 校验（即 ``verify_crc`` 的生效值）。默认不校验。"""
+    crc_verified: bool = True
+    """本次是否执行了 CRC 校验（即 ``verify_crc`` 的生效值）。默认校验。"""
     verified_blocks: int = 0
-    """通过整分片 CRC 校验的读块数；``crc_verified=False`` 时恒为 0。"""
+    """通过 CRC-32C 校验的**块数**；``crc_verified=False`` 时恒为 0。"""
+    io_requests: int = 0
+    """实际 IO 单元数（扩读、同块合并之后的 ``read_range`` 次数）。"""
     unverified: tuple[str, ...] = ()
-    """要求校验、但读块覆盖不到一个完整分片（结构上无法校验）的项。
+    """要求校验、但没有扩读到完整 CRC 块的读块标签。
 
-    ``column_strategy="strided"`` 下非空。它**不**包含「按策略不校验」的读块——
-    那种情况由 ``crc_verified=False`` 统一表示，不逐项列举，否则默认配置下这个
-    tuple 会和读块数一样大。
+    默认 ``crc_padding="block"`` 下为空；``crc_padding="none"`` 或 ``"auto"``
+    未达阈值时非空。它**不**包含「按策略不校验」的读块——那种情况由
+    ``crc_verified=False`` 统一表示。
     """
+    unverified_bytes: int = 0
+    """上述读块里没有可比 CRC 的字节数；``crc_verified=False`` 时恒为 0。"""
 
     @property
     def amplification(self) -> float:
@@ -96,7 +103,9 @@ def load_local(
     tp: int = 1,
     tp_rank: int = 0,
     shard_dims: Mapping[str, int] | None = None,
-    verify_crc: bool = False,
+    verify_crc: bool = True,
+    crc_padding: str = "block",
+    crc_padding_ratio: float = 0.125,
     budget_bytes: int = DEFAULT_CHUNK_BYTES,
     engine: str = "auto",
     alignment: int = DEFAULT_ALIGNMENT,
@@ -112,7 +121,10 @@ def load_local(
     ``engine``        ``"native"``（io_uring）/ ``"python"``（preadv）/ ``"auto"``
     ``column_strategy`` 列子集读法（``whole`` 整块读再切 / ``strided`` 逐行读）
     ``pool``          复用调用方的 pinned 池（窗口变大时会扩容）
-    ``verify_crc``    逐块校验分片 crc32；**默认关闭**，见模块 docstring 的说明
+    ``verify_crc``    逐块校验分片 CRC-32C；**默认开启**，见模块 docstring 的说明
+    ``crc_padding``   ``block``（默认，扩读到完整 CRC 块）/ ``auto``（按比例）/
+                      ``none``（不扩读，部分块记 unverified）
+    ``crc_padding_ratio`` ``auto`` 的阈值：实际使用字节 / 扩展后字节
     """
     if budget_bytes <= 0:
         raise ValueError(f"budget_bytes must be > 0, got {budget_bytes}")
@@ -147,28 +159,57 @@ def load_local(
     copied_bytes = 0
     windows = 0
     requests = 0
+    io_requests = 0
     verified_blocks = 0
     unverified: set[str] = set()
+    unverified_bytes = 0
     try:
         for window in plan.windows(budget_bytes):
-            total = sum(item.length for item in window)
+            units = crc_read_units(
+                version.index,
+                window,
+                padding=crc_padding if verify_crc else "none",
+                padding_ratio=crc_padding_ratio,
+            )
+            total = sum(unit.length for unit in units)
             buffer = pool.acquire(total)
             try:
                 view = _as_view(buffer)
-                offsets = _window_offsets(window)
                 if reader is not None:
-                    reader.read_window(version, window, offsets, view)
+                    reader.read_units(version, units, view)
                 else:
-                    _read_window_python(version, window, offsets, view)
-                for item, offset in zip(window, offsets):
-                    block = view[offset : offset + item.length]
-                    if verify_crc:
-                        if _verify_block(version.index, item, block):
+                    _read_units_python(version, units, view)
+                if verify_crc:
+                    for unit in units:
+                        verified_bytes = 0
+                        for offset, length, expected in unit.chunks:
+                            start = unit.staging_offset + offset
+                            actual = crc32c_hex(
+                                view[start : start + length]
+                            )
+                            if actual != expected:
+                                raise ChecksumError(
+                                    f"{unit.label}: crc32c {actual} != index "
+                                    f"{expected} ({unit.file}@{unit.byte_offset + offset}"
+                                    f"+{length})"
+                                )
                             verified_blocks += 1
-                        else:
-                            unverified.add(_block_label(item))
-                    _scatter(item, block, host_arrays)
+                            verified_bytes += length
+                        missing = unit.length - verified_bytes
+                        if missing:
+                            unverified_bytes += missing
+                            for consumer in unit.consumers:
+                                unverified.add(item_label(consumer.item))
+                for unit in units:
+                    for consumer in unit.consumers:
+                        start = unit.staging_offset + consumer.offset_in_unit
+                        _scatter(
+                            consumer.item,
+                            view[start : start + consumer.item.length],
+                            host_arrays,
+                        )
                 requests += len(window)
+                io_requests += len(units)
                 read_bytes += total
                 copied_bytes += sum(
                     span.numel * numpy_dtype(item.dtype).itemsize
@@ -206,7 +247,9 @@ def load_local(
         h2d_bytes=h2d_bytes,
         crc_verified=verify_crc,
         verified_blocks=verified_blocks,
+        io_requests=io_requests,
         unverified=tuple(sorted(unverified)),
+        unverified_bytes=unverified_bytes,
     )
 
 
@@ -226,31 +269,20 @@ def _resolve_engine(engine: str) -> str:
         return "python"
 
 
-def _window_offsets(window: tuple[ReadItem, ...]) -> list[int]:
-    """窗口内每个读块在 staging 里的偏移：按请求顺序紧凑排布。"""
-    offsets: list[int] = []
-    cursor = 0
-    for item in window:
-        offsets.append(cursor)
-        cursor += item.length
-    return offsets
-
-
-def _read_window_python(
+def _read_units_python(
     version: RecoveredVersion,
-    window: tuple[ReadItem, ...],
-    offsets: list[int],
+    units: tuple[ReadUnit, ...],
     view: memoryview,
 ) -> None:
-    """纯 Python 回退：每个读块一次 ``preadv``，同样是零拷贝落进 staging。"""
+    """纯 Python 回退：每个读取单元一次 ``preadv``，零拷贝落进 staging。"""
     storage = version.storage
     if not isinstance(storage, LocalStorage):  # pragma: no cover - load_local 只建 LocalStorage
         raise TypeError(f"python read engine requires LocalStorage, got {type(storage).__name__}")
-    for item, offset in zip(window, offsets):
+    for unit in units:
         storage.read_range_into(
-            version.file_key(item.file),
-            item.byte_offset,
-            view[offset : offset + item.length],
+            version.file_key(unit.file),
+            unit.byte_offset,
+            view[unit.staging_offset : unit.staging_offset + unit.length],
         )
 
 
@@ -264,17 +296,16 @@ class _NativeReader:
     def __init__(self) -> None:
         self._files: dict[str, Any] = {}
 
-    def read_window(
+    def read_units(
         self,
         version: RecoveredVersion,
-        window: tuple[ReadItem, ...],
-        offsets: list[int],
+        units: tuple[ReadUnit, ...],
         view: memoryview,
     ) -> None:
         """按文件分组，一组一次 ``read_ranges``：一次提交读多段，零拷贝落进 staging。"""
-        grouped: dict[str, list[tuple[ReadItem, int]]] = {}
-        for item, offset in zip(window, offsets):
-            grouped.setdefault(item.file, []).append((item, offset))
+        grouped: dict[str, list[ReadUnit]] = {}
+        for unit in units:
+            grouped.setdefault(unit.file, []).append(unit)
         storage = version.storage
         for name, entries in grouped.items():
             key = version.file_key(name)
@@ -282,8 +313,10 @@ class _NativeReader:
             if handle is None:
                 handle = self._open(storage, key)
                 self._files[key] = handle
-            ranges = [(item.byte_offset, item.length, offset) for item, offset in entries]
-            handle.read_ranges(ranges, view)
+            ranges_for_handle = [
+                (unit.byte_offset, unit.length, unit.staging_offset) for unit in entries
+            ]
+            handle.read_ranges(ranges_for_handle, view)
 
     def close(self) -> None:
         while self._files:
@@ -308,43 +341,7 @@ def _as_view(buffer: Any) -> memoryview:
     return memoryview(buffer)
 
 
-# --- 校验与拷贝 -------------------------------------------------------------
-
-
-def _block_label(item: ReadItem) -> str:
-    return f"{item.file}@{item.byte_offset}+{item.length}"
-
-
-def _verify_block(index: CheckpointIndex, item: ReadItem, block: memoryview) -> bool:
-    """读块正好是索引里的一个完整分片时校验 crc32；其余情况返回 False。
-
-    返回 False 表示「这个读块没有可用的整分片校验和」，调用方据此记 unverified；
-    校验和不匹配抛 :class:`ChecksumError`，不会返回坏数据。
-    """
-    shard = _matching_shard(index, item)
-    if shard is None or shard.crc32c is None:
-        return False
-    actual = f"{zlib.crc32(block) & 0xFFFFFFFF:08x}"
-    if actual != shard.crc32c:
-        raise ChecksumError(
-            f"{item.fqn}: crc32 {actual} != index {shard.crc32c} "
-            f"({item.file}@{item.byte_offset}+{item.length})"
-        )
-    return True
-
-
-def _matching_shard(index: CheckpointIndex, item: ReadItem) -> ShardMeta | None:
-    meta = index.tensors.get(item.fqn)
-    if meta is None:
-        return None
-    for shard in meta.shards:
-        if (
-            shard.file == item.file
-            and shard.byte_offset == item.byte_offset
-            and shard.length == item.length
-        ):
-            return shard
-    return None
+# --- 拷贝 -------------------------------------------------------------------
 
 
 def _scatter(item: ReadItem, block: memoryview, host_arrays: Mapping[str, np.ndarray]) -> None:

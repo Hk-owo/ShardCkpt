@@ -140,7 +140,7 @@ def _check_data_files(
         )
 
     if not isinstance(storage, LocalStorage):
-        return  # 对象存储没有 stat：大小一致性交给 Range GET 的短读检查
+        return  # 非本地后端在这里没有 stat；下载后会再落成本地文件并走同一套校验
 
     for name, expected in sorted(record.files.items()):
         path = storage.path_for(f"{key}/{name}")

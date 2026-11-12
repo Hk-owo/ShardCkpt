@@ -46,21 +46,28 @@ key 布局（相对存储配置里的 prefix）::
 from __future__ import annotations
 
 import json
+import shutil
+import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Mapping, Sequence
 
-import numpy as np
-
-from async_ import DeviceBackend, Tensor, get_backend
-from commit.local import COMMIT_FILE, latest_step, read_commit
+from async_ import Tensor
+from commit.local import (
+    COMMIT_FILE,
+    CommitRecord,
+    latest_step,
+    read_commit,
+    write_commit,
+    write_metadata,
+)
 from core import FormatError
 from core.index import META_FILE, BlobMeta, CheckpointIndex, ShardMeta, TensorMeta
-from core.metadata import Device, numpy_dtype
-from planner.load_plan import ReadItem, TargetTensor, build_load_plan
-from planner.targets import targets_for_layout
+from core.metadata import Device
 from storage.base import ObjectNotFoundError, StorageBackend
 from storage.local import LocalStorage
+from storage.local_load import LoadReport, load_local
 
 COMMIT_FORMAT_VERSION = 1
 DEFAULT_BUDGET_BYTES = 8 << 20
@@ -472,7 +479,7 @@ def open_object_version(
     )
 
 
-# --- 读取：Range GET + scatter + H2D ---------------------------------------
+# --- 读取：整文件下载到本地临时目录，再走本地读闭环 -------------------------
 
 
 @dataclass(frozen=True)
@@ -489,6 +496,15 @@ class ObjectLoadReport:
     read_bytes: int
     copied_bytes: int
     h2d_bytes: int
+    download_bytes: int = 0
+    """本次从对象存储下载的字节数（整个版本的数据文件）。"""
+    local_staging: str | None = None
+    """下载用的临时目录路径；报告返回时已经清理，只留作诊断。"""
+    crc_verified: bool = True
+    verified_blocks: int = 0
+    io_requests: int = 0
+    unverified: tuple[str, ...] = ()
+    unverified_bytes: int = 0
 
     @property
     def amplification(self) -> float:
@@ -505,85 +521,113 @@ def load_object_version(
     shard_dims: Mapping[str, int] | None = None,
     budget_bytes: int = DEFAULT_BUDGET_BYTES,
     column_strategy: str = "whole",
+    verify_crc: bool = True,
+    crc_padding: str = "block",
+    crc_padding_ratio: float = 0.125,
+    io_concurrency: int = 1,
+    local_staging_dir: str | Path | None = None,
 ) -> ObjectLoadReport:
-    """从对象存储恢复张量：``COMMIT`` 门禁 → 读取计划 → Range GET → staging → H2D。"""
+    """从对象存储恢复：整文件下载到本地临时目录，再走本地读闭环。
+
+    下载用 :meth:`StorageBackend.download` 流式写盘，不把整个数据文件读进内存；
+    下载完写合并后的 ``.metadata`` 与本地 ``COMMIT``，然后调用
+    :func:`storage.local_load.load_local` 按索引里的 CRC 块校验。
+
+    对象存储侧只负责「发回来的 = 存的」（整对象 GET 带 ``ChecksumMode=ENABLED``），
+    本地 ``load_local`` 负责「存的 = 当初写的」。
+    """
     version = open_object_version(storage, step)
-    targets = targets_for_layout(
-        version.index, tp=tp, tp_rank=tp_rank, shard_dims=shard_dims
-    )
-    plan = build_load_plan(
-        version.index, targets, strict=True, column_strategy=column_strategy
-    )
+    if io_concurrency < 1:
+        raise ValueError(f"io_concurrency must be >= 1, got {io_concurrency}")
 
-    device_spec = Device.parse(device)
-    backend = get_backend(device_spec)
-    host_arrays = {
-        target.fqn: np.zeros(target.region.shape, dtype=numpy_dtype(target.dtype))
-        for target in targets
-    }
-
-    read_bytes = 0
-    copied_bytes = 0
-    windows = 0
-    for window in plan.windows(budget_bytes):
-        for item in window:
-            block = storage.read_range(
-                version.file_key(item.file), item.byte_offset, item.length
-            )
-            _scatter(item, memoryview(block), host_arrays)
-            read_bytes += item.length
-            copied_bytes += sum(
-                span.numel * numpy_dtype(item.dtype).itemsize for span in item.spans
-            )
-        windows += 1
-
-    tensors: dict[str, Tensor] = {}
-    h2d_bytes = 0
-    for target in targets:
-        host = host_arrays[target.fqn]
-        tensors[target.fqn] = _to_device(target, host, device_spec, backend)
-        h2d_bytes += host.nbytes
-
-    return ObjectLoadReport(
-        step=version.step,
-        device=device_spec,
-        tensors=tensors,
-        blobs=version.read_blobs(),
-        index=version.index,
-        requests=len(plan.items),
-        windows=windows,
-        read_bytes=read_bytes,
-        copied_bytes=copied_bytes,
-        h2d_bytes=h2d_bytes,
-    )
-
-
-def _scatter(item: ReadItem, block: memoryview, host_arrays: Mapping[str, np.ndarray]) -> None:
-    """把读块里的矩形按 ``CopySpan`` 拷进目标数组（与 ``storage/local_load.py`` 同算法）。"""
-    source = np.frombuffer(block, dtype=numpy_dtype(item.dtype)).reshape(item.read_shape)
-    target = host_arrays[item.fqn]
-    for span in item.spans:
-        dst = tuple(
-            slice(offset, offset + size) for offset, size in zip(span.dst_offsets, span.shape)
+    staging_root = tempfile.mkdtemp(prefix="shardckpt-", dir=local_staging_dir)
+    try:
+        version_dir = Path(staging_root) / version_prefix(version.step)
+        version_dir.mkdir(parents=True, exist_ok=True)
+        files = _version_files(version.index)
+        sizes = _download_files(
+            storage,
+            version,
+            files,
+            version_dir,
+            io_concurrency=io_concurrency,
         )
-        target[dst] = source[span.src_region().slices]
+
+        local = LocalStorage(staging_root)
+        metadata_bytes = write_metadata(local, version.step, version.index)
+        write_commit(
+            local,
+            CommitRecord(
+                step=version.step,
+                metadata_bytes=metadata_bytes,
+                files=sizes,
+            ),
+        )
+
+        report: LoadReport = load_local(
+            staging_root,
+            step=version.step,
+            device=device,
+            tp=tp,
+            tp_rank=tp_rank,
+            shard_dims=shard_dims,
+            verify_crc=verify_crc,
+            crc_padding=crc_padding,
+            crc_padding_ratio=crc_padding_ratio,
+            budget_bytes=budget_bytes,
+            column_strategy=column_strategy,
+        )
+        return ObjectLoadReport(
+            step=report.step,
+            device=report.device,
+            tensors=report.tensors,
+            blobs=report.blobs,
+            index=report.index,
+            requests=report.requests,
+            windows=report.windows,
+            read_bytes=report.read_bytes,
+            copied_bytes=report.copied_bytes,
+            h2d_bytes=report.h2d_bytes,
+            download_bytes=sum(sizes.values()),
+            local_staging=staging_root,
+            crc_verified=report.crc_verified,
+            verified_blocks=report.verified_blocks,
+            io_requests=report.io_requests,
+            unverified=report.unverified,
+            unverified_bytes=report.unverified_bytes,
+        )
+    finally:
+        shutil.rmtree(staging_root, ignore_errors=True)
 
 
-def _to_device(
-    target: TargetTensor, host: np.ndarray, device: Device, backend: DeviceBackend
-) -> Tensor:
-    payload = np.ascontiguousarray(host)
-    buffer = backend.allocate(payload.nbytes)
-    # memoryview(np 数组) 的长度是元素数，copy_h2d 要的是字节视图
-    backend.copy_h2d(buffer, memoryview(payload).cast("B"))
-    return Tensor(
-        name=target.fqn,
-        buffer=buffer,
-        device=device,
-        dtype=target.dtype,
-        shape=tuple(int(dim) for dim in host.shape),
-        backend=backend,
-    )
+def _version_files(index: CheckpointIndex) -> list[str]:
+    """版本里需要下载的全部数据文件（分片与小状态可能共用一个文件）。"""
+    files = {
+        shard.file for meta in index.tensors.values() for shard in meta.shards
+    }
+    files.update(blob.file for blob in index.blobs.values())
+    return sorted(files)
+
+
+def _download_files(
+    storage: StorageBackend,
+    version: ObjectVersion,
+    files: Sequence[str],
+    version_dir: Path,
+    *,
+    io_concurrency: int,
+) -> dict[str, int]:
+    """把版本数据文件下载到本地目录，返回「文件 -> 字节数」。"""
+
+    def fetch(name: str) -> tuple[str, int]:
+        target = version_dir / name
+        size = storage.download(version.file_key(name), target)
+        return name, size
+
+    if io_concurrency <= 1:
+        return dict(fetch(name) for name in files)
+    with ThreadPoolExecutor(max_workers=io_concurrency) as pool:
+        return dict(pool.map(fetch, files))
 
 
 __all__ = [

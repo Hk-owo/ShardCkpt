@@ -57,8 +57,9 @@ from core import (
     PlanError,
     UnsupportedDeviceError,
 )
-from core.metadata import CPU, Device, cuda
-from storage.fs import CheckpointData, CheckpointReader, LoadOptions
+from core.metadata import CPU, Device, cuda, numpy_dtype
+from storage.checksum import CRC_CHUNK_MAX, crc32c_chunks
+from storage.data import CheckpointData
 from storage.local_load import LoadReport, load_local
 from storage.upload import (
     DEFAULT_BUDGET_BYTES as DEFAULT_UPLOAD_BUDGET_BYTES,
@@ -75,8 +76,9 @@ def load(
     path: str | Path,
     *,
     device: "str | Device" = "cpu",
-    verify_crc: bool = False,
-    staging: bool = True,
+    verify_crc: bool = True,
+    crc_padding: str = "block",
+    crc_padding_ratio: float = 0.125,
     step: int | None = None,
     tp: int = 1,
     tp_rank: int = 0,
@@ -84,16 +86,10 @@ def load(
 ) -> CheckpointData:
     """便捷入口，对应 ``torch.load(path, map_location=device)``。
 
-    按目录内容自动选格式：有 ``manifest.json`` 走旧的整文件读取路径；
-    有 ``COMMIT`` / ``.metadata`` 走本地层读闭环（:func:`load_local`）。
+    只接受本地版本目录（``COMMIT`` / ``.metadata``）：读路径统一走
+    :func:`storage.local_load.load_local`，校验按索引里的 CRC 块做。
     """
     root = Path(path)
-    if (root / "manifest.json").is_file():
-        reader = CheckpointReader.open(
-            path, device=device, verify_crc=verify_crc, staging=staging
-        )
-        return reader.read_all()
-
     if _is_version_dir(root):
         base, version = _resolve_version_root(root)
         report = load_local(
@@ -104,6 +100,8 @@ def load(
             tp_rank=tp_rank,
             shard_dims=shard_dims,
             verify_crc=verify_crc,
+            crc_padding=crc_padding,
+            crc_padding_ratio=crc_padding_ratio,
         )
         return CheckpointData(
             tensors=dict(report.tensors),
@@ -118,8 +116,7 @@ def load(
         )
 
     raise FormatError(
-        f"{root}: neither manifest.json nor a committed version directory "
-        "(COMMIT / .metadata) found"
+        f"{root}: no committed version directory (COMMIT / .metadata) found"
     )
 
 
@@ -204,19 +201,29 @@ def _as_view(buffer: Any) -> memoryview:
 def _build_index(
     plan: SavePlan,
     *,
+    buffer: Any,
     step: int,
     layout: Mapping[str, int] | None,
+    crc_chunk_max: int,
 ) -> CheckpointIndex:
     """从「已经躺在 buffer 里的字节」直接生成索引。
 
-    不再计算分片 CRC：字节级完整性由上传时的对象级校验和负责（见
-    :mod:`storage.object`），索引里只留分片坐标。``crc32c`` 字段留空，旧版本
-    写下的值仍能解析（显式 ``verify_crc=True`` 时也仍然可用）。
+    ``buffer``（对齐后的 pinned 块）里每个分片/小状态按 ``crc_chunk_max`` 切块，
+    每块算一次 CRC-32C 写进索引：这是本地读路径做字节级自证（``verify_crc=True``）
+    的依据。算的是 ``[byte_offset, end)`` 这段**有效字节**，不含对齐补齐（详见
+    :mod:`storage.local_load`）。
     """
     grouped: dict[str, list[ShardMeta]] = {}
     shapes: dict[str, tuple[tuple[int, ...], str]] = {}
     for item in plan.items:
-        grouped.setdefault(item.fqn, []).append(item.to_shard_meta())
+        chunk_bytes, chunks = crc32c_chunks(
+            buffer[item.byte_offset : item.end],
+            itemsize=numpy_dtype(item.dtype).itemsize,
+            max_bytes=crc_chunk_max,
+        )
+        grouped.setdefault(item.fqn, []).append(
+            item.to_shard_meta(crc_chunk_bytes=chunk_bytes, crc32c_chunks=chunks)
+        )
         shapes[item.fqn] = (item.global_shape, item.dtype)
 
     tensors = {
@@ -225,7 +232,14 @@ def _build_index(
         )
         for fqn, shards in grouped.items()
     }
-    blobs: dict[str, BlobMeta] = plan.partial_blobs()
+    blobs: dict[str, BlobMeta] = {}
+    for blob in plan.blobs:
+        chunk_bytes, chunks = crc32c_chunks(
+            buffer[blob.byte_offset : blob.end], max_bytes=crc_chunk_max
+        )
+        blobs[blob.name] = blob.to_blob_meta(
+            crc_chunk_bytes=chunk_bytes, crc32c_chunks=chunks
+        )
     return CheckpointIndex(
         tensors=tensors, blobs=blobs, step=step, saved_layout=dict(layout or {})
     )
@@ -256,6 +270,7 @@ def save_local(
     alignment: int = DEFAULT_ALIGNMENT,
     engine: str = "auto",
     direct_io: bool = True,
+    crc_chunk_max: int = CRC_CHUNK_MAX,
     pool: PinnedBufferPool | None = None,
     manager: SnapshotManager | None = None,
 ) -> SaveReport:
@@ -267,6 +282,7 @@ def save_local(
     ``tensors``: FQN -> ``Tensor``（真机在 GPU 上，mock 下是 host 内存）
     ``blobs``:   小状态的**已序列化字节**（RNG / lr scheduler / dataloader 位置）
     ``layout``:  写进索引的 ``saved_layout``，只用于诊断与快路径
+    ``crc_chunk_max``: CRC 块上限（默认 1 MiB）；块数由分片长度推导，不会截断
     """
     blob_payloads = dict(blobs or {})
     if sources is None:
@@ -332,7 +348,13 @@ def save_local(
         _clear_padding(plan, view, aligned_size)
         snapshot.d2h_done()  # host 数据从这一刻起不可变
 
-        index = _build_index(plan, step=step, layout=layout)
+        index = _build_index(
+            plan,
+            buffer=snapshot.buffer.view,
+            step=step,
+            layout=layout,
+            crc_chunk_max=crc_chunk_max,
+        )
         # 单 rank 只看得到自己那片：`complete=False` 只做局部自检。全局覆盖由
         # 「汇总/恢复的一方」负责——本地多 rank 汇总后，或对象存储恢复端合并索引后。
         # 用 ``complete=True`` 会让任何带分片的保存（TP/ZeRO）直接 PlanError。
@@ -429,8 +451,13 @@ def load_object(
     shard_dims: Mapping[str, int] | None = None,
     budget_bytes: int = DEFAULT_UPLOAD_BUDGET_BYTES,
     column_strategy: str = "whole",
+    verify_crc: bool = True,
+    crc_padding: str = "block",
+    crc_padding_ratio: float = 0.125,
+    io_concurrency: int = 1,
+    local_staging_dir: str | Path | None = None,
 ) -> ObjectLoadReport:
-    """从对象存储恢复：``COMMIT`` 门禁 → 读各 rank 索引合并 → Range GET → H2D。"""
+    """从对象存储恢复：整文件下载到本地临时目录 → 本地读闭环按块校验 → H2D。"""
     return load_object_version(
         storage,
         step=step,
@@ -440,6 +467,11 @@ def load_object(
         shard_dims=shard_dims,
         budget_bytes=budget_bytes,
         column_strategy=column_strategy,
+        verify_crc=verify_crc,
+        crc_padding=crc_padding,
+        crc_padding_ratio=crc_padding_ratio,
+        io_concurrency=io_concurrency,
+        local_staging_dir=local_staging_dir,
     )
 
 
@@ -474,7 +506,6 @@ __all__ = [
     "BackendStats",
     "CheckpointData",
     "CheckpointError",
-    "CheckpointReader",
     "ChecksumError",
     "CpuBackend",
     "Device",
@@ -482,7 +513,6 @@ __all__ = [
     "FormatError",
     "GcReport",
     "GcWorker",
-    "LoadOptions",
     "LoadReport",
     "MissingTensorError",
     "MockCudaBackend",

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import threading
 import time
 from pathlib import Path
@@ -20,10 +19,6 @@ from async_ import (
     get_backend,
 )
 from core import PoolError, PoolExhaustedError
-
-
-def manifest_of(root: Path) -> dict:
-    return json.loads((root / "manifest.json").read_text(encoding="utf-8"))
 
 
 def test_preallocates_min_chunks() -> None:
@@ -176,22 +171,20 @@ def test_close_drops_free_chunks() -> None:
 
 def test_tensor_copy_to_pinned_block(dataset: Path) -> None:
     """Tensor.copy_to 直接把数据落到池里的块上，不额外分配 host 副本。"""
-    manifest = manifest_of(dataset)
-    files = {entry["name"]: entry["file"] for entry in manifest["tensors"]}
-
     data = ckpt.load(dataset, device="cuda:0")
     backend = get_backend(data.device)
     pool = PinnedBufferPool(chunk_bytes=1 << 20, min_chunks=1)
 
     name = data.names()[0]
     tensor = data[name]
+    expected = tensor.tobytes()
     backend.stats.reset()
 
     buffer = pool.acquire(tensor.nbytes)
     try:
         copied = tensor.copy_to(buffer)
         assert copied == tensor.nbytes
-        assert buffer.view[: copied] == (dataset / files[name]).read_bytes()
+        assert buffer.view[:copied] == expected
     finally:
         buffer.release()
 

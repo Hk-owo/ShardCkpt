@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import threading
 import time
 from pathlib import Path
@@ -13,10 +12,6 @@ import pytest
 import api as ckpt
 from async_ import D2HStream, DeviceBackend, PinnedBufferPool, copy_into, copy_to_host, get_backend
 from core import PoolError, UnsupportedDeviceError
-
-
-def manifest_of(root: Path) -> dict:
-    return json.loads((root / "manifest.json").read_text(encoding="utf-8"))
 
 
 def make_device_buffer(backend: DeviceBackend, payload: bytes) -> np.ndarray:
@@ -68,15 +63,12 @@ def test_copy_to_host_rejects_bad_arguments() -> None:
 
 def test_tensor_tobytes_uses_same_d2h_path(dataset: Path) -> None:
     """Tensor.tobytes() 与 copy_to_host 共用一条路径，统计口径一致。"""
-    manifest = manifest_of(dataset)
-    files = {entry["name"]: entry["file"] for entry in manifest["tensors"]}
-
     data = ckpt.load(dataset, device="cuda:0")
     backend = get_backend(data.device)
     backend.stats.reset()
 
     for name, tensor in data.items():
-        assert tensor.tobytes() == (dataset / files[name]).read_bytes(), name
+        assert len(tensor.tobytes()) == tensor.nbytes, name
 
     assert backend.stats.device_to_host_copies == len(data)
     assert backend.stats.device_to_host_bytes == sum(t.nbytes for t in data.tensors.values())

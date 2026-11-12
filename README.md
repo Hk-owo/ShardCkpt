@@ -17,13 +17,15 @@ ShardCkpt/
 │   ├── load_plan.py    求交 → 读取计划，合并相邻读请求
 │   └── targets.py      目标布局（tp / shard_dims）→ 本 rank 要读的区域
 ├── storage/          存储后端，统一接口
-│   ├── base.py         write / read / read_range / rename_or_put / list / delete
-│   ├── fs.py           本地盘、并行文件系统（manifest 解析、按张量读取）
+│   ├── base.py         write / read / download / read_range / rename_or_put / list / delete
+│   ├── data.py         加载结果容器（api.load 的返回类型）
 │   ├── local.py        本地层后端（native O_DIRECT 写 / preadv 读 / 纯 Python 回退）
-│   ├── local_load.py   本地层读闭环：窗口化 staging + 批量读 + 拷贝 + H2D
+│   ├── checksum.py     CRC-32C（默认 1 MiB 分块，可配置）+ google-crc32c / 纯 Python 回退
+│   ├── crc_io.py       逻辑读块 → 可校验 IO 子区间
+│   ├── local_load.py   本地层读闭环：窗口化 staging + 批量读 + 块校验 + H2D
 │   ├── recover.py      COMMIT 门禁：选版本、校验 .metadata、读出索引
-│   ├── object.py       对象存储（boto3：PUT / Range GET / list / delete / copy+delete）
-│   └── upload.py       上传闭环：每 rank 独立上传 + rank 0 只 list 检查 + 对象存储恢复
+│   ├── object.py       对象存储（boto3：PUT / 流式下载 / Range GET / list / delete）
+│   └── upload.py       上传闭环 + 对象存储恢复（整文件下载 → 本地读闭环）
 ├── commit/           提交协议、版本目录、垃圾回收
 │   ├── local.py        .metadata → COMMIT，版本扫描与删除
 │   └── gc.py           回收判据（纯函数）+ 执行器 + 周期线程
@@ -40,7 +42,7 @@ ShardCkpt/
 ├── bindings/         Python 绑定源码：python.cpp（异常映射 / GIL / 零拷贝 / 线程归属）
 ├── api.py            save_local / load_local / load：唯一把以上组件串起来的地方
 ├── tests/            pytest、测试数据生成器（tests/fixtures/）、仿真测试（tests/sim/）、C++ 用例（tests/cpp/）
-├── requirements.txt  Python 依赖（numpy / boto3）
+├── requirements.txt  Python 依赖（numpy / boto3 / google-crc32c）
 ├── include/ckpt/     C++ 公共头文件：Status、io_uring 封装、本地文件读写
 ├── src/              C++ 实现：io/uring.cpp、storage/local/local_file.cpp
 └── CMakeLists.txt    C++ 静态库 ckpt_core（liburing）+ Python 扩展 ckpt_native（pybind11）
@@ -103,19 +105,19 @@ data = api.load("/ckpt", device="cuda:0")           # 本地版本目录自动�
 | `DeviceBackend` | `async_/` | `allocate` / `copy_h2d` / `copy_d2h` / `synchronize` |
 | `CpuBackend` / `MockCudaBackend` | `async_/` | 默认注册的两个后端，后者 `is_mock == True` |
 | `register_backend()` | `async_/` | 接入真卡时用真实 `CudaBackend` 覆盖 `"cuda"`，调用方与测试不用改 |
-| `CheckpointReader` | `storage/fs.py` | 读 manifest、校验 CRC32、逐张量 H2D |
+| `CheckpointData` | `storage/data.py` | 加载结果容器：按名字取张量、迁移设备 |
 | `copy_into()` / `copy_to_host()` | `async_/d2h.py` | device → host 的唯一实现；前者不分配、直接落进调用方 buffer |
 | `D2HStream` / `CopyHandle` | `async_/d2h.py` | 独立拷贝 stream：提交即返回，`wait_stream` / `synchronize` / `max_inflight` |
 | `PinnedBufferPool` | `async_/pinned.py` | 预分配 + 复用 + 容量上限；无可用块时阻塞（反压点） |
 | `SnapshotManager` | `async_/machine.py` | 一代快照的状态机 + 多代门闸（单/双缓冲） |
 | `LocalStorage` | `storage/local.py` | 本地目录后端：native 写（O_DIRECT+fsync+rename）/ preadv 读 |
-| `CommitRecord` | `commit/local.py` | COMMIT 内容：step、metadata 校验和、文件清单 |
+| `CommitRecord` | `commit/local.py` | COMMIT 内容：step、metadata 字节数、文件清单 |
 | `save_local()` | `api.py` | 本地层写闭环：plan → D2H → 数据 + `.metadata` + COMMIT |
 | `open_version()` | `storage/recover.py` | 恢复门禁：只认带 COMMIT 的版本，校验 `.metadata` 与数据文件 |
 | `targets_for_layout()` | `planner/targets.py` | 新布局 → 本 rank 的目标区域（`tp=1` 时整读） |
-| `load_local()` | `api.py` | 本地层读闭环：COMMIT → 读取计划 → io_uring 批量读 → staging → H2D |
+| `load_local()` | `api.py` | 本地层读闭环：COMMIT → 读取计划 → 按块 IO → 块 CRC-32C → H2D |
 | `upload_local()` / `finalize_upload()` | `storage/upload.py` | 对象存储上传：每 rank 独立上传 + rank 0 只 `list` 检查 |
-| `load_object()` | `storage/upload.py` | 对象存储恢复：COMMIT → 合并各 rank 索引 → Range GET → H2D |
+| `load_object()` | `storage/upload.py` | 对象存储恢复：COMMIT → 合并索引 → 整文件下载 → 本地读闭环 |
 | `RankCommit` | `storage/upload.py` | 分片提交点：`step_N/rank_i/COMMIT`，证明本 rank 传完了 |
 | `plan()` | `commit/gc.py` | 回收判据（纯函数）：删哪些、留哪些、为什么 |
 | `collect()` / `gc_local()` | `commit/gc.py` / `api.py` | 回收执行器：一次 `list` + 目录扫描 + 幂等删除，默认 `dry_run` |
@@ -165,7 +167,7 @@ buffer.release()                            # 数据写完才归还，见下方�
 
 `tests/test_gpu_to_s3.py` 端到端验证这条链路：`load(device="cuda:0")` → 逐张量 D2H →
 PUT 到 S3 兼容存储 → 读回与源文件逐字节一致（大张量另走 multipart 分支）。上传本身带
-对象级校验和（`x-amz-checksum-crc32`），见「为什么本地层不做字节级校验」。
+对象级校验和（`x-amz-checksum-crc32`），见「本地分片 CRC 与对象存储校验的分工」。
 
 ## 快照状态机
 
@@ -292,7 +294,7 @@ dtype 归一（`torch.float32` / numpy / 短名）、各类拒绝路径，以及
 ## 对象存储后端（S3）
 
 `storage/object.py` 用 boto3 接 S3 兼容存储（SeaweedFS / MinIO / AWS S3），
-是 `storage/base.py` 接口的一个实现，调用语义与 `storage/fs.py` 一致：
+是 `storage/base.py` 接口的一个实现，调用语义与 `storage/local.py` 一致：
 
 ```python
 from storage.object import S3Config, S3Storage
@@ -321,12 +323,12 @@ s3.delete("tensors/final.bin")                     # 幂等
 - `tests/s3_stub.py` 是进程内的最小 S3 兼容服务，跑测试不需要外部 S3
 
 ```bash
-uv pip install --python .venv/bin/python -r requirements.txt   # numpy + boto3
-.venv/bin/python -m pytest      # 324 个用例：数据生成器 + 读取接口 + 对象存储 + D2H/stream/pinned 池 + GPU→S3
+uv pip install --python .venv/bin/python -r requirements.txt   # numpy + boto3 + google-crc32c
+.venv/bin/python -m pytest      # 344 个用例：数据生成器 + 读取接口 + 对象存储 + D2H/stream/pinned 池 + GPU→S3
 #              + 状态机 + 区域/索引/读写计划 + C++ 绑定（**未构建 native 时相关用例自动 skip**）
 #              + 本地层写闭环（数据 + .metadata + COMMIT 可恢复）
-#              + 本地层读闭环（布局不变 / TP 换卡数 / CRC 与 COMMIT 门禁）
-#              + 对象存储上传（每 rank 独立上传 / rank 0 list 门禁 / 从 S3 恢复）
+#              + 本地层读闭环（布局不变 / TP 换卡数 / 默认 1 MiB 块 CRC-32C + 扩读与 COMMIT 门禁）
+#              + 对象存储上传（每 rank 独立上传 / rank 0 list 门禁 / 整文件下载恢复）
 #              + 垃圾回收（判据纯函数 / 上传后回收 / 残片 / 幂等 / 降级 / 周期线程）
 #              + 仿真：训练 loop / 多 rank 分片 / 故障注入（见 tests/sim/README.md）
 #              + DTensor 适配（placements → 全局坐标；每 rank 上传后恢复拼回全局）
@@ -582,8 +584,8 @@ device）。落盘时怎么切的，恢复时按新布局重新求交，所以�
 ```
 open_version(COMMIT 门禁 + 长度校验) ──> targets_for_layout(tp/shard_dims)
    ──> build_load_plan(求交 → 读取计划) ──> 窗口化取 pinned staging 块
-   ──> 按文件分组 native.read_file_ranges(io_uring 批量读，零拷贝落进 staging)
-   ──> [可选 verify_crc] ──> 按 CopySpan 拷进目标 host 数组 ──> H2D ──> Tensor
+   ──> 按索引里的 CRC 块切/扩读 ──> 按文件分组 native.read_file_ranges
+   ──> 逐块 CRC-32C 校验 ──> 按 CopySpan 拷进目标 host 数组 ──> H2D ──> Tensor
 ```
 
 ```python
@@ -593,10 +595,12 @@ report = ckpt.load_local("/ckpt", device="cuda:0")      # step=None 取最新提
 report.step          # 42
 report.engine        # "native"（io_uring）/ "python"（preadv）
 report.requests      # ReadItem 数（合并相邻请求之后）
+report.io_requests   # 实际 IO 单元数（扩读/同块合并之后）
 report.amplification # 读放大：读进来的字节 / 真正用到的字节
-report.crc_verified  # 本次是否真的校验了（默认 False，见下节）
-report.verified_blocks  # 通过整分片校验的读块数
-report.unverified    # 开了校验、但结构上校验不了的读块（strided 读法下非空）
+report.crc_verified  # 本次是否校验（默认 True）
+report.verified_blocks  # 通过 CRC-32C 的块数
+report.unverified       # 没有扩读到完整块的读块（默认空；none/auto 未达阈值时非空）
+report.unverified_bytes # 上述读块里没有可比 CRC 的字节数
 report.tensors["model.embed_tokens.weight"].numpy()
 report.blobs["lr_scheduler"]                             # 小状态原样读回
 
@@ -612,41 +616,69 @@ report = ckpt.load_local(
 - **staging 复用**：一个窗口内所有读请求紧凑排进一块 pinned 块（`PinnedBufferPool`，
   与写路径同一个 `aligned_allocator`），读完、拷完才归还；`budget_bytes` 控制窗口大小，
   单块大于预算时自己占一个窗口
-- **CRC 的边界**：校验默认关闭（见下节）。显式打开 `verify_crc=True` 时，索引里记的整分片
-  crc32 只对**覆盖整个分片**的读块成立：`column_strategy="whole"`（默认）整块读旧分片再
-  在内存里切，能校验；`"strided"` 逐行读，单块只是分片的一部分，校验不了 —— 这种情况如实
-  记进 `LoadReport.unverified`，不假装校验过
+- **CRC 的边界**：默认校验，索引里每个分片/小状态按 `crc_chunk_max`（默认 1 MiB）
+  切块，每块一个 CRC-32C。读路径按同样的块边界切 IO，并默认把不完整的读块扩读到
+  完整块（`crc_padding="block"`），完整块逐个比对；只有显式 `crc_padding="none"`
+  或 `"auto"` 未达阈值时，头/尾部分块才记进 `LoadReport.unverified` 并计入
+  `unverified_bytes`，不假装校验过
 - **短读不静默截断**：C++ 的 `ReadRanges` 与 Python 的 `preadv` 回退都会报错
-- `api.load()` 会自动探测格式：有 `manifest.json` 走旧的整文件读取，有 `COMMIT` /
-  `.metadata` 走这条读闭环；直接传 `step_42` 目录也可以
+- `api.load()` 只接受本地版本目录（`COMMIT` / `.metadata`）；旧的 `manifest.json`
+  格式已删除，历史数据集需要重新保存
 
-## 为什么本地层不做字节级校验
+## 本地分片 CRC 与对象存储校验的分工
 
-本地版本目录只是**上传对象存储之前的暂存**：写完 fsync、立刻上传、传成功就删。所以
-这里既不需要分片 CRC，也不需要 `.metadata` 的 CRC。
+本地版本目录的完整性由 `tmp → fsync → rename → fsync` 与 `COMMIT` 的文件清单兜结构性问题；
+字节级正确性由**块级 CRC-32C** 兜，默认开启。
 
-- **完整性不靠校验和**。`tmp → fsync → rename → fsync` 保证「要么看到旧版本、要么看到
-  新版本」，`COMMIT` 的文件清单（名字 → 字节数）保证「文件齐、长度对、不是别的 step」。
-  这两样覆盖了「缺文件 / 截断 / 版本错配」，且不依赖介质健康。
-- **字节正确性在上传边界把关**。`storage/object.py` 的对象级校验和覆盖「本地读出来 →
-  网络 → 落盘」整条链路：PUT 带 `ChecksumAlgorithm`，服务端独立重算并比对，不匹配回
-  400；整对象 GET 带 `ChecksumMode=ENABLED` 由 botocore 回验。不带校验头的 PUT 只能
-  证明「服务端收到的 = 服务端存下的」，证明不了「客户端发出去的是对的」。
-- **索引的完整性有更强的免费检查**。JSON 解析 + `CheckpointIndex.validate()` 抓结构性
-  损坏，比「长度不变但内容被改」的 crc32 更有意义（rename/PUT 的原子性已经排除半写）。
-- **文件系统级 checksum 不是替代方案**：它的信任域到文件系统边界就结束了（`cp` /
-  `rsync` / 上传 / 跨机读取都不带它），训练集群常用的 ext4/xfs 没有、Lustre/GPFS 通常
-  没权限开，坏了只会得到一个不可定位的 `EIO`。
-- **CRC 本来也抓不到最主要的那类故障**：写错位置、rank 之间拼错、张量串了。它只证明
-  「读回来的 = 当时写进去的」。
+- **写侧总是算**。`save_local` 为每个分片与小状态按 `crc_chunk_max`（默认 1 MiB，
+  可配置）切块，每块算一次 CRC-32C（Castagnoli；默认用 `google-crc32c`，走
+  SSE4.2 / ARMv8 硬件指令），写进索引的 `crc_chunk_bytes` / `crc32c_chunks`。
+  算的是 `[byte_offset, byte_offset + length)` 这段有效字节，不含对齐补齐。
+- **块大小由长度推导**：`blocks = ceil(length / crc_chunk_max)`，
+  `chunk = ceil(length / blocks)`。小分片整片一块，大分片块大小落在
+  `crc_chunk_max/2` 到 `crc_chunk_max` 之间；尾块接近块大小，不会出现几 KB 的零头。
+- **读侧默认校验 + 扩读**。读路径按 `crc_chunk_bytes` 切 IO；`crc_padding="block"`
+  （默认）把不完整的读块扩读到完整块，同块/相邻块合并成一次 IO。每块重算后与索引
+  比对，不匹配在**读出坏数据之前**抛 `ChecksumError`。关掉校验要显式传
+  `verify_crc=False`；只想控制读放大可以传 `crc_padding="auto"` / `"none"`。
+- **扩读的代价是读放大**。`strided` 逐行读时，一行可能只有几 KB，扩读到 1 MiB 块
+  意味着最多几百倍放大；`crc_padding="auto"` 用“实际使用字节 / 扩展后字节”的阈值
+  控制，`"none"` 则完全不扩、如实记 `unverified`。
 
-需要一个「介质可疑 / 离线排查 / 恢复演练」时的自证入口，就显式 `verify_crc=True`：
-它对**旧版本写下的索引**（里面还有分片 `crc32c`）依然有效，新写的 checkpoint 不再生成
-这个字段。默认关闭的定义在 `storage/local_load.py` 的模块 docstring 里。
+### 为什么是 CRC-32C，而对象存储用 CRC32
 
-注意区分：`planner/save_plan.py` 的 `default_writer` 也用 `zlib.crc32(fqn) % n`，那是
-**哈希分桶**（决定 Replicate 副本里谁落盘），不是校验，不能跟着删——否则历史版本的分片
-归属会变。
+两层算法**故意不同**，各有各的理由：
+
+| | 本地层（`storage/checksum.py`） | 对象存储（`storage/object.py`） |
+|---|---|---|
+| 谁算 | 我们自己算 | 服务端独立算，客户端只声明算法 |
+| 算法 | CRC-32C（Castagnoli） | CRC32（IEEE） |
+| 理由 | 需要自己算才有得比，`google-crc32c` 有硬件指令 | botocore 无 `awscrt` 时只实现 `crc32`/`sha1`/`sha256`/`sha512`；换 CRC32C 要么加 `awscrt` 要么自己写 header，而 32 位校验的检错能力同量级，收益为零 |
+
+两层的值互不流通：本地块校验和不进对象存储，对象存储的校验和不落本地索引。
+
+### 对象存储恢复：整文件下载 + 本地块校验
+
+对象存储恢复走 `load_object()`：先读版本 `COMMIT`、合并各 rank 的 `.metadata`，然后把
+版本数据文件**流式下载**到本地临时目录（`StorageBackend.download`，峰值内存是一块下载
+缓冲，不是整个文件），写本地 `.metadata` 与 `COMMIT`，最后调用 `load_local()` 按块校验。
+
+- 对象存储侧只负责「发回来的 = 存的」：整对象 GET 带 `ChecksumMode=ENABLED`，
+  PUT / multipart 带 `ChecksumAlgorithm=CRC32`，服务端独立重算；
+- 本地 `load_local()` 负责「存的 = 当初写的」：按索引里的 CRC 块比对 CRC-32C；
+- 下载完临时目录在返回前删除；`report.local_staging` 只留路径作诊断。
+
+### 旧格式已删除
+
+`manifest.json` 读取路径、`.metadata` / `COMMIT` 里的旧整片 `crc32c`、`COMMIT` 的
+`metadata.crc32` 都已删除。旧 checkpoint 不再兼容：要么重新保存，要么用旧版本程序读取。
+
+注意区分：`planner/save_plan.py` 的 `default_writer` 仍用 `zlib.crc32(fqn) % n`，那是
+**哈希分桶**（决定 Replicate 副本里谁落盘），不是校验，不能跟着改——否则历史版本的
+分片归属会变。
+
+CRC 本来也抓不到最主要的那类故障：写错位置、rank 之间拼错、张量串了。它只证明「读回来
+的 = 当时写进去的」，结构性错误由 `CheckpointIndex.validate()` 与 `COMMIT` 门禁负责。
 
 ## Python 绑定（`ckpt_native`）
 
