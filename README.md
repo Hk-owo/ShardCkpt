@@ -109,6 +109,7 @@ data = api.load("/ckpt", device="cuda:0")           # 本地版本目录自动�
 | `copy_into()` / `copy_to_host()` | `async_/d2h.py` | device → host 的唯一实现；前者不分配、直接落进调用方 buffer |
 | `D2HStream` / `CopyHandle` | `async_/d2h.py` | 独立拷贝 stream：提交即返回，`wait_stream` / `synchronize` / `max_inflight` |
 | `PinnedBufferPool` | `async_/pinned.py` | 预分配 + 复用 + 容量上限；无可用块时阻塞（反压点） |
+| `default_pool()` | `async_/pinned.py` | 保存路径的进程级常驻池：跨 step 复用同一块，`trim()` 削掉多余空闲块 |
 | `SnapshotManager` | `async_/machine.py` | 一代快照的状态机 + 多代门闸（单/双缓冲） |
 | `LocalStorage` | `storage/local.py` | 本地目录后端：native 写（O_DIRECT+fsync+rename）/ preadv 读 |
 | `CommitRecord` | `commit/local.py` | COMMIT 内容：step、metadata 字节数、文件清单 |
@@ -324,7 +325,7 @@ s3.delete("tensors/final.bin")                     # 幂等
 
 ```bash
 uv pip install --python .venv/bin/python -r requirements.txt   # numpy + boto3 + google-crc32c
-.venv/bin/python -m pytest      # 344 个用例：数据生成器 + 读取接口 + 对象存储 + D2H/stream/pinned 池 + GPU→S3
+.venv/bin/python -m pytest      # 361 个用例：数据生成器 + 读取接口 + 对象存储 + D2H/stream/pinned 池 + GPU→S3
 #              + 状态机 + 区域/索引/读写计划 + C++ 绑定（**未构建 native 时相关用例自动 skip**）
 #              + 本地层写闭环（数据 + .metadata + COMMIT 可恢复）
 #              + 本地层读闭环（布局不变 / TP 换卡数 / 默认 1 MiB 块 CRC-32C + 扩读与 COMMIT 门禁）
@@ -515,10 +516,16 @@ ckpt/
   （功能等价、不绕 page cache）；`"auto"` 按扩展是否可用来选
 - pinned 块由 C++ 的 `AlignedBuffer` 分配（`aligned_allocator()`），D2H 落点天然满足
   O_DIRECT 的地址对齐，写盘全程零拷贝
+- **默认用常驻池，不再「每存一次现造一块」**：`pool=None` 时走进程级 `default_pool()`，
+  块粒度是 `chunk_bytes`（默认 8 MiB）而不是整份 checkpoint。同一份模型反复保存时
+  `stats.allocations` 恒为 1、`stats.reuses` 逐代增长；每次租块前 `trim(keep_bytes=...)`
+  把多余空闲块削掉，稳态只占一块（模型变大就换大的那块，旧的释放掉）
+- `report.pool_reused` 说明这一次是不是命中了池里已有的块（`None` = 池不提供统计）
 
 ```python
 import api as ckpt
 
+ckpt.configure_default_pool(chunk_bytes=16 << 20, max_bytes=1 << 30)  # 可选：启动时定策略
 data = ckpt.load("/data/step_0", device="cuda:0")
 report = ckpt.save_local(
     data.tensors, "/ckpt", step=42,
@@ -528,6 +535,9 @@ report = ckpt.save_local(
 report.state        # SnapshotState.COMMITTED
 report.engine       # "native" / "python"
 report.file_size    # 数据文件字节数（含尾块补齐）
+report.pool_reused  # 这次是否复用了常驻池里的块（首版 False，之后 True）
+
+ckpt.close_default_pool()   # 训练结束/显存紧张时显式释放常驻块
 ```
 
 `save_async()` 仍是 `NotImplementedError`：后台进程与上传队列还没做。

@@ -240,3 +240,73 @@ def test_pool_drives_snapshot_machine(dataset: Path) -> None:
     assert pool.stats.allocations == 1, "下一代替换时复用同一块，不再分配"
     assert pool.stats.reuses == 2
     again.release()
+
+
+# --- trim：常驻池跨 step 复用时不让空闲块堆积 ---------------------------------
+
+
+def test_trim_keeps_one_reuse_candidate() -> None:
+    pool = PinnedBufferPool(chunk_bytes=4096, min_chunks=0)
+    small = pool.acquire(4096)
+    big = pool.acquire(8192)
+    small.release()
+    big.release()
+
+    dropped = pool.trim(keep_bytes=8192)
+
+    assert dropped == 4096, "留下 8 KiB 那块当复用候选，4 KiB 的丢掉"
+    assert pool.stats.chunks == 1
+    assert pool.stats.capacity_bytes == 8192
+
+    reused = pool.acquire(8192)
+    assert reused.capacity == 8192
+    assert pool.stats.allocations == 2, "候选块直接复用，不再分配"
+    reused.release()
+
+
+def test_trim_prefers_the_smallest_block_that_fits() -> None:
+    pool = PinnedBufferPool(chunk_bytes=4096, min_chunks=0)
+    small = pool.acquire(4096)
+    big = pool.acquire(8192)
+    small.release()
+    big.release()
+
+    dropped = pool.trim(keep_bytes=1024)
+
+    assert dropped == 8192, "只留能满足 1 KiB 的最小块（4 KiB）"
+    assert pool.stats.capacity_bytes == 4096
+    assert pool.acquire(1024).capacity == 4096
+
+
+def test_trim_keeps_the_largest_block_when_none_fits() -> None:
+    pool = PinnedBufferPool(chunk_bytes=4096, min_chunks=0)
+    small = pool.acquire(4096)
+    big = pool.acquire(8192)
+    small.release()
+    big.release()
+
+    dropped = pool.trim(keep_bytes=1 << 20)
+
+    assert dropped == 4096, "都不够大时留最大的一块"
+    assert pool.stats.capacity_bytes == 8192
+
+
+def test_trim_ignores_in_use_blocks() -> None:
+    pool = PinnedBufferPool(chunk_bytes=4096, min_chunks=0)
+    held = pool.acquire(4096)
+    free = pool.acquire(8192)
+    free.release()
+
+    dropped = pool.trim(keep_bytes=0)
+
+    assert dropped == 0, "只剩一块空闲块（它就是候选）"
+    assert pool.stats.in_use_bytes == 4096
+    assert held.valid
+    held.release()
+
+
+def test_trim_on_closed_pool_is_a_noop() -> None:
+    pool = PinnedBufferPool(chunk_bytes=4096, min_chunks=1)
+    pool.close()
+
+    assert pool.trim(keep_bytes=4096) == 0

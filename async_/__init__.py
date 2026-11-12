@@ -37,6 +37,9 @@ from async_.pinned import (
     PinnedBufferPool,
     PoolStats,
     aligned_allocator,
+    close_default_pool,
+    configure_default_pool,
+    default_pool,
 )
 from core import UnsupportedDeviceError
 from core.metadata import Device, numpy_dtype
@@ -312,8 +315,11 @@ __all__ = [
     "TriggerDecision",
     "aligned_allocator",
     "available_device_types",
+    "close_default_pool",
+    "configure_default_pool",
     "copy_into",
     "copy_to_host",
+    "default_pool",
     "get_backend",
     "register_backend",
     "reset_registry",

@@ -8,6 +8,11 @@
 方式都不用改。``aligned_allocator()`` 用 C++ 的 ``AlignedBuffer`` 分配页对齐内存，
 让 O_DIRECT 零拷贝写盘成立（numpy 分配的地址不保证 4096 对齐）。
 
+保存路径默认用 ``default_pool()`` 拿**进程级常驻池**：第一次保存时创建，之后跨 step
+复用同一块（同一份 checkpoint 反复保存时 ``stats.allocations`` 恒为 1、``stats.reuses``
+逐代增长）；``trim()`` 在每次租块前削掉多余空闲块，稳态只占一块。参数用
+``configure_default_pool()`` 配，显式释放用 ``close_default_pool()``。
+
 池实现 :class:`async_.machine.BufferPool` 协议：``acquire`` / ``release`` /
 ``has_free``。``acquire`` 在池空且无法扩容时等待别人归还（``timeout`` 到点抛
 :class:`core.PoolExhaustedError`），这正是「下一次快照等上一批 buffer 归还」的那条
@@ -16,6 +21,7 @@
 
 from __future__ import annotations
 
+import os
 import threading
 import weakref
 from dataclasses import dataclass, replace
@@ -208,6 +214,34 @@ class PinnedBufferPool(BufferPool):
                 self._free.append(array)
             self._cond.notify()
 
+    # --- 内存治理 -----------------------------------------------------------
+    def trim(self, *, keep_bytes: int = 0) -> int:
+        """丢掉多余的空闲块，只留一块「下次复用候选」，返回释放的字节数。
+
+        常驻池跨多次保存复用时，checkpoint 大小会变（模型长大、分片变多），旧块
+        留在空闲列表里就变成纯浪费。保留的候选是「能满足 ``keep_bytes`` 的最小空闲
+        块」；没有能满足的就留最大的一块 —— 它至少能接住下一次稍小的请求。
+
+        在用的块不受影响，所以随时可以调。
+        """
+        if keep_bytes < 0:
+            raise ValueError(f"keep_bytes must be >= 0, got {keep_bytes}")
+        with self._cond:
+            if self._closed or not self._free:
+                return 0
+            best = self._best_fit(keep_bytes)
+            if best is None:
+                best = max(range(len(self._free)), key=lambda i: self._free[i].nbytes)
+            dropped = 0
+            for index in reversed(range(len(self._free))):
+                if index == best:
+                    continue
+                array = self._free.pop(index)
+                dropped += int(array.nbytes)
+                self._stats.capacity_bytes -= int(array.nbytes)
+                self._stats.chunks -= 1
+            return dropped
+
     # --- 生命周期 -----------------------------------------------------------
     def close(self) -> None:
         """关闭池：丢掉所有空闲块；在用块归还时直接被丢弃。"""
@@ -304,10 +338,116 @@ def aligned_allocator(alignment: int = 4096) -> Callable[[int], np.ndarray]:
     return allocate
 
 
+# --- 进程级常驻池 -----------------------------------------------------------
+#
+# 保存路径的默认池：第一次 ``save_local`` 时创建，之后跨 step 复用同一批块
+# （同一份 checkpoint 反复保存时 ``stats.reuses`` 增长、``stats.allocations`` 不动）。
+# 生命周期跟着进程走，用 ``configure_default_pool()`` 调参、``close_default_pool()``
+# 显式释放；不关闭的话就是「稳态常驻一块」的内存占用。
+
+_DEFAULT_POOL_LOCK = threading.Lock()
+_DEFAULT_POOL: PinnedBufferPool | None = None
+_DEFAULT_POOL_ALIGNMENT = 0
+_DEFAULT_POOL_PID = 0
+_DEFAULT_POOL_KWARGS: dict[str, object] = {}
+
+_DEFAULT_POOL_DEFAULTS: dict[str, object] = {
+    "chunk_bytes": DEFAULT_CHUNK_BYTES,
+    "min_chunks": 0,
+    "max_bytes": None,
+    "timeout": None,
+}
+
+_DEFAULT_POOL_KEYS = frozenset(_DEFAULT_POOL_DEFAULTS) | {"alignment", "allocator"}
+
+
+def default_pool(*, alignment: int | None = None, **overrides: object) -> PinnedBufferPool:
+    """进程级常驻池：跨多次保存复用同一批块，第一次调用时创建。
+
+    默认 ``chunk_bytes=DEFAULT_CHUNK_BYTES``（8 MiB 粒度）、``min_chunks=0``
+    （按需分配）、``max_bytes=None``（可扩容，因此不会因为容量卡住）、
+    ``timeout=None``。``alignment`` 决定分配器的地址对齐（默认 4096，O_DIRECT 前提）。
+
+    ``overrides`` 只对**创建**生效，可用键见 :data:`_DEFAULT_POOL_KEYS`；池已存在时
+    用 :func:`configure_default_pool` 先配置，或先 :func:`close_default_pool`。
+
+    池已存在但要求更大的 ``alignment``：没有在途块就重建，有在途块则抛
+    :class:`core.PoolError` —— 不能把正在被写的内存悄悄换掉。
+    """
+    global _DEFAULT_POOL, _DEFAULT_POOL_ALIGNMENT, _DEFAULT_POOL_PID
+
+    unknown = set(overrides) - _DEFAULT_POOL_KEYS
+    if unknown:
+        raise TypeError(f"未知的池参数：{', '.join(sorted(unknown))}")
+
+    with _DEFAULT_POOL_LOCK:
+        pool = _DEFAULT_POOL
+        if pool is not None and _DEFAULT_POOL_PID != os.getpid():
+            # fork 之后子进程拿到的是父进程的副本：块的内容与锁状态都不可信。
+            # 直接丢掉重建（不 close：那把锁可能正被父进程的线程持着）。
+            pool, _DEFAULT_POOL, _DEFAULT_POOL_ALIGNMENT = None, None, 0
+        if pool is not None and not pool.closed:
+            if alignment is None or alignment <= _DEFAULT_POOL_ALIGNMENT:
+                return pool
+            if pool.stats.in_use_bytes:
+                raise PoolError(
+                    f"默认池的块对齐是 {_DEFAULT_POOL_ALIGNMENT}，"
+                    f"但本次要求 {alignment}，且有块在用，不能重建"
+                )
+            pool.close()
+            _DEFAULT_POOL = None
+
+        options = dict(_DEFAULT_POOL_DEFAULTS)
+        options.update(_DEFAULT_POOL_KWARGS)
+        options.update(overrides)
+        # 本次显式要求的对齐优先于已配置的值：重建之后必须按新的来。
+        configured = options.pop("alignment", None)
+        align = int(alignment if alignment is not None else (configured or 4096))
+        allocator = options.pop("allocator", None) or aligned_allocator(align)
+
+        pool = PinnedBufferPool(allocator=allocator, **options)  # type: ignore[arg-type]
+        _DEFAULT_POOL = pool
+        _DEFAULT_POOL_ALIGNMENT = align
+        _DEFAULT_POOL_PID = os.getpid()
+        return pool
+
+
+def configure_default_pool(**kwargs: object) -> None:
+    """配置**下一次**创建默认池的参数；池已存在时先 ``close_default_pool()``。"""
+    unknown = set(kwargs) - _DEFAULT_POOL_KEYS
+    if unknown:
+        raise TypeError(f"未知的池参数：{', '.join(sorted(unknown))}")
+    with _DEFAULT_POOL_LOCK:
+        if _DEFAULT_POOL is not None and not _DEFAULT_POOL.closed:
+            raise PoolError("默认池已创建，先 close_default_pool() 再配置")
+        _DEFAULT_POOL_KWARGS.clear()
+        _DEFAULT_POOL_KWARGS.update(kwargs)
+
+
+def close_default_pool(*, keep_config: bool = False) -> None:
+    """关闭并丢弃进程级默认池；在途块归还时被丢弃，下次 ``default_pool()`` 重建。
+
+    ``keep_config=False``（默认）连 ``configure_default_pool()`` 的配置一起清掉，
+    下一次创建回到内置默认；只想换一批块、保留参数就传 ``keep_config=True``。
+    """
+    global _DEFAULT_POOL, _DEFAULT_POOL_ALIGNMENT, _DEFAULT_POOL_PID
+    with _DEFAULT_POOL_LOCK:
+        pool, _DEFAULT_POOL = _DEFAULT_POOL, None
+        _DEFAULT_POOL_ALIGNMENT = 0
+        _DEFAULT_POOL_PID = 0
+        if not keep_config:
+            _DEFAULT_POOL_KWARGS.clear()
+    if pool is not None:
+        pool.close()
+
+
 __all__ = [
     "DEFAULT_CHUNK_BYTES",
     "PinnedBuffer",
     "PinnedBufferPool",
     "PoolStats",
     "aligned_allocator",
+    "close_default_pool",
+    "configure_default_pool",
+    "default_pool",
 ]

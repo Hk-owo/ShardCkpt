@@ -32,8 +32,10 @@ from async_ import (
     SnapshotState,
     Tensor,
     TriggerDecision,
-    aligned_allocator,
     available_device_types,
+    close_default_pool,
+    configure_default_pool,
+    default_pool,
     get_backend,
     register_backend,
     reset_registry,
@@ -169,6 +171,8 @@ class SaveReport:
     commit: CommitRecord
     state: SnapshotState
     d2h_bytes: int
+    # 这次租块是否命中了池里已有的块；池不提供统计时为 None
+    pool_reused: bool | None = None
 
     @property
     def file_size(self) -> int:
@@ -196,6 +200,12 @@ def _sources_from_tensors(tensors: Mapping[str, Tensor]) -> list[ShardSource]:
 def _as_view(buffer: Any) -> memoryview:
     view = getattr(buffer, "view", None)
     return view if isinstance(view, memoryview) else memoryview(buffer)
+
+
+def _pool_reuses(pool: Any) -> int | None:
+    """池的累计复用次数；自定义池没有 ``stats.reuses`` 时返回 ``None``。"""
+    reuses = getattr(getattr(pool, "stats", None), "reuses", None)
+    return reuses if isinstance(reuses, int) else None
 
 
 def _build_index(
@@ -283,6 +293,9 @@ def save_local(
     ``blobs``:   小状态的**已序列化字节**（RNG / lr scheduler / dataloader 位置）
     ``layout``:  写进索引的 ``saved_layout``，只用于诊断与快路径
     ``crc_chunk_max``: CRC 块上限（默认 1 MiB）；块数由分片长度推导，不会截断
+    ``pool``:    pinned 块池；``None`` 时用进程级常驻池（``api.default_pool()``），
+                 同一份 checkpoint 反复保存时复用同一块，不再每次现造现弃。
+                 常驻池在每次租块前会 ``trim()`` 掉多余空闲块，稳态只占一块。
     """
     blob_payloads = dict(blobs or {})
     if sources is None:
@@ -302,20 +315,25 @@ def save_local(
     aligned_size = -(-plan.size // alignment) * alignment
 
     if pool is None:
-        chunk = max(aligned_size, alignment)
-        pool = PinnedBufferPool(
-            chunk_bytes=chunk,
-            min_chunks=1,
-            max_bytes=chunk,
-            timeout=0,
-            allocator=aligned_allocator(alignment),
-        )
+        # 默认走进程级常驻池：同一份 checkpoint 反复保存时复用同一块（不再每次
+        # 「按整份大小现造、用完即弃」）。先把多出来的空闲块削掉，稳态只有一块。
+        pool = default_pool(alignment=alignment)
+        trim = getattr(pool, "trim", None)
+        if trim is not None:
+            trim(keep_bytes=aligned_size)
     snapshot_manager = manager or SnapshotManager(pool)
 
+    reuses_before = _pool_reuses(pool)
     trigger = snapshot_manager.trigger(step, nbytes=aligned_size)
     if trigger.decision is not TriggerDecision.START or trigger.snapshot is None:
         raise PlanError(f"step {step}: 拿不到 pinned buffer（{trigger.reason}）")
     snapshot: Snapshot = trigger.snapshot
+    reuses_after = _pool_reuses(pool)
+    pool_reused = (
+        None
+        if reuses_before is None or reuses_after is None
+        else reuses_after > reuses_before
+    )
 
     storage = LocalStorage(root, direct_io=direct_io, alignment=alignment, engine=engine)
     key = version_key(step)
@@ -403,6 +421,7 @@ def save_local(
         commit=record,
         state=snapshot.state,
         d2h_bytes=d2h_bytes,
+        pool_reused=pool_reused,
     )
 
 
@@ -524,7 +543,10 @@ __all__ = [
     "TriggerDecision",
     "UnsupportedDeviceError",
     "available_device_types",
+    "close_default_pool",
+    "configure_default_pool",
     "cuda",
+    "default_pool",
     "gc_local",
     "get_backend",
     "ObjectLoadReport",
