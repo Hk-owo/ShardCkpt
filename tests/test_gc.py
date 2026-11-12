@@ -156,7 +156,7 @@ def test_remote_newest_prefix_is_kept() -> None:
 
 
 def test_committed_remote_version_is_never_removed() -> None:
-    """不做保留策略：远端已提交的版本一个都不删。"""
+    """残片判据永不删已提交版本：有界保留是另一条判据（``plan_retention``）。"""
     result = plan(
         versions=[1, 2, 3, 4],
         rank_commits=[(4, 0)],

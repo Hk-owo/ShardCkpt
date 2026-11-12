@@ -12,7 +12,7 @@ S3 是进程内的 `tests/s3_stub.py`（要连真的 SeaweedFS / MinIO 就传 `-
     4  提交点语义：finalize(step=12) 失败、load_object(step=12) 报错，最新仍是 9
     5  从对象存储恢复：每个 rank 取自己那片、拼回全局，再整读一份交叉验证
     6  续训：从 step 9 恢复后跑 3 步 == 一口气跑到 step 12（逐字节）
-    7  下一轮 step 15 提交成功 → 回收本地暂存（已上传的 / 被越过的残片），幂等重跑
+    7  下一轮 step 15 提交成功 → 有界保留只留最近 3 代（step 3 被删）+ 回收本地暂存
 
 用法::
 
@@ -498,9 +498,26 @@ def phase_resume(sc: Scenario, restored: Mapping[str, np.ndarray]) -> None:
 
 
 def phase_gc(sc: Scenario) -> None:
-    print("\n[7/7] 回收本地暂存：已上传的删、被更新版本越过的残片删")
+    print(
+        "\n[7/7] 提交完成后的有界保留（只留最近 "
+        f"{ckpt.DEFAULT_KEEP_VERSIONS} 代）+ 回收本地暂存"
+    )
     storage = sc.storage()
     try:
+        # rank 0 在 finalize(step=15) 里已经裁过一次；这里只复核结果，不动手删。
+        versions = sorted(committed_steps(storage))
+        window = sorted(STEPS)[-ckpt.DEFAULT_KEEP_VERSIONS :]
+        print(f"    远端保留的已提交版本：{[f'step_{v}' for v in versions]}；保留窗口：{window}")
+        assert versions == window, f"远端版本清单异常：{versions}，期望 {window}"
+
+        oldest = sorted(STEPS)[0]
+        try:
+            ckpt.load_object(storage, step=oldest, device=sc.device)
+        except FormatError as exc:
+            print(f"    窗口外的 step {oldest} 如期不可恢复：{exc}")
+        else:
+            raise AssertionError(f"step {oldest} 超出保留窗口，应该已经被删掉")
+
         print("    回收计划（dry_run=True，只看不删）：")
         for rank in range(sc.ranks):
             plan = ckpt.gc_local(sc.root(rank), storage, rank=rank, dry_run=True)
@@ -523,10 +540,7 @@ def phase_gc(sc: Scenario) -> None:
             if sc.root(rank).is_dir()
         }
         print(f"    幂等重跑无新增删除；本地剩余目录：{remaining}")
-
-        versions = sorted(committed_steps(storage))
-        print(f"    远端保留的已提交版本：{[f'step_{v}' for v in versions]}")
-        assert versions == sorted(STEPS), f"远端版本清单异常：{versions}"
+        assert sorted(committed_steps(storage)) == window, "本地回收不该碰远端已提交版本"
     finally:
         storage.close()
 

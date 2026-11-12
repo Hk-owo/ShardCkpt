@@ -19,8 +19,15 @@
 **降级**：本地判据依赖远端状态，所以远端不可达时本地一个都不删 —— 「查不到」
 不能当成「可以删」。
 
-删除顺序与写入镜像：先删提交点（本地 ``COMMIT`` / 远端 ``rank_<r>/COMMIT``），
-再删数据，最后删空目录。判据只看提交点在不在，所以删到一半被打断，重跑一次收敛。
+删除顺序与写入镜像：先删提交点（本地 ``COMMIT`` / 远端版本 ``COMMIT`` /
+``rank_<r>/COMMIT``），再删数据，最后删空目录。判据只看提交点在不在，所以删到一半
+被打断，重跑一次收敛。
+
+上面两条判据**只删残片**，远端已提交的版本一个都不碰。对象存储侧的**有界保留**是另一
+条独立判据（:func:`plan_retention` / :func:`retain_remote_versions`）：版本 ``COMMIT``
+一写完，rank 0 就只留最新的 ``keep`` 代（默认 3），从最旧的一代开始删，同样先删版本
+``COMMIT`` 再删其余数据 —— 提交点一消失这一版立刻不可恢复，删到一半被打断也不会被
+当成「完整版本」。
 """
 
 from __future__ import annotations
@@ -51,7 +58,13 @@ NO_NEWER_VERSION = "no_newer_version"
 """远端最新、且没有版本提交点：可能正在传，也可能 rank 0 崩在最后一步。"""
 
 COMMITTED = "committed"
-"""远端已提交的版本：不做保留策略，永不删除。"""
+"""远端已提交、且落在保留窗口内的版本：:func:`plan` 永不删除它。"""
+
+RETENTION = "retention"
+"""远端已提交但超出保留窗口的版本：由 rank 0 在提交完成后删除。"""
+
+DEFAULT_KEEP_VERSIONS = 3
+"""对象存储侧有界保留的默认窗口：只留最新的这么多代已提交版本。"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,6 +143,22 @@ def plan(
         kept=tuple(kept),
         versions=known,
     )
+
+
+def plan_retention(
+    *, versions: Iterable[int], keep: int = DEFAULT_KEEP_VERSIONS
+) -> tuple[int, ...]:
+    """对象存储侧的有界保留：只留最新 ``keep`` 代，返回要删的 step（最旧在前）。
+
+    **纯函数**：不碰 IO。入参只取「带版本 ``COMMIT`` 的 step」—— 半途上传、没有提交点
+    的前缀不归这条判据管（那是 :func:`plan` 的 ``superseded``）。
+
+    ``keep`` 必须 >= 1：最新那一代永远留着，「删到没有可恢复版本」不是保留策略。
+    """
+    if keep < 1:
+        raise ValueError(f"keep must be >= 1, got {keep}")
+    ordered = sorted({int(step) for step in versions})
+    return tuple(ordered[:-keep])
 
 
 # --- 执行器 ---------------------------------------------------------------
@@ -240,12 +269,22 @@ def _scan_remote(
 
 
 def _delete_remote_prefix(remote: StorageBackend, step: int, keys: Iterable[str]) -> int:
-    """删远端整个 ``step_N/`` 前缀：先删分片提交点，再删其余对象。"""
+    """删远端整个 ``step_N/`` 前缀，顺序与写入镜像。
+
+    先删**版本提交点** ``step_N/COMMIT``（L3）—— 它一消失这一版立刻不可恢复、也不会
+    再被当成「已提交版本」；再删各 ``rank_r/COMMIT``（L2）；最后才是数据对象。删到一半
+    被打断也不会留下「看着像完整版本」的前缀，重跑一次收敛。
+    """
     prefix = f"{version_key(step)}/"
     mine = sorted(key for key in keys if key.startswith(prefix))
-    commits = [key for key in mine if key.count("/") == 2 and key.endswith(f"/{COMMIT_FILE}")]
-    rest = [key for key in mine if key not in set(commits)]
-    for key in commits + rest:
+    version_commit = f"{version_key(step)}/{COMMIT_FILE}"
+    rank_commits = {
+        key for key in mine if key.count("/") == 2 and key.endswith(f"/{COMMIT_FILE}")
+    }
+    rest = [key for key in mine if key != version_commit and key not in rank_commits]
+    ordered = ([version_commit] if version_commit in mine else [])
+    ordered += sorted(rank_commits) + rest
+    for key in ordered:
         remote.delete(key)
     _prune_remote_dirs(remote, step)
     return len(mine)
@@ -334,6 +373,104 @@ def collect(
     )
 
 
+# --- 对象存储侧的有界保留（rank 0 在版本提交完成后执行） --------------------
+
+
+@dataclass(frozen=True, slots=True)
+class RetentionReport:
+    """一次有界保留的结果：删了哪些代、留下哪几代、为什么没做。"""
+
+    keep: int
+    dry_run: bool
+    planned: tuple[int, ...]
+    """超出保留窗口的 step，最旧在前（``dry_run`` 时也非空）。"""
+
+    deleted: tuple[DeletedVersion, ...]
+    """实际删掉的版本；``dry_run=True`` 时为空。"""
+
+    kept: tuple[int, ...]
+    """落在窗口内、保留的已提交 step。"""
+
+    aborted: str | None = None
+    """整体放弃（远端不可达）或删到一半失败的原因；非空时可能只删了一部分。"""
+
+    def steps(self) -> tuple[int, ...]:
+        return tuple(item.step for item in self.deleted)
+
+
+def retain_remote_versions(
+    remote: StorageBackend | None,
+    *,
+    keep: int = DEFAULT_KEEP_VERSIONS,
+    dry_run: bool = False,
+) -> RetentionReport:
+    """有界保留：一次 ``list``，只留最新 ``keep`` 代已提交版本，从最旧的一代开始删。
+
+    这是 :func:`collect` 之外的**另一条判据**，只在「版本 ``COMMIT`` 刚写完」这个
+    时刻跑（rank 0 的提交动作，见 :func:`storage.upload.finalize_upload`）：
+
+    - ``collect`` 删的是**残片**（没有提交点、或被更新版本越过）；
+    - 这里删的是**完整但过旧**的版本：``keep`` 之外最旧的几代。
+
+    删除顺序见 :func:`_delete_remote_prefix`：先版本 ``COMMIT``，再分片 ``COMMIT``，
+    最后数据。所以删到一半被打断时，这一版已经「不可恢复」，下次 ``collect`` 会把它的
+    剩余前缀当残片收掉，两条路径收敛到同一个结果。
+
+    降级：远端不可达时什么都不删（``RetentionReport.aborted``）；删某一代中途失败就停在
+    那里并记原因 —— 已经删掉 ``COMMIT`` 的那一代不会回到「可恢复」状态。
+
+    已知限制：保留判据不看「谁正在读」。如果恢复端正好在读一代刚好被删的版本，
+    会读失败（报错而不是读到半份数据）。``load_object(step=None)`` 永远落在窗口内。
+    """
+    if keep < 1:
+        raise ValueError(f"keep must be >= 1, got {keep}")
+    if remote is None:
+        return RetentionReport(
+            keep=keep,
+            dry_run=dry_run,
+            planned=(),
+            deleted=(),
+            kept=(),
+            aborted="no remote storage configured",
+        )
+
+    try:
+        keys = remote.list("")
+    except StorageError as exc:
+        return RetentionReport(
+            keep=keep,
+            dry_run=dry_run,
+            planned=(),
+            deleted=(),
+            kept=(),
+            aborted=f"remote unreachable: {exc}",
+        )
+
+    versions, _, _ = _scan_remote(keys)
+    doomed = plan_retention(versions=versions, keep=keep)
+    kept = tuple(sorted(versions - set(doomed)))
+
+    deleted: list[DeletedVersion] = []
+    aborted: str | None = None
+    if not dry_run:
+        for step in doomed:
+            try:
+                count = _delete_remote_prefix(remote, step, keys)
+            except StorageError as exc:  # 停在这一代，下次提交后再收敛
+                aborted = f"step_{step}: delete failed: {exc}"
+                break
+            deleted.append(DeletedVersion(REMOTE, step, count, 0, RETENTION))
+
+    return RetentionReport(
+        keep=keep,
+        dry_run=dry_run,
+        planned=doomed,
+        deleted=tuple(deleted),
+        kept=kept,
+        aborted=aborted,
+    )
+
+
 class GcWorker:
     """周期性回收的守护线程：**启动时先跑一次**，之后每 ``interval`` 秒一次。
 
@@ -342,6 +479,10 @@ class GcWorker:
       目录天然不命中，所以不需要和保存路径做任何协调。
     - 单次失败（远端抖动、IO 错误）只记进 ``last_error``，线程继续跑；远端整体不可达
       时 :func:`collect` 自己是空操作，不会误删。
+
+    它**不做有界保留**：裁剪「完整但过旧」的版本需要一个明确锚点（「刚提交完一代」），
+    由 rank 0 在 :func:`storage.upload.finalize_upload` 里调
+    :func:`retain_remote_versions`，不放进周期线程。
     """
 
     def __init__(
@@ -415,6 +556,7 @@ class GcWorker:
 
 __all__ = [
     "COMMITTED",
+    "DEFAULT_KEEP_VERSIONS",
     "DeletedVersion",
     "GcCandidate",
     "GcPlan",
@@ -424,9 +566,13 @@ __all__ = [
     "NOT_UPLOADED",
     "NO_NEWER_VERSION",
     "REMOTE",
+    "RETENTION",
+    "RetentionReport",
     "SUPERSEDED",
     "UPLOADED",
     "collect",
     "delete_local_version",
     "plan",
+    "plan_retention",
+    "retain_remote_versions",
 ]

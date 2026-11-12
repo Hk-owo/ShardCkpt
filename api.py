@@ -40,7 +40,15 @@ from async_ import (
     register_backend,
     reset_registry,
 )
-from commit.gc import GcReport, GcWorker, collect, delete_local_version
+from commit.gc import (
+    DEFAULT_KEEP_VERSIONS,
+    GcReport,
+    GcWorker,
+    RetentionReport,
+    collect,
+    delete_local_version,
+    retain_remote_versions,
+)
 from commit.local import (
     CommitRecord,
     version_key,
@@ -450,14 +458,19 @@ def finalize_upload(
     step: int,
     ranks: "list[int] | tuple[int, ...]",
     layout: Mapping[str, int] | None = None,
+    keep: int | None = DEFAULT_KEEP_VERSIONS,
 ) -> UploadCommit:
     """rank 0 的提交动作：``list`` 一次前缀确认全部 rank 都传完了，再写 ``COMMIT``。
 
     它**不读**任何 rank 的索引，也不汇总分片：齐全性由每个 rank 的 ``rank_<i>/COMMIT``
     证明，分片怎么拼由各 rank 的 ``.metadata`` 在恢复端合并时证明。判据只看提交点在
     不在，所以这一步可以幂等重跑（rank 0 崩了，重启补一次即可）。
+
+    **提交完成即做有界保留**：版本 ``COMMIT`` 落盘之后，rank 0 接着只留最新 ``keep``
+    代（默认 3 代），从最旧的一代开始删 —— 先删版本 ``COMMIT``，再删分片提交点与数据。
+    ``keep=None`` 关掉自动裁剪；要看/单跑这一步用 :func:`retain_remote_versions`。
     """
-    return _finalize_upload(storage, step, ranks=ranks, layout=layout)
+    return _finalize_upload(storage, step, ranks=ranks, layout=layout, keep=keep)
 
 
 def load_object(
@@ -506,13 +519,17 @@ def gc_local(
 ) -> GcReport:
     """回收本地 ``step_N/``：已上传的版本、以及被更新版本越过的残片。
 
-    判据只依赖 step 单调性 —— **没有保留策略，没有租约，没有时间阈值**：
+    判据只依赖 step 单调性 —— **本地没有保留策略，没有租约，没有时间阈值**：
 
     - 远端的 ``step_N/rank_<rank>/COMMIT`` 在 ⇒ 本 rank 的分片已经到远端 ⇒ 本地这份
       是纯冗余（本 rank 传完就删，不等最慢的 rank，也不等 rank 0 写版本 COMMIT）；
     - 存在比 N 更新的版本 ``COMMIT`` ⇒ 训练已经越过第 N 代 ⇒ 本地 ``step_N/``
       （哪怕它从没上传成功）与远端整个 ``step_N/`` 前缀都是残片；
     - 其余一律保留：最新且未完成的可能就是**正在写**（本地）或**正在传**（远端）。
+
+    对象存储侧的**有界保留**是另一条判据（只留最近 ``keep`` 代已提交版本），由 rank 0
+    在 :func:`finalize_upload` 里执行，不在这里：这个函数要能安全地周期跑，而删「完整
+    但过旧」的版本只在「刚提交完一代」这个时刻做才有明确的锚点。
 
     ``dry_run=True``（默认）只返回计划。远端不可达时什么都不删（``GcReport.aborted``
     里记原因）。周期调用用 :class:`commit.gc.GcWorker`。
@@ -527,6 +544,7 @@ __all__ = [
     "CheckpointError",
     "ChecksumError",
     "CpuBackend",
+    "DEFAULT_KEEP_VERSIONS",
     "Device",
     "DeviceBackend",
     "FormatError",
@@ -536,6 +554,7 @@ __all__ = [
     "MissingTensorError",
     "MockCudaBackend",
     "PinnedBufferPool",
+    "RetentionReport",
     "SaveReport",
     "SnapshotManager",
     "SnapshotState",
@@ -558,6 +577,7 @@ __all__ = [
     "load_object",
     "register_backend",
     "reset_registry",
+    "retain_remote_versions",
     "save_async",
     "save_local",
     "upload_local",

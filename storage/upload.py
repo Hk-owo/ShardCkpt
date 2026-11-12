@@ -34,6 +34,10 @@ key 布局（相对存储配置里的 prefix）::
 3. 恢复端先读版本 ``COMMIT``（没有就拒绝），再按 ``COMMIT`` 里的 rank 清单读索引；
    缺任何一个 rank 的索引都直接报错，不会交出半份数据。
 
+对象存储侧**有界保留**：rank 0 写完版本 ``COMMIT`` 之后立刻只留最新 ``keep`` 代
+（默认 3 代），从最旧的一代开始删 —— 先删它的版本 ``COMMIT``，再删分片提交点与数据
+（:func:`commit.gc.retain_remote_versions`）。``keep=None`` 关掉自动裁剪。
+
 待补（见 ``tests/sim/README.md`` 的待补全清单）：
 
 - **attempt/epoch**：同一 step 重试时旧残片会和新的混在同一前缀下。现在
@@ -41,6 +45,8 @@ key 布局（相对存储配置里的 prefix）::
   正式版应在 key 里带尝试号，``COMMIT`` 记住这次尝试的 id。
 - **流式上传**：``upload_rank`` 现在整块读数据文件（demo 规模够用）。大文件应改成
   分块 ``upload_part``，``S3Storage`` 的 multipart 分支已经具备能力。
+- **每 M 步永久保留一份**：现在的保留窗口只有「最近 ``keep`` 代」，长跑时 rollback
+  距离被限制在 ``keep`` 个 checkpoint 以内；硬链接/归档到另一个前缀还没做。
 """
 
 from __future__ import annotations
@@ -54,6 +60,7 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 from async_ import Tensor
+from commit.gc import DEFAULT_KEEP_VERSIONS, retain_remote_versions
 from commit.local import (
     COMMIT_FILE,
     CommitRecord,
@@ -315,6 +322,7 @@ def finalize_upload(
     *,
     ranks: Sequence[int],
     layout: Mapping[str, int] | None = None,
+    keep: int | None = DEFAULT_KEEP_VERSIONS,
 ) -> UploadCommit:
     """rank 0 的提交动作：``list`` 一次前缀，确认每个 rank 都传完了，再写 ``COMMIT``。
 
@@ -324,6 +332,14 @@ def finalize_upload(
 
     **幂等可重跑**：判据只看每个 rank 的分片提交点在不在，所以 rank 0 崩在写完
     ``COMMIT`` 之前时，重启后再调一次（或运维当 CLI 调）就能把这一版补成可恢复的。
+
+    **有界保留**：``COMMIT`` 落盘之后，同一个 rank 0 立刻做一次对象存储侧的保留 ——
+    只留最新 ``keep`` 代版本（默认 :data:`commit.gc.DEFAULT_KEEP_VERSIONS`，即 3 代），
+    从最旧的一代开始删，先删版本 ``COMMIT`` 再删其余数据。``keep=None`` 关掉这一步
+    （交给运维手工调 :func:`commit.gc.retain_remote_versions`）。
+
+    保留失败（远端抖动、删到一半）**不影响这次提交**：版本 ``COMMIT`` 已经写完，这一版
+    就是可恢复的；残留的旧代会在下一次提交成功后被同一条判据收掉。
     """
     expected = tuple(int(rank) for rank in ranks)
     commit = UploadCommit(step=step, ranks=expected, layout=dict(layout or {}))
@@ -354,6 +370,13 @@ def finalize_upload(
         )
 
     storage.write(commit_key(step), commit.dumps().encode("utf-8"))
+    if keep is not None:
+        # 提交已经成立，裁剪失败不能反过来把这次提交判成失败：retain_remote_versions
+        # 自己吞掉 StorageError（记进 aborted），这里再兜住其它意外。
+        try:
+            retain_remote_versions(storage, keep=keep)
+        except Exception:  # pragma: no cover - 保留是收尾动作，不能回滚提交
+            pass
     return commit
 
 
@@ -632,6 +655,7 @@ def _download_files(
 
 __all__ = [
     "DEFAULT_BUDGET_BYTES",
+    "DEFAULT_KEEP_VERSIONS",
     "ObjectLoadReport",
     "ObjectVersion",
     "RankCommit",

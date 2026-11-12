@@ -28,7 +28,7 @@ ShardCkpt/
 │   └── upload.py       上传闭环 + 对象存储恢复（整文件下载 → 本地读闭环）
 ├── commit/           提交协议、版本目录、垃圾回收
 │   ├── local.py        .metadata → COMMIT，版本扫描与删除
-│   └── gc.py           回收判据（纯函数）+ 执行器 + 周期线程
+│   └── gc.py           回收判据（纯函数）+ 执行器 + 周期线程 + 对象存储侧有界保留
 ├── dist/             通信抽象：gather / broadcast / all-reduce，带超时（**未实现**，只有 docstring）
 ├── async_/           DeviceBackend / Tensor、D2H 搬运、pinned 池、拷贝 stream、状态机
 │                     （后台进程还没做，`save_async` 仍是 NotImplementedError）
@@ -72,7 +72,7 @@ S3 用进程内的 `tests/s3_stub.py`。读取路径、提交点语义、Range G
 | 4 | 提交点语义：`finalize_upload(12)` 失败、`load_object(12)` 报错，最新仍是 9 |
 | 5 | 从对象存储恢复：整读一份 + 每 rank 取自己那片拼回全局，两者逐字节一致 |
 | 6 | 续训：从 step 9 恢复再跑 3 步 == 一口气训到 step 12（无容差） |
-| 7 | 回收：已上传的本地版本、被更新版本越过的残片都删掉；`dry_run` 出计划、重跑幂等 |
+| 7 | 有界保留：step 15 提交后远端只剩最近 3 代（step 3 不可恢复）；再回收本地暂存，`dry_run` 出计划、重跑幂等 |
 
 脚本本身就是「外部调用方怎么用这套 API」的示例：`to_device()` 演示 host 数组 →
 device 张量，`sources_for_rank()` 演示分片全局坐标，`save_rank()` 是一个 rank 的完整动作。
@@ -117,10 +117,11 @@ data = api.load("/ckpt", device="cuda:0")           # 本地版本目录自动�
 | `open_version()` | `storage/recover.py` | 恢复门禁：只认带 COMMIT 的版本，校验 `.metadata` 与数据文件 |
 | `targets_for_layout()` | `planner/targets.py` | 新布局 → 本 rank 的目标区域（`tp=1` 时整读） |
 | `load_local()` | `api.py` | 本地层读闭环：COMMIT → 读取计划 → 按块 IO → 块 CRC-32C → H2D |
-| `upload_local()` / `finalize_upload()` | `storage/upload.py` | 对象存储上传：每 rank 独立上传 + rank 0 只 `list` 检查 |
+| `upload_local()` / `finalize_upload()` | `storage/upload.py` | 对象存储上传：每 rank 独立上传 + rank 0 只 `list` 检查，写完 `COMMIT` 即做有界保留 |
 | `load_object()` | `storage/upload.py` | 对象存储恢复：COMMIT → 合并索引 → 整文件下载 → 本地读闭环 |
 | `RankCommit` | `storage/upload.py` | 分片提交点：`step_N/rank_i/COMMIT`，证明本 rank 传完了 |
-| `plan()` | `commit/gc.py` | 回收判据（纯函数）：删哪些、留哪些、为什么 |
+| `plan()` | `commit/gc.py` | 残片回收判据（纯函数）：删哪些、留哪些、为什么 |
+| `plan_retention()` / `retain_remote_versions()` | `commit/gc.py` | 对象存储侧有界保留：只留最近 `keep` 代（默认 3），先删版本 `COMMIT` 再删数据 |
 | `collect()` / `gc_local()` | `commit/gc.py` / `api.py` | 回收执行器：一次 `list` + 目录扫描 + 幂等删除，默认 `dry_run` |
 | `GcWorker` | `commit/gc.py` | 周期回收线程：启动时跑一次，之后每 `interval` 秒 |
 
@@ -325,7 +326,7 @@ s3.delete("tensors/final.bin")                     # 幂等
 
 ```bash
 uv pip install --python .venv/bin/python -r requirements.txt   # numpy + boto3 + google-crc32c
-.venv/bin/python -m pytest      # 361 个用例：数据生成器 + 读取接口 + 对象存储 + D2H/stream/pinned 池 + GPU→S3
+.venv/bin/python -m pytest      # 371 个用例：数据生成器 + 读取接口 + 对象存储 + D2H/stream/pinned 池 + GPU→S3
 #              + 状态机 + 区域/索引/读写计划 + C++ 绑定（**未构建 native 时相关用例自动 skip**）
 #              + 本地层写闭环（数据 + .metadata + COMMIT 可恢复）
 #              + 本地层读闭环（布局不变 / TP 换卡数 / 默认 1 MiB 块 CRC-32C + 扩读与 COMMIT 门禁）
@@ -394,11 +395,16 @@ report.amplification                                    # 读放大（Range GET 
   提交路径不为它付 `HEAD` 往返
 - **残片会被指出来**：`finalize_upload` 会把 `COMMIT` 没声明的 `rank_*` 前缀当错误
   报出（多半是上一次重试的残留）。正式的 attempt/epoch 隔离还没做，见下
+- **提交完成即有界保留**：`COMMIT` 写完，同一个 rank 0 接着只留最新 `keep` 代
+  （默认 `DEFAULT_KEEP_VERSIONS = 3`），从最旧的一代开始删 —— **先删它的版本
+  `COMMIT`，再删分片提交点与数据**。提交点一消失这一版立刻不可恢复，删到一半被打断
+  也不会留下「看着像完整版本」的前缀。`keep=None` 关掉自动裁剪，运维可用
+  `retain_remote_versions(s3, keep=3, dry_run=True)` 先看计划再动手
 - 字节级完整性仍在上传边界：`S3Storage` 的 PUT 带对象级校验和，服务端独立重算比对
 
 待补：`step_N/` 里带尝试号（避免重试残片混进同一前缀）、大文件分块流式上传、
-上传失败重试与后台上传队列（`save_async`）。上传成功后回收本地暂存已由
-「垃圾回收」一节覆盖。
+上传失败重试与后台上传队列（`save_async`）、「每 M 步永久保留一份」（现在回滚距离
+就是一个保留窗口）。上传成功后回收本地暂存已由「垃圾回收」一节覆盖。
 
 ## 本地读写（C++ / io_uring）
 
@@ -542,11 +548,18 @@ ckpt.close_default_pool()   # 训练结束/显存紧张时显式释放常驻块
 
 `save_async()` 仍是 `NotImplementedError`：后台进程与上传队列还没做。
 
-## 垃圾回收（上传完即回收）
+## 垃圾回收（上传完即回收 + 远端有界保留）
+
+回收有**两条互不重叠的判据**，各管一半：
+
+| 判据 | 谁触发 | 删什么 |
+|---|---|---|
+| 残片（下表三条） | `gc_local` / `GcWorker`，可周期跑 | 本地已上传的中转副本、本地与远端被更新版本越过的残片 |
+| 有界保留 | **rank 0 在 `finalize_upload` 写完版本 `COMMIT` 之后** | 远端「完整但过旧」的版本：`keep`（默认 3）之外最旧的那几代 |
 
 本地层只是**上传前的中转**：本 rank 的分片一到远端，本地那份就是纯冗余，可以直接删。
-判据只有一条不变量 —— **step 单调推进** —— 所以不需要保留策略、租约、时间阈值或
-尝试号（`commit/gc.py`）。
+残片判据只有一条不变量 —— **step 单调推进** —— 所以不需要租约、时间阈值或尝试号
+（`commit/gc.py`）。
 
 | 位置 | 候选 | 删除条件 | 理由 |
 |---|---|---|---|
@@ -558,9 +571,24 @@ ckpt.close_default_pool()   # 训练结束/显存紧张时显式释放常驻块
 远端最新且没有版本提交点 → 可能正在传，也可能 rank 0 崩在最后一步（重跑
 `finalize_upload` 就能补成可恢复）。回收延迟上界是一个 checkpoint 间隔。
 
+对象存储侧单独做**有界保留**（`plan_retention` / `retain_remote_versions`）：只认
+「带版本 `COMMIT` 的 step」，排序后留最新 `keep` 代，从最旧的一代开始删，**先删这一代
+的版本 `COMMIT`，再删分片提交点与数据**。删到一半被打断也不会留下「看着像完整版本」的
+前缀 —— 下次 `collect` 会把它的剩余部分当 `superseded` 残片收掉。
+
 ```python
 import api as ckpt
 from commit.gc import GcWorker
+
+# 提交完成（rank 0）：写版本 COMMIT → 立刻裁剪，只留最近 3 代
+ckpt.finalize_upload(s3, step=42, ranks=range(8), keep=3)   # keep=None 关掉自动裁剪
+
+# 运维单独看一眼/单跑裁剪（dry_run 只出计划）
+report = ckpt.retain_remote_versions(s3, keep=3, dry_run=True)
+report.planned      # 超出窗口的 step，最旧在前
+report.kept         # 落在窗口内的已提交 step
+report.deleted      # 真跑时删掉的版本（reason="retention"）；远端字节记 0
+report.aborted      # 远端不可达 / 删到一半失败的原因
 
 report = ckpt.gc_local("/ckpt/rank_0", s3, rank=0, dry_run=True)   # 默认只看计划
 report.planned      # 命中的候选 (location, step, reason)
@@ -577,14 +605,18 @@ with GcWorker("/ckpt/rank_0", s3, rank=0, interval=60.0) as worker:
 - **不需要问「写入者是否还活着」**：兄弟 rank 正在写的目录一定是最新 step，两条判据
   都不命中。这也是本地 root 必须**按 rank 独立**的原因 —— 本地判据删的是整个
   `step_N/` 目录，只有目录里全是本 rank 的文件时这句话才成立
-- **删除顺序与写入镜像**：先删提交点（本地 `COMMIT` / 远端 `rank_*/COMMIT`），再删
-  数据，最后移空目录。判据只看提交点在不在，所以删到一半被打断、重跑一次就收敛
-- **远端不可达就什么都不删**：本地判据依赖远端状态，「查不到」不能当成「可以删」，
-  原因记在 `GcReport.aborted`，周期线程继续跑
+- **删除顺序与写入镜像**：先删提交点（本地 `COMMIT` / 远端版本 `COMMIT` /
+  `rank_*/COMMIT`），再删数据，最后移空目录。判据只看提交点在不在，所以删到一半被
+  打断、重跑一次就收敛
+- **远端不可达就什么都不删**：两条判据都依赖远端状态，「查不到」不能当成「可以删」，
+  原因记在 `GcReport.aborted` / `RetentionReport.aborted`，周期线程继续跑
+- **裁剪失败不回滚提交**：版本 `COMMIT` 已经写完，这一版就是可恢复的；旧代残留会在
+  下一次提交成功后被同一条判据收掉
 - **`save_local` 失败路径就地清理**：`ABORTED` 时直接删掉残缺目录并 `mark_cleaned()`，
   所以「本地无 `COMMIT` 的残目录」几乎只剩 SIGKILL 一种来源，定时回收只兜底
-- **不做保留策略**：远端已提交的版本永不删除；本地不保留任何可恢复版本，正常恢复
-  一律走 `load_object()`
+- **保留窗口只有一个**：本地不留任何可恢复版本（正常恢复一律走 `load_object()`）；
+  远端的回滚距离就是 `keep` 个 checkpoint（默认 3 代），「每 M 步永久保留一份」还没做。
+  另外保留判据不看「谁正在读」——恰好读到被裁掉的那一代会报错（而不是读到半份数据）
 
 ## 本地层读闭环
 
