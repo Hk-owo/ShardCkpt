@@ -29,7 +29,8 @@ ShardCkpt/
 ├── commit/           提交协议、版本目录、垃圾回收
 │   ├── local.py        .metadata → COMMIT，版本扫描与删除
 │   └── gc.py           回收判据（纯函数）+ 执行器 + 周期线程 + 对象存储侧有界保留
-├── dist/             通信抽象：gather / broadcast / all-reduce，带超时（**未实现**，只有 docstring）
+├── dist/             通信抽象：`all_reduce(MAX)` 已落地（含同进程 ThreadedCollective），
+│                     gather / broadcast 仍只有 docstring
 ├── async_/           DeviceBackend / Tensor、D2H 搬运、pinned 池、拷贝 stream、状态机
 │                     （后台进程还没做，`save_async` 仍是 NotImplementedError）
 ├── adapters/         框架相关，把本地张量翻译成全局坐标
@@ -207,6 +208,12 @@ elif trigger.decision is TriggerDecision.SKIP:
 状态机不认识真实内存（buffer 是不透明句柄），所以整套转移在 mock 环境下可测；
 pinned 池与 `D2HStream` 已经实现，还没做的是后台进程（`save_async`）和真卡上的
 `CudaBackend`。
+
+**跨 rank 门闸（已落地）**：`trigger()` 的裁决不再由各 rank 自己判 —— 本 rank 的
+「在途代数 / 池空闲块」只是输入，裁决由一次 `all_reduce(MAX)` 统一得出（`dist/`），
+任一 rank 阻塞则全体 `SKIP` / `FORCE_WAIT`。多 rank 训练要给 `save_local(collective=...)`，
+`world_size > 1` 却没给 collective 会直接报错，而不是退化成各写各的。规格与落地偏差
+见 `docs/gate.md`，用例在 `tests/test_gate.py`。
 
 ## 读写计划（planner）
 

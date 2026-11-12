@@ -25,6 +25,8 @@ from async_ import (
     BackendStats,
     CpuBackend,
     DeviceBackend,
+    GateBlock,
+    GateCollective,
     MockCudaBackend,
     PinnedBufferPool,
     Snapshot,
@@ -291,6 +293,8 @@ def save_local(
     crc_chunk_max: int = CRC_CHUNK_MAX,
     pool: PinnedBufferPool | None = None,
     manager: SnapshotManager | None = None,
+    collective: GateCollective | None = None,
+    world_size: int | None = None,
 ) -> SaveReport:
     """把一组 device 上的张量写成一份可恢复的本地 checkpoint（同步版本）。
 
@@ -304,7 +308,18 @@ def save_local(
     ``pool``:    pinned 块池；``None`` 时用进程级常驻池（``api.default_pool()``），
                  同一份 checkpoint 反复保存时复用同一块，不再每次现造现弃。
                  常驻池在每次租块前会 ``trim()`` 掉多余空闲块，稳态只占一块。
+    ``collective``: 多 rank 训练必须给（``dist.Collective`` 的任意实现）。门闸裁决由
+                 一次 ``all_reduce(MAX)`` 统一得出：任一 rank 拿不到 buffer，**全体**
+                 这一 step 都不写，不会出现「有的 rank 写、有的跳过」的残缺版本。
+                 通信世界的 rank / world_size 由 collective 自己给出。
+    ``world_size``: 只用于**显式声明**参与通信的 rank 数；不填则按 collective 推导
+                 （没有 collective 即 1）。声明 > 1 却没给 collective 直接报错。
     """
+    if manager is not None and collective is not None:
+        raise ValueError(
+            "manager 与 collective 只能给一个：collective 必须经 SnapshotManager 注入，"
+            "两者同时给会有一份被静默忽略"
+        )
     blob_payloads = dict(blobs or {})
     if sources is None:
         sources = _sources_from_tensors(tensors)
@@ -329,11 +344,15 @@ def save_local(
         trim = getattr(pool, "trim", None)
         if trim is not None:
             trim(keep_bytes=aligned_size)
-    snapshot_manager = manager or SnapshotManager(pool)
+    snapshot_manager = manager or SnapshotManager(
+        pool, collective=collective, world_size=world_size
+    )
 
     reuses_before = _pool_reuses(pool)
     trigger = snapshot_manager.trigger(step, nbytes=aligned_size)
     if trigger.decision is not TriggerDecision.START or trigger.snapshot is None:
+        # 门闸裁决是全局统一的：这里抛错时其他 rank 也拿到同一个裁决，
+        # 于是这一 step 全体都不写，不会留下凑不齐分片的残缺版本。
         raise PlanError(f"step {step}: 拿不到 pinned buffer（{trigger.reason}）")
     snapshot: Snapshot = trigger.snapshot
     reuses_after = _pool_reuses(pool)
@@ -550,6 +569,8 @@ __all__ = [
     "FormatError",
     "GcReport",
     "GcWorker",
+    "GateBlock",
+    "GateCollective",
     "LoadReport",
     "MissingTensorError",
     "MockCudaBackend",

@@ -153,10 +153,29 @@ load ≈ 500 MiB/s、峰值 RSS ≈ 240 MiB。
 
 ## 待补全清单
 
-按优先级排列，都是「现在缺前置条件」而不是「没想清楚」：
+**已落地：门闸跨 rank 一致化（correctness 前置条件，先于下面所有功能补全）**
+
+`SnapshotManager.trigger()` 的判据原本是纯本地的（本 rank 的在途代数 + 池空闲块，
+`_skipped_streak` 也各算各的），于是同一个 step 上可以 rank 0 `SKIP`、rank 1 `START`：
+版本残缺（`finalize_upload` 的 per-rank `COMMIT` 永远齐不了），且一旦保存路径接入
+collective 就是死锁。现在改为**一次 `all-reduce(MAX)` 统一裁决** —— 本地原因只是输入，
+任一 rank 报「开不了新一代」则全体一致地 `SKIP` / `FORCE_WAIT`。
+
+- 规格与落地偏差：`docs/gate.md`；用例：`tests/test_gate.py`（15 条，同进程
+  `dist.ThreadedCollective` 并发多 rank）。
+- 已锁住：「rank 1 池满、rank 0 空闲」⇒ 全体 `SKIP` 且 rank 0 一个字节都不分配；
+  裁决序列逐 step 相等；`MachineStats.skipped/forced` 各 rank 相等；
+  `FORCE_WAIT` 后的每轮重试都重新归约；归约超时 ⇒ 全体放弃、不落地 `step_N/`。
+- **本目录仍缺的一块**：这些用例跑在**同一进程的多线程**里（`ThreadedCollective`），
+  仿真侧的多 rank 仍是各自 `multiprocessing` 进程、没有跨进程 collective，所以
+  「真跨进程 / 跨机」这条还没覆盖 —— 与下面第 1 条一起做（同一个 `Collective` 协议，
+  换后端即可）。
+
+下面按优先级排列，都是「现在缺前置条件」而不是「没想清楚」：
 
 1. **`dist/` 真 gather**：落地后把 `sim.merge_rank_versions()` 换成 collective，
-   L2 用例不变；同时可以删掉 rank 目录硬链接这一步。
+   L2 用例不变；同时可以删掉 rank 目录硬链接这一步。门闸要的
+   `all_reduce(MAX)` 已落地（同进程后端），换真后端时与 gather 共用同一套超时与错误出口。
 2. **S3 故障注入**：`s3_stub` 加故障模式（500/503、连接重置、超时、限速、
    `store.objects` 改字节模拟静默损坏），断言 `upload_local` 的重试 / abort / 幂等；
    再配合 `storage/object.py` 的对象级校验和验证「静默损坏必须被发现」。

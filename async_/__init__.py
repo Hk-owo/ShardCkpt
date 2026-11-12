@@ -23,6 +23,8 @@ import numpy as np
 
 from async_.machine import (
     BufferPool,
+    GateBlock,
+    GateCollective,
     MachineStats,
     Snapshot,
     SnapshotError,
@@ -30,6 +32,9 @@ from async_.machine import (
     SnapshotState,
     Trigger,
     TriggerDecision,
+    decide,
+    pack_block,
+    unpack_block,
 )
 from async_.pinned import (
     DEFAULT_CHUNK_BYTES,
@@ -300,6 +305,8 @@ __all__ = [
     "D2HStream",
     "DEFAULT_CHUNK_BYTES",
     "DeviceBackend",
+    "GateBlock",
+    "GateCollective",
     "MachineStats",
     "MockCudaBackend",
     "PinnedBuffer",
@@ -319,10 +326,13 @@ __all__ = [
     "configure_default_pool",
     "copy_into",
     "copy_to_host",
+    "decide",
     "default_pool",
     "get_backend",
+    "pack_block",
     "register_backend",
     "reset_registry",
+    "unpack_block",
 ]
 
 # 放在文件末尾导入：d2h 依赖本模块的 get_backend，提前导入会撞上未初始化的循环。

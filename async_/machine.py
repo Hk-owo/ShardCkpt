@@ -10,6 +10,13 @@
 3. 门闸看的是「上一代是否还占着 buffer」，不是「D2H 是否完成」：``max_inflight=1``
    是单缓冲，``2`` 即双缓冲；越线时先 ``SKIP``（训练不等），连续跳过达到阈值才
    ``FORCE_WAIT``（训练阻塞到上一代结束）。
+4. **裁决必须全局唯一**：本 rank 的在途代数与池空闲块只是**输入**，裁决由一次
+   ``all_reduce(MAX)`` 得出 —— 任一 rank 阻塞则全体 ``SKIP`` / ``FORCE_WAIT``。
+   同一个 step 上「rank 0 跳过、rank 1 开写」会让版本残缺（各 rank 分片凑不齐），
+   而一旦保存路径里接入 collective，一边进一边不进就是死锁。规格见 ``docs/gate.md``。
+
+``_skipped_streak`` 的写点收敛在 ``trigger()`` 一处（提交成功只记一个待清零标志），
+所有写都发生在集体通信的同侧，各 rank 的 streak 才会同步演进。
 
 池只被用到 ``acquire`` / ``release`` / ``has_free`` 三个动作，buffer 对状态机而言是
 不透明句柄，所以本模块不依赖 GPU，在 mock 环境下可以完整测试。
@@ -157,12 +164,77 @@ class Snapshot:
         self.released = True
 
 
+class GateBlock(enum.IntEnum):
+    """门闸的**本地**阻塞原因。
+
+    值就是优先级：归约取 ``MAX`` 天然得到「最严重的原因」，不需要额外的比较逻辑。
+    """
+
+    NONE = 0
+    NO_FREE_BLOCK = 1
+    INFLIGHT = 2
+
+    def describe(self, *, max_inflight: int) -> str:
+        """不依赖本地状态的通用描述（跨 rank 报原因时用）。"""
+        if self is GateBlock.INFLIGHT:
+            return f"在途代数已达上限 {max_inflight}，上一代还没归还 buffer"
+        if self is GateBlock.NO_FREE_BLOCK:
+            return "池里没有可用块"
+        return "门闸通过"
+
+
+_RANK_MASK = (1 << 32) - 1
+
+
+def pack_block(block: GateBlock, *, rank: int) -> int:
+    """打包成 ``(kind << 32) | rank``：高位给原因，低位给最严重的 rank（排障用）。"""
+    if not 0 <= rank <= _RANK_MASK:
+        raise ValueError(f"rank {rank} 超出打包范围 [0, {_RANK_MASK}]")
+    return (int(block) << 32) | rank
+
+
+def unpack_block(packed: int) -> tuple[GateBlock, int]:
+    """解包 :func:`pack_block`；归约结果不是已知原因说明 collective 被写坏了。"""
+    kind, rank = packed >> 32, packed & _RANK_MASK
+    try:
+        return GateBlock(kind), rank
+    except ValueError as exc:
+        raise SnapshotError(f"门闸归约返回未知的阻塞原因 {kind}") from exc
+
+
+class GateCollective(Protocol):
+    """门闸需要的通信面：一个 int64 的 ``all_reduce(MAX)``，带超时。
+
+    实现**不许**在超时时降级成本地判据 —— 只能抛错让全体一致地放弃本次保存。
+    真机后端见 ``dist/``（``dist.Collective`` 即满足本协议）。
+    """
+
+    def all_reduce_max_int64(
+        self, values: list[int], *, timeout: float
+    ) -> list[int]:
+        """逐元素求全局最大值；入参与返回值等长同序。"""
+
+
 class TriggerDecision(enum.Enum):
     """``trigger()`` 的三种结果，对应转移表里 IDLE 上的三条边。"""
 
     START = "start"
     SKIP = "skip"
     FORCE_WAIT = "force_wait"
+
+
+def decide(
+    block: GateBlock, *, streak: int, force_after_skips: int
+) -> TriggerDecision:
+    """门闸裁决（纯函数）：先跳过，连续跳过达到阈值才强制等待。
+
+    入参必须是**全局**原因 —— 本函数不认识 rank，也不做任何本地判定。
+    """
+    if block is GateBlock.NONE:
+        return TriggerDecision.START
+    if streak >= force_after_skips:
+        return TriggerDecision.FORCE_WAIT
+    return TriggerDecision.SKIP
 
 
 @dataclass(frozen=True)
@@ -198,6 +270,15 @@ class SnapshotManager:
     ``max_inflight`` 是在途代数上限：1 为单缓冲（只有上一代归还后下一代才能开始），
     2 即双缓冲。连续跳过 ``force_after_skips`` 次之后，触发返回 ``FORCE_WAIT``，
     由调用方阻塞到上一代结束后重新触发（对应设计文档「距上次成功超过阈值就阻塞训练」）。
+
+    多 rank 时必须注入 ``collective``：每次 ``trigger()`` 把本 rank 的阻塞原因打成一个
+    ``int64`` 做 ``all_reduce(MAX)``，得到**全局唯一**的裁决 —— 任一 rank 阻塞则全体
+    ``SKIP`` / ``FORCE_WAIT``。本地判据只是输入，所以「别的 rank 忙、我空闲」也不会
+    单独开写。
+
+    ``rank`` / ``world_size`` 取自 ``collective``（通信世界），与「本 rank 写哪些分片」
+    无关 —— 后者是 plan 的事。``world_size`` 参数只是**显式声明**，用来在没给
+    collective 的情况下拦住「多 rank 各判各的」：声明 > 1 却没人可通信，直接报错。
     """
 
     def __init__(
@@ -206,16 +287,41 @@ class SnapshotManager:
         *,
         max_inflight: int = 1,
         force_after_skips: int = 3,
+        collective: GateCollective | None = None,
+        world_size: int | None = None,
+        collective_timeout: float = 30.0,
     ) -> None:
         if max_inflight < 1:
             raise ValueError(f"max_inflight must be >= 1, got {max_inflight}")
         if force_after_skips < 1:
             raise ValueError(f"force_after_skips must be >= 1, got {force_after_skips}")
+        if collective is not None:
+            actual = getattr(collective, "world_size", 1)
+            if world_size is not None and world_size != actual:
+                raise ValueError(
+                    f"声明的 world_size={world_size} 与 collective 的 {actual} 不一致"
+                )
+            world_size = actual
+        elif world_size is None:
+            world_size = 1
+        if world_size < 1:
+            raise ValueError(f"world_size must be >= 1, got {world_size}")
+        if world_size > 1 and collective is None:
+            raise ValueError(
+                f"world_size={world_size} 但没注入 collective：门闸裁决会各 rank 各判各的，"
+                "同一个 step 上必然出现有的 rank 写、有的跳过（版本残缺；有 collective 时"
+                "还会死锁）"
+            )
         self._pool = pool
+        self._collective = collective
         self.max_inflight = max_inflight
         self.force_after_skips = force_after_skips
+        self.rank = int(getattr(collective, "rank", 0))
+        self.world_size = world_size
+        self.collective_timeout = collective_timeout
         self._active: list[Snapshot] = []
         self._skipped_streak = 0
+        self._pending_clear = False
         self.stats = MachineStats()
 
     # --- 查询 ---------------------------------------------------------------
@@ -225,22 +331,30 @@ class SnapshotManager:
 
     @property
     def skipped_streak(self) -> int:
-        """连续跳过的次数；成功提交后归零。"""
-        return self._skipped_streak
+        """连续跳过的次数；有代提交成功后归零。
+
+        清零在**下一次 ``trigger()`` 入口**兑现（见 ``_consume_pending_clear``），
+        这样 streak 的写点只有 ``trigger()`` 一处，各 rank 才同步演变。
+        """
+        return 0 if self._pending_clear else self._skipped_streak
 
     def current(self) -> Snapshot | None:
         return self._active[0] if self._active else None
 
     # --- 触发 ---------------------------------------------------------------
     def trigger(self, step: int, nbytes: int = 0) -> Trigger:
-        blocked = self._blocked_reason()
-        if blocked:
-            if self._skipped_streak >= self.force_after_skips:
+        self._consume_pending_clear()
+        block, reported_by = self._resolve_block()
+        decision = decide(
+            block, streak=self.skipped_streak, force_after_skips=self.force_after_skips
+        )
+        if decision is not TriggerDecision.START:
+            if decision is TriggerDecision.FORCE_WAIT:
                 self.stats.forced += 1
-                return Trigger(TriggerDecision.FORCE_WAIT, reason=blocked)
-            self._skipped_streak += 1
-            self.stats.skipped += 1
-            return Trigger(TriggerDecision.SKIP, reason=blocked)
+            else:
+                self._skipped_streak += 1
+                self.stats.skipped += 1
+            return Trigger(decision, reason=self._reason(block, reported_by))
 
         snapshot = Snapshot(
             step=step,
@@ -254,15 +368,50 @@ class SnapshotManager:
         return Trigger(TriggerDecision.START, snapshot=snapshot)
 
     # --- 内部 ---------------------------------------------------------------
-    def _blocked_reason(self) -> str:
-        if len(self._active) >= self.max_inflight:
-            return (
-                f"{len(self._active)} 代仍在途（上限 {self.max_inflight}），"
-                "上一代还没归还 buffer"
+    def _consume_pending_clear(self) -> None:
+        """把「有代提交成功」记下的清零在 ``trigger()`` 入口兑现。"""
+        if self._pending_clear:
+            self._skipped_streak = 0
+            self._pending_clear = False
+
+    def _resolve_block(self) -> tuple[GateBlock, int]:
+        """本地原因 → 全局原因（AND 语义：任一 rank 阻塞即全体阻塞）。
+
+        返回 ``(全局原因, 报出最严重原因的那个 rank)``。归约失败直接抛错让全体放弃，
+        不降级成本地判据 —— 降级就是各 rank 重新走上不同分支。
+        """
+        local = self._local_block()
+        if self._collective is None:
+            return local, self.rank
+        packed = pack_block(local, rank=self.rank)
+        result = self._collective.all_reduce_max_int64(
+            [packed], timeout=self.collective_timeout
+        )
+        if len(result) != 1:
+            raise SnapshotError(
+                f"门闸归约返回 {len(result)} 个值，期望 1 个（检查 collective 实现）"
             )
+        return unpack_block(int(result[0]))
+
+    def _local_block(self) -> GateBlock:
+        if len(self._active) >= self.max_inflight:
+            return GateBlock.INFLIGHT
         if not self._pool.has_free():
-            return "池里没有可用块"
-        return ""
+            return GateBlock.NO_FREE_BLOCK
+        return GateBlock.NONE
+
+    def _reason(self, block: GateBlock, reported_by: int) -> str:
+        if reported_by == self.rank:
+            if block is GateBlock.INFLIGHT:
+                return (
+                    f"{len(self._active)} 代仍在途（上限 {self.max_inflight}），"
+                    "上一代还没归还 buffer"
+                )
+            return block.describe(max_inflight=self.max_inflight)
+        return (
+            f"{block.describe(max_inflight=self.max_inflight)}"
+            f"（最严重的 rank 是 {reported_by}）"
+        )
 
     def _on_change(self, snapshot: Snapshot) -> None:
         if not snapshot.is_terminal:
@@ -271,7 +420,8 @@ class SnapshotManager:
             self._active.remove(snapshot)
         if snapshot.state is SnapshotState.COMMITTED:
             self.stats.committed += 1
-            self._skipped_streak = 0
+            # 只记标志，不在回调里改 streak：清零统一在 trigger() 入口兑现
+            self._pending_clear = True
         elif snapshot.state is SnapshotState.ABORTED:
             self.stats.aborted += 1
         else:  # DROPPED
@@ -280,6 +430,8 @@ class SnapshotManager:
 
 __all__ = [
     "BufferPool",
+    "GateBlock",
+    "GateCollective",
     "MachineStats",
     "Snapshot",
     "SnapshotError",
@@ -288,4 +440,7 @@ __all__ = [
     "TERMINAL_STATES",
     "Trigger",
     "TriggerDecision",
+    "decide",
+    "pack_block",
+    "unpack_block",
 ]
