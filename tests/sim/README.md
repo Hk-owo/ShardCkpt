@@ -5,7 +5,7 @@
 
 ## 为什么需要这一层
 
-现有 333 个用例大多是**单点**的：保存能写、索引能解析、planner 求交正确、S3 后端
+现有 431 个用例大多是**单点**的：保存能写、索引能解析、planner 求交正确、S3 后端
 语义对。它们各自的假设没人交叉验证过：
 
 - 「保存时写的字节」和「恢复时读的字节」是不是同一份（版本隔离、换布局）
@@ -127,18 +127,24 @@ load ≈ 500 MiB/s、峰值 RSS ≈ 240 MiB。
 | 多 rank | `sim.merge_rank_versions()` test-only 汇总旁路 | 每 rank 独立上传，**没有汇总**，rank 0 只 list |
 | 全局覆盖校验 | 在 rank0 的旁路里做 | 在**恢复端**合并索引后做 |
 
-上传侧待补（与本目录的待补全清单互补）：`step_N/` 带尝试号（epoch/attempt）
-隔离重试残片、大文件分块流式上传、失败重试与后台上传队列。**上传成功后的本地清理**
-与**对象存储侧的有界保留**都已落地，见「回收链路」一节的 ``commit/gc.py``
+上传侧已经落地：**代际隔离与 fence**（`step_N/<gen>/rank_r/`，GEN 用 S3 条件写做
+CAS，落后写者写不了 L2、旧代提交不了 L3 —— 规格见 `docs/generation.md`）、
+**大文件分块流式上传**（条件挂在 `CompleteMultipartUpload` 上）、**条件写原语与端点
+能力探针**（`tests/test_conditional.py` / `tests/test_generation.py`）。**上传成功后
+的本地清理**与**对象存储侧的有界保留**见「回收链路」一节的 ``commit/gc.py``
 （用例在 `tests/test_gc.py` / `tests/test_retention.py`）。
+
+上传侧待补：失败重试与后台上传队列（`save_async`）、`dist/` 真 gather/broadcast
+（现在代际广播借用 `all_reduce(MAX)`）。
 
 ## 回收链路（已落地，测试不在本目录）
 
 `commit/gc.py` 有两条互不重叠的判据：
 
-- **残片**：只依赖一条不变量（step 单调推进）—— 远端有本 rank 的分片提交点 ⇒ 本地
-  这份是冗余；存在更新的版本提交点 ⇒ 这一代是残片。没有租约、时间阈值或尝试号，
-  所以本地回收与「最慢的 rank」「写入者是否还活着」都无关；
+- **残片**：只依赖两条不变量（step 单调推进 + 代际只能靠 CAS 前进）—— 远端有本 rank
+  **当前代**的分片提交点 ⇒ 本地这份是冗余；存在更新的版本提交点 ⇒ 这一代是残片；
+  同一个 step 下不在当前代际的前缀 ⇒ 被取代的尝试，整代删。没有租约、时间阈值或
+  心跳，所以本地回收与「最慢的 rank」「写入者是否还活着」都无关；
 - **有界保留**：远端只留最近 `keep` 代（默认 3）已提交版本，由 **rank 0 在
   `finalize_upload` 写完版本 `COMMIT` 之后**执行，从最旧的一代开始删，先删版本
   `COMMIT` 再删分片提交点与数据。
@@ -149,6 +155,8 @@ load ≈ 500 MiB/s、峰值 RSS ≈ 240 MiB。
 | 执行器（dry_run / 上传后回收 / 残片 / 幂等 / 远端不可达） | `tests/test_gc.py` 8 条 |
 | 周期线程（启动即跑 / 远端挂了继续跑） | `tests/test_gc.py` 2 条 |
 | 有界保留（窗口 / 删除顺序 / dry_run / 幂等 / 裁剪失败） | `tests/test_retention.py` 10 条 |
+| 代际残片（判据 / 执行器 / 单代删除顺序 / 只读端点） | `tests/test_gc.py` 8 条 |
+| 代际与 fence（CAS acquire / 落后写者 / 混代拒绝 / 恢复） | `tests/test_generation.py` 22 条 |
 | 长跑不泄漏（目录数、池、fd） | 本目录的 `test_many_steps_reuse_one_pool_without_leaking` 尚未接入 GC |
 
 ## 待补全清单
@@ -179,8 +187,8 @@ collective 就是死锁。现在改为**一次 `all-reduce(MAX)` 统一裁决** 
 2. **S3 故障注入**：`s3_stub` 加故障模式（500/503、连接重置、超时、限速、
    `store.objects` 改字节模拟静默损坏），断言 `upload_local` 的重试 / abort / 幂等；
    再配合 `storage/object.py` 的对象级校验和验证「静默损坏必须被发现」。
-   现在已有的是「缺分片提交点 / 缺索引 / 缺数据对象」三类结构性故障（见
-   `tests/test_object_upload.py`）。
+   现在已有：结构性故障（缺分片提交点 / 缺索引 / 缺数据对象）、条件写的 412 / 404 /
+   409、以及「端点根本不执行条件头」（`ignore_conditional_headers`）。
 3. **磁盘满**：小 tmpfs 或 quota 下保存，断言状态机走 `ABORTED`、没有更新的提交、
    旧版本可恢复。
 4. **反压链路**：`s3_stub` 限速 + `PinnedBufferPool` 满 → 验证 `D2HStream` 与

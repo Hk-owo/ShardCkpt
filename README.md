@@ -17,17 +17,20 @@ ShardCkpt/
 │   ├── load_plan.py    求交 → 读取计划，合并相邻读请求
 │   └── targets.py      目标布局（tp / shard_dims）→ 本 rank 要读的区域
 ├── storage/          存储后端，统一接口
-│   ├── base.py         write / read / download / read_range / rename_or_put / list / delete
+│   ├── base.py         write / read / ... + 条件写协议（ConditionalBackend / WriteOutcome）
 │   ├── data.py         加载结果容器（api.load 的返回类型）
-│   ├── local.py        本地层后端（native O_DIRECT 写 / preadv 读 / 纯 Python 回退）
+│   ├── local.py        本地层后端（native O_DIRECT 写 / preadv 读 / 纯 Python 回退；
+│   │                   可选条件写只给「把目录当远端」的仿真用）
 │   ├── checksum.py     CRC-32C（默认 1 MiB 分块，可配置）+ google-crc32c / 纯 Python 回退
 │   ├── crc_io.py       逻辑读块 → 可校验 IO 子区间
 │   ├── local_load.py   本地层读闭环：窗口化 staging + 批量读 + 块校验 + H2D
 │   ├── recover.py      COMMIT 门禁：选版本、校验 .metadata、读出索引
-│   ├── object.py       对象存储（boto3：PUT / 流式下载 / Range GET / list / delete）
-│   └── upload.py       上传闭环 + 对象存储恢复（整文件下载 → 本地读闭环）
-├── commit/           提交协议、版本目录、垃圾回收
+│   ├── object.py       对象存储（boto3：PUT / 流式下载 / Range GET / list / delete
+│   │                   + 条件写 If-None-Match / If-Match + 端点能力探针）
+│   └── upload.py       上传闭环 + 对象存储恢复（代际前缀 / 三检查点 / 混代拒绝）
+├── commit/           提交协议、版本目录、代际与 fence、垃圾回收
 │   ├── local.py        .metadata → COMMIT，版本扫描与删除
+│   ├── generation.py   代际（gen_0007-xxx）与 GEN 寄存器：CAS 抢写权、读证明、seal
 │   └── gc.py           回收判据（纯函数）+ 执行器 + 周期线程 + 对象存储侧有界保留
 ├── dist/             通信抽象：`all_reduce(MAX)` 已落地（含同进程 ThreadedCollective），
 │                     gather / broadcast 仍只有 docstring
@@ -67,7 +70,7 @@ S3 用进程内的 `tests/s3_stub.py`。读取路径、提交点语义、Range G
 
 | 阶段 | 演示什么 |
 |---|---|
-| 1 | 伪训练 3/6/9 步，每 rank 存自己那片（TP 列切分）→ 独立上传 → rank 0 只 `list` 写版本 `COMMIT` |
+| 1 | 伪训练 3/6/9 步，rank 0 先开一代并广播 → 每 rank 存自己那片（TP 列切分）→ 独立上传 → rank 0 只 `list` 写版本 `COMMIT` |
 | 2 | 本地门禁：只有带 `COMMIT` 的版本可恢复；单 rank 目录单独读会被全局覆盖校验拒掉 |
 | 3 | 崩溃注入：step 12 的某个 rank 在写 `COMMIT` 前被 `SIGKILL`（数据齐、提交点缺失） |
 | 4 | 提交点语义：`finalize_upload(12)` 失败、`load_object(12)` 报错，最新仍是 9 |
@@ -112,16 +115,19 @@ data = api.load("/ckpt", device="cuda:0")           # 本地版本目录自动�
 | `PinnedBufferPool` | `async_/pinned.py` | 预分配 + 复用 + 容量上限；无可用块时阻塞（反压点） |
 | `default_pool()` | `async_/pinned.py` | 保存路径的进程级常驻池：跨 step 复用同一块，`trim()` 削掉多余空闲块 |
 | `SnapshotManager` | `async_/machine.py` | 一代快照的状态机 + 多代门闸（单/双缓冲） |
-| `LocalStorage` | `storage/local.py` | 本地目录后端：native 写（O_DIRECT+fsync+rename）/ preadv 读 |
+| `LocalStorage` | `storage/local.py` | 本地目录后端：native 写（O_DIRECT+fsync+rename）/ preadv 读；`conditional_writes=True` 时兼作条件写替身（仿真/GC 测试） |
 | `CommitRecord` | `commit/local.py` | COMMIT 内容：step、metadata 字节数、文件清单 |
 | `save_local()` | `api.py` | 本地层写闭环：plan → D2H → 数据 + `.metadata` + COMMIT |
 | `open_version()` | `storage/recover.py` | 恢复门禁：只认带 COMMIT 的版本，校验 `.metadata` 与数据文件 |
 | `targets_for_layout()` | `planner/targets.py` | 新布局 → 本 rank 的目标区域（`tp=1` 时整读） |
 | `load_local()` | `api.py` | 本地层读闭环：COMMIT → 读取计划 → 按块 IO → 块 CRC-32C → H2D |
-| `upload_local()` / `finalize_upload()` | `storage/upload.py` | 对象存储上传：每 rank 独立上传 + rank 0 只 `list` 检查，写完 `COMMIT` 即做有界保留 |
+| `begin_upload()` | `commit/generation.py` / `api.py` | 开一代（CAS 抢写权）并用一次 `all_reduce(MAX)` 广播；多 rank 必须先调它 |
+| `upload_local()` / `finalize_upload()` | `storage/upload.py` | 对象存储上传：每 rank 独立上传（`If-None-Match`）+ rank 0 `seal` 后 CAS 写 `COMMIT`，写完即做有界保留 |
 | `load_object()` | `storage/upload.py` | 对象存储恢复：COMMIT → 合并索引 → 整文件下载 → 本地读闭环 |
-| `RankCommit` | `storage/upload.py` | 分片提交点：`step_N/rank_i/COMMIT`，证明本 rank 传完了 |
-| `plan()` | `commit/gc.py` | 残片回收判据（纯函数）：删哪些、留哪些、为什么 |
+| `RankCommit` | `storage/upload.py` | 分片提交点：`step_N/<gen>/rank_i/COMMIT`，证明本 rank 传完了 |
+| `Generation` / `FencedError` | `commit/generation.py` | 代际身份与「你已被取代」的裁决错误 |
+| `S3Storage` 条件写 | `storage/object.py` | `put_if_absent` / `put_if_match` / `head` / `write_file` / `probe_conditional_writes` |
+| `plan()` | `commit/gc.py` | 残片回收判据（纯函数）：上传来/被越过/代际残片，删哪些、留哪些、为什么 |
 | `plan_retention()` / `retain_remote_versions()` | `commit/gc.py` | 对象存储侧有界保留：只留最近 `keep` 代（默认 3），先删版本 `COMMIT` 再删数据 |
 | `collect()` / `gc_local()` | `commit/gc.py` / `api.py` | 回收执行器：一次 `list` + 目录扫描 + 幂等删除，默认 `dry_run` |
 | `GcWorker` | `commit/gc.py` | 周期回收线程：启动时跑一次，之后每 `interval` 秒 |
@@ -321,6 +327,12 @@ s3.read_range("tensors/model_embed.bin", 0, 4096)  # Range GET，按张量读取
 s3.list("tensors")                                 # 相对 prefix 的 key
 s3.rename_or_put("tensors/tmp.bin", "tensors/final.bin")
 s3.delete("tensors/final.bin")                     # 幂等
+
+# 条件写（CAS）：对象存储端代际与 fence 的基础
+s3.put_if_absent("step_42/GEN", body)              # If-None-Match: *  → created / exists
+s3.put_if_match("step_42/GEN", body, etag)         # If-Match: <etag>  → swapped / conflict / gone
+s3.head("step_42/GEN")                             # → ObjectMeta(etag, size) / None
+s3.probe_conditional_writes()                      # 4 步探针：条件真的被执行了吗
 ```
 
 - key 一律相对 `prefix`，与 fs 后端保持一致；绝对路径、`..`、空段直接 `ValueError`
@@ -329,15 +341,22 @@ s3.delete("tensors/final.bin")                     # 幂等
   任一步失败都会 abort 掉本次上传；`part_size` 默认 8 MiB（S3 要求除末片外 ≥ 5 MiB）
 - `rename_or_put` 在源对象超过 5 GiB 时自动改用 `UploadPartCopy`，分片大小按 10000 片上限放大；
   复制失败会 abort 并保留源对象
-- `tests/s3_stub.py` 是进程内的最小 S3 兼容服务，跑测试不需要外部 S3
+- `tests/s3_stub.py` 是进程内的最小 S3 兼容服务，跑测试不需要外部 S3；它也求值
+  `If-Match` / `If-None-Match`（412 / 404 / 409 对齐 S3），并支持「忽略条件头」的故障注入
+- **条件写是写路径的硬前置**：`If-None-Match` / `If-Match` 由服务端原子判定，
+  大对象的条件挂在 `CompleteMultipartUpload` 上（`CreateMultipartUpload` / `UploadPart`
+  在 AWS 上不接受条件头）。`S3Config.conditional_writes="require"`（默认）时首次使用会
+  跑探针，端点不真正执行条件就拒绝写入；`"off"` 把端点降为**只读**（写动作抛
+  `ConditionalWritesDisabled`），不做无 CAS 的降级写入
 
 ```bash
 uv pip install --python .venv/bin/python -r requirements.txt   # numpy + boto3 + google-crc32c
-.venv/bin/python -m pytest      # 371 个用例：数据生成器 + 读取接口 + 对象存储 + D2H/stream/pinned 池 + GPU→S3
+.venv/bin/python -m pytest      # 431 个用例：数据生成器 + 读取接口 + 对象存储 + D2H/stream/pinned 池 + GPU→S3
 #              + 状态机 + 区域/索引/读写计划 + C++ 绑定（**未构建 native 时相关用例自动 skip**）
 #              + 本地层写闭环（数据 + .metadata + COMMIT 可恢复）
 #              + 本地层读闭环（布局不变 / TP 换卡数 / 默认 1 MiB 块 CRC-32C + 扩读与 COMMIT 门禁）
 #              + 对象存储上传（每 rank 独立上传 / rank 0 list 门禁 / 整文件下载恢复）
+#              + 条件写与代际（CAS 原语 / 端点探针 / 代际隔离 / fence / 混代拒绝）
 #              + 垃圾回收（判据纯函数 / 上传后回收 / 残片 / 幂等 / 降级 / 周期线程）
 #              + 仿真：训练 loop / 多 rank 分片 / 故障注入（见 tests/sim/README.md）
 #              + DTensor 适配（placements → 全局坐标；每 rank 上传后恢复拼回全局）
@@ -349,23 +368,31 @@ uv pip install --python .venv/bin/python -r requirements.txt   # numpy + boto3 +
 故障注入（SIGKILL / 提交点缺失 / 破坏索引）和 64 MiB 规模仿真来验证生命周期行为。
 方案、覆盖矩阵与待补全清单见 [`tests/sim/README.md`](tests/sim/README.md)。
 
-## 对象存储上传（每 rank 独立上传）
+## 对象存储上传（每 rank 独立上传 + 代际 / fence）
 
 `storage/upload.py` 把本地版本推到对象存储，**每个 rank 各传各的**，rank 0 只在
-所有人都传完之后 `list` 一次前缀做检查，不做任何索引汇总：
+所有人都传完之后 `list` 一次前缀做检查，不做任何索引汇总。写入身份有两层：
+`step`（训练步）与 **代际 generation**（这一次尝试）。
 
 ```
+rank 0（开代，一次 all_reduce(MAX) 广播给全体）
+  begin_upload(s3, step=42, ranks=range(N))
+      GET step_42/GEN ── 没有 → PUT If-None-Match: *   ┐ 两个动作都交给
+                      └ 有   → PUT If-Match: <etag>     ┘ 服务端原子判定
+
 每个 rank（独立进程，互不等）
   save_local() ──> 本地 step_N/ 已提交（本地 COMMIT 是第一道门）
-  upload_local(root, s3, step=42, rank=i)
-      PUT step_42/rank_i/__i_0.distcp     数据
-      PUT step_42/rank_i/.metadata        本 rank 的分片索引
-      PUT step_42/rank_i/COMMIT           分片提交点（最后写；它一出现本地就能回收）
+  upload_local(root, s3, step=42, rank=i, generation=gen)
+      GET step_42/GEN                                ← fence 检查：我还持有这一代吗
+      PUT step_42/gen_0003-xxx/rank_i/__i_0.distcp    数据（If-None-Match + 流式分片）
+      PUT step_42/gen_0003-xxx/rank_i/.metadata       本 rank 的分片索引
+      PUT step_42/gen_0003-xxx/rank_i/COMMIT          分片提交点（最后写）
 
 rank 0
-  finalize_upload(s3, step=42, ranks=range(N))
-      list("step_42") ──> 每个 rank 的 .metadata + rank_i/COMMIT 都在？
-      PUT step_42/COMMIT                  版本提交点（只记 step / ranks / layout）
+  finalize_upload(s3, step=42, ranks=range(N), generation=gen)
+      PUT step_42/GEN             If-Match: <etag>   seal：这一代不再收新写者
+      list("step_42/gen_0003-xxx") ──> 每个 rank 的 .metadata + COMMIT 都在？
+      PUT step_42/COMMIT          If-None-Match / If-Match（版本提交点，记 generation）
 ```
 
 ```python
@@ -374,9 +401,11 @@ from storage.object import S3Config, S3Storage
 s3 = S3Storage(S3Config(bucket="ckpt", prefix="runs",
                         endpoint_url="http://127.0.0.1:8333",   # SeaweedFS / MinIO
                         access_key_id="...", secret_access_key="..."))
+s3.ensure_conditional_writes()   # 探针：端点不真正执行条件写就在这里失败
 
-api.upload_local("/ckpt", s3, step=42, rank=3)          # 每个 rank 调自己的
-api.finalize_upload(s3, step=42, ranks=range(8), layout={"tp": 8})   # 只有 rank 0 调
+gen = api.begin_upload(s3, step=42, ranks=range(8), collective=collective)  # 单 rank 可省 collective
+api.upload_local("/ckpt", s3, step=42, rank=3, generation=gen)              # 每个 rank 调自己的
+api.finalize_upload(s3, step=42, ranks=range(8), generation=gen, layout={"tp": 8})   # 只有 rank 0
 
 report = api.load_object(s3, device="cuda:0")           # 取最新已提交版本
 report.step        # 42
@@ -384,6 +413,16 @@ report.tensors["model.embed_tokens.weight"].numpy()
 report.amplification                                    # 读放大（Range GET / 真正用到的字节）
 ```
 
+- **代际隔离**：同一 step 的两次尝试落在不同 `gen_*` 前缀下，旧尝试的 `rank_0` 永远
+  不会和新尝试的 `rank_1` 拼成一份「看着完整」的版本；恢复端还要求每个
+  `rank_i/COMMIT` 声明的 generation 与版本 `COMMIT` 一致 —— 混代在读第一个字节之前
+  就被拒。**多 rank 必须先 `begin_upload()`**：两个 rank 各自自动开代会落到不同的
+  代际下，那一版永远凑不齐
+- **fence**：`step_42/GEN` 是全 step 唯一的共享写点，只能 `If-None-Match` / `If-Match`
+  修改。写者写 L2 之前读一次 GEN 证明自己仍是当前代；rank 0 提交前 CAS 把 GEN 推到
+  `sealed`，再 CAS 写版本 `COMMIT` —— 落后的写者写不了 L2，旧代提交不了 L3
+- **已提交版本不会被重试破坏**：新一代只有在自己完整之后才能换掉 `COMMIT`；它写到
+  一半崩掉，恢复端读到的仍是旧代，字节不变
 - **三层提交点**：本地 `step_N/COMMIT` 管「本 rank 写完了，可以传」；
   `rank_i/COMMIT` 管「本 rank 传完了，本地可以删」；版本 `COMMIT` 管「这一版齐了，
   可以恢复」。每一层只放开一个动作（见「垃圾回收」一节）
@@ -393,25 +432,20 @@ report.amplification                                    # 读放大（Range GET 
 - **提交点顺序**：`rank_i/COMMIT` 是每个 rank 的最后一步；版本 `COMMIT` 在全部
   分片提交点齐了之后写。少任何一个都让 `finalize_upload` 失败且不写 `COMMIT`，
   这一版对恢复端不可见；反过来它是**幂等可重跑**的，rank 0 崩在最后一步，重启
-  补调一次就能把这一版补成可恢复
-- **恢复端才做全局校验**：`open_object_version` 按 `COMMIT` 的 rank 清单读各 rank 的
-  `.metadata`，把分片 `file` 加上 `rank_<i>/` 前缀后合并，再 `validate()` 查覆盖与重叠。
-  缺任何一个 rank 的索引都在读数据之前报错，不会交出半份张量
-- **rank 0 不逐个对象核对**：它只信分片提交点。真缺了数据对象由恢复端的 Range GET
-  （短读即报错）抓 —— 数据对象清单记在 `rank_i/COMMIT` 里，但那是给人和工具看的，
-  提交路径不为它付 `HEAD` 往返
-- **残片会被指出来**：`finalize_upload` 会把 `COMMIT` 没声明的 `rank_*` 前缀当错误
-  报出（多半是上一次重试的残留）。正式的 attempt/epoch 隔离还没做，见下
+  补调一次就能把这一版补成可恢复（重跑不产生任何写入）
+- **恢复端才做全局校验**：`open_object_version` 按 `COMMIT` 的 generation 与 rank
+  清单读各 rank 的 `.metadata`，把分片 `file` 加上 `rank_<i>/` 前缀后合并，再
+  `validate()` 查覆盖与重叠。缺任何一个 rank 的索引都在读数据之前报错
 - **提交完成即有界保留**：`COMMIT` 写完，同一个 rank 0 接着只留最新 `keep` 代
   （默认 `DEFAULT_KEEP_VERSIONS = 3`），从最旧的一代开始删 —— **先删它的版本
-  `COMMIT`，再删分片提交点与数据**。提交点一消失这一版立刻不可恢复，删到一半被打断
-  也不会留下「看着像完整版本」的前缀。`keep=None` 关掉自动裁剪，运维可用
-  `retain_remote_versions(s3, keep=3, dry_run=True)` 先看计划再动手
+  `COMMIT`，再删 `GEN`、分片提交点与数据**。提交点一消失这一版立刻不可恢复
 - 字节级完整性仍在上传边界：`S3Storage` 的 PUT 带对象级校验和，服务端独立重算比对
 
-待补：`step_N/` 里带尝试号（避免重试残片混进同一前缀）、大文件分块流式上传、
-上传失败重试与后台上传队列（`save_async`）、「每 M 步永久保留一份」（现在回滚距离
-就是一个保留窗口）。上传成功后回收本地暂存已由「垃圾回收」一节覆盖。
+规格、失败模式矩阵、端点能力探针与版本下界见
+[`docs/generation.md`](docs/generation.md)。
+
+待补：上传失败重试与后台上传队列（`save_async`）、「每 M 步永久保留一份」（现在
+回滚距离就是一个保留窗口）。
 
 ## 本地读写（C++ / io_uring）
 
@@ -561,18 +595,23 @@ ckpt.close_default_pool()   # 训练结束/显存紧张时显式释放常驻块
 
 | 判据 | 谁触发 | 删什么 |
 |---|---|---|
-| 残片（下表三条） | `gc_local` / `GcWorker`，可周期跑 | 本地已上传的中转副本、本地与远端被更新版本越过的残片 |
+| 残片（下表四条） | `gc_local` / `GcWorker`，可周期跑 | 本地已上传的中转副本、本地与远端被更新版本越过的残片、被取代的代际前缀 |
 | 有界保留 | **rank 0 在 `finalize_upload` 写完版本 `COMMIT` 之后** | 远端「完整但过旧」的版本：`keep`（默认 3）之外最旧的那几代 |
 
 本地层只是**上传前的中转**：本 rank 的分片一到远端，本地那份就是纯冗余，可以直接删。
-残片判据只有一条不变量 —— **step 单调推进** —— 所以不需要租约、时间阈值或尝试号
-（`commit/gc.py`）。
+残片判据只有一条不变量 —— **step 单调推进** —— 加上「代际只能靠 CAS 前进」，所以不需要
+租约、时间阈值或心跳（`commit/gc.py`）。
 
 | 位置 | 候选 | 删除条件 | 理由 |
 |---|---|---|---|
-| 本地 | `step_N/` | 远端有 `step_N/rank_<本rank>/COMMIT` | `uploaded`：本分片已到远端 |
+| 本地 | `step_N/` | 远端有**当前代**的 `step_N/<gen>/rank_<本rank>/COMMIT` | `uploaded`：本分片已到远端 |
 | 本地 | `step_N/` | 存在 `M > N` 的版本 `COMMIT` | `superseded`：训练已越过第 N 代 |
-| 远端 | `step_N/`（整个前缀） | 没有版本 `COMMIT` 且有 `M > N` 的版本 `COMMIT` | `superseded`：半途上传的残片 |
+| 远端 | `step_N/`（整个前缀） | 没有版本 `COMMIT`、没有代际前缀，且有 `M > N` 的版本 `COMMIT` | `superseded`：半途上传的残片 |
+| 远端 | `step_N/<gen>/`（单代） | 有版本 `COMMIT` 且这一代不是它声明的代；或没有版本 `COMMIT` 且不是本 step 序号最大的代 | `stale_generation`：被取代的尝试 |
+
+只读端点（`conditional_writes="off"`）能列不能删：远端候选一律记
+`remote_read_only` 跳过，本地判据照常（远端状态仍然看得到）。版本 `COMMIT` 读不出来
+（坏 JSON / 被外部删）时**一个代都不删** —— 不猜当前代。
 
 **保留的一律是「最新且未完成」**：本地最新且没有自己的分片提交点 → 可能正在写；
 远端最新且没有版本提交点 → 可能正在传，也可能 rank 0 崩在最后一步（重跑
@@ -580,15 +619,15 @@ ckpt.close_default_pool()   # 训练结束/显存紧张时显式释放常驻块
 
 对象存储侧单独做**有界保留**（`plan_retention` / `retain_remote_versions`）：只认
 「带版本 `COMMIT` 的 step」，排序后留最新 `keep` 代，从最旧的一代开始删，**先删这一代
-的版本 `COMMIT`，再删分片提交点与数据**。删到一半被打断也不会留下「看着像完整版本」的
+的版本 `COMMIT`，再删 `GEN`、分片提交点与数据**（代际目录随之整段消失）。删到一半被打断也不会留下「看着像完整版本」的
 前缀 —— 下次 `collect` 会把它的剩余部分当 `superseded` 残片收掉。
 
 ```python
 import api as ckpt
 from commit.gc import GcWorker
 
-# 提交完成（rank 0）：写版本 COMMIT → 立刻裁剪，只留最近 3 代
-ckpt.finalize_upload(s3, step=42, ranks=range(8), keep=3)   # keep=None 关掉自动裁剪
+# 提交完成（rank 0）：seal GEN → 写版本 COMMIT → 立刻裁剪，只留最近 3 代
+ckpt.finalize_upload(s3, step=42, ranks=range(8), generation=gen, keep=3)  # keep=None 关掉
 
 # 运维单独看一眼/单跑裁剪（dry_run 只出计划）
 report = ckpt.retain_remote_versions(s3, keep=3, dry_run=True)
@@ -612,9 +651,9 @@ with GcWorker("/ckpt/rank_0", s3, rank=0, interval=60.0) as worker:
 - **不需要问「写入者是否还活着」**：兄弟 rank 正在写的目录一定是最新 step，两条判据
   都不命中。这也是本地 root 必须**按 rank 独立**的原因 —— 本地判据删的是整个
   `step_N/` 目录，只有目录里全是本 rank 的文件时这句话才成立
-- **删除顺序与写入镜像**：先删提交点（本地 `COMMIT` / 远端版本 `COMMIT` /
-  `rank_*/COMMIT`），再删数据，最后移空目录。判据只看提交点在不在，所以删到一半被
-  打断、重跑一次就收敛
+- **删除顺序与写入镜像**：整版先删 `COMMIT`（禁恢复）→ `GEN`（让残留写者立刻被
+  fence）→ `rank_*/COMMIT` → 数据；单代只删 `L2 → 数据`。最后移空目录。判据只看提交点
+  在不在，所以删到一半被打断、重跑一次就收敛
 - **远端不可达就什么都不删**：两条判据都依赖远端状态，「查不到」不能当成「可以删」，
   原因记在 `GcReport.aborted` / `RetentionReport.aborted`，周期线程继续跑
 - **裁剪失败不回滚提交**：版本 `COMMIT` 已经写完，这一版就是可恢复的；旧代残留会在
