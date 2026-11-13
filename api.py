@@ -44,6 +44,7 @@ from async_ import (
 )
 from commit.generation import FencedError, Generation, acquire_generation, new_writer
 from commit.gc import (
+    DEFAULT_KEEP_LOCAL_VERSIONS,
     DEFAULT_KEEP_VERSIONS,
     GcReport,
     GcWorker,
@@ -76,10 +77,13 @@ from storage.data import CheckpointData
 from storage.local_load import LoadReport, load_local
 from storage.upload import (
     DEFAULT_BUDGET_BYTES as DEFAULT_UPLOAD_BUDGET_BYTES,
+    LocalCopyCheck,
     ObjectLoadReport,
     ObjectVersion,
     UploadCommit,
+    check_local_copy,
     finalize_upload as _finalize_upload,
+    load_checkpoint_version,
     load_object_version,
     upload_rank as _upload_rank,
 )
@@ -595,7 +599,78 @@ def load_object(
     )
 
 
-# --- 本地暂存回收（上传完即删） --------------------------------------------
+def local_copy_available(
+    local_root: str | Path | None,
+    storage: Any,
+    *,
+    step: int | None = None,
+    tp: int = 1,
+    tp_rank: int = 0,
+    shard_dims: Mapping[str, int] | None = None,
+    column_strategy: str = "whole",
+) -> LocalCopyCheck:
+    """本地热副本能不能顶替一次下载（判定，不读数据）。
+
+    条件是两条同时成立：远端有这一代的版本 ``COMMIT``，本地 ``step_N/`` 带 ``COMMIT``
+    且索引覆盖请求的布局。
+    """
+    return check_local_copy(
+        local_root,
+        storage,
+        step=step,
+        tp=tp,
+        tp_rank=tp_rank,
+        shard_dims=shard_dims,
+        column_strategy=column_strategy,
+    )
+
+
+def load_checkpoint(
+    storage: Any,
+    *,
+    local_root: str | Path | None = None,
+    step: int | None = None,
+    device: "str | Device" = "cpu",
+    tp: int = 1,
+    tp_rank: int = 0,
+    shard_dims: Mapping[str, int] | None = None,
+    budget_bytes: int = DEFAULT_UPLOAD_BUDGET_BYTES,
+    column_strategy: str = "whole",
+    verify_crc: bool = True,
+    crc_padding: str = "block",
+    crc_padding_ratio: float = 0.125,
+    io_concurrency: int = 1,
+    local_staging_dir: str | Path | None = None,
+    prefer_local: bool = True,
+) -> ObjectLoadReport:
+    """恢复一个版本：**本地热副本优先**，本地不满足条件再下载（回退用这个入口）。
+
+    本地 ``local_root`` 下留着这一代（``gc_local`` 的恢复层窗口）、且远端同一代有版本
+    ``COMMIT`` 时，直接读本地（``report.source == "local"``，零下载）；否则与
+    :func:`load_object` 一样下载整份到临时目录再读。
+
+    ``prefer_local=False`` 强制下载；``local_root=None`` 等价于 :func:`load_object`。
+    """
+    return load_checkpoint_version(
+        storage,
+        local_root=local_root,
+        step=step,
+        device=device,
+        tp=tp,
+        tp_rank=tp_rank,
+        shard_dims=shard_dims,
+        budget_bytes=budget_bytes,
+        column_strategy=column_strategy,
+        verify_crc=verify_crc,
+        crc_padding=crc_padding,
+        crc_padding_ratio=crc_padding_ratio,
+        io_concurrency=io_concurrency,
+        local_staging_dir=local_staging_dir,
+        prefer_local=prefer_local,
+    )
+
+
+# --- 本地暂存回收（最近 1 代留作恢复层） ------------------------------------
 
 
 def gc_local(
@@ -604,16 +679,22 @@ def gc_local(
     *,
     rank: int,
     dry_run: bool = True,
+    keep_local: int = DEFAULT_KEEP_LOCAL_VERSIONS,
 ) -> GcReport:
     """回收本地 ``step_N/``：已上传的版本、以及被更新版本越过的残片。
 
-    判据只依赖 step 单调性 —— **本地没有保留策略，没有租约，没有时间阈值**：
+    判据只依赖 step 单调性 —— **没有租约，没有时间阈值**：
 
     - 远端的 ``step_N/rank_<rank>/COMMIT`` 在 ⇒ 本 rank 的分片已经到远端 ⇒ 本地这份
-      是纯冗余（本 rank 传完就删，不等最慢的 rank，也不等 rank 0 写版本 COMMIT）；
+      是冗余（本 rank 传完就能删，不等最慢的 rank，也不等 rank 0 写版本 COMMIT）；
     - 存在比 N 更新的版本 ``COMMIT`` ⇒ 训练已经越过第 N 代 ⇒ 本地 ``step_N/``
       （哪怕它从没上传成功）与远端整个 ``step_N/`` 前缀都是残片；
     - 其余一律保留：最新且未完成的可能就是**正在写**（本地）或**正在传**（远端）。
+
+    ``keep_local`` 是**本地恢复层**：最近 ``keep_local`` 个「远端已有版本 ``COMMIT``
+    且本 rank 已上传」的本地版本不删，回退到这一代时直接读本地、零下载
+    （:func:`load_checkpoint`）；``0`` 回到「上传完即删」。窗口按「远端可恢复」定，
+    所以留下的这份永远不是唯一副本。
 
     对象存储侧的**有界保留**是另一条判据（只留最近 ``keep`` 代已提交版本），由 rank 0
     在 :func:`finalize_upload` 里执行，不在这里：这个函数要能安全地周期跑，而删「完整
@@ -622,7 +703,9 @@ def gc_local(
     ``dry_run=True``（默认）只返回计划。远端不可达时什么都不删（``GcReport.aborted``
     里记原因）。周期调用用 :class:`commit.gc.GcWorker`。
     """
-    return collect(local_root, storage, rank=rank, dry_run=dry_run)
+    return collect(
+        local_root, storage, rank=rank, dry_run=dry_run, keep_local=keep_local
+    )
 
 
 __all__ = [
@@ -632,6 +715,7 @@ __all__ = [
     "CheckpointError",
     "ChecksumError",
     "CpuBackend",
+    "DEFAULT_KEEP_LOCAL_VERSIONS",
     "DEFAULT_KEEP_VERSIONS",
     "Device",
     "DeviceBackend",
@@ -641,6 +725,7 @@ __all__ = [
     "GateBlock",
     "GateCollective",
     "LoadReport",
+    "LocalCopyCheck",
     "MissingTensorError",
     "MockCudaBackend",
     "PinnedBufferPool",
@@ -666,8 +751,10 @@ __all__ = [
     "UploadCommit",
     "finalize_upload",
     "load",
+    "load_checkpoint",
     "load_local",
     "load_object",
+    "local_copy_available",
     "register_backend",
     "reset_registry",
     "retain_remote_versions",

@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import time
 
+import pytest
+
 import api as ckpt
 import sim
 from commit.gc import (
@@ -22,6 +24,7 @@ from commit.gc import (
     LOCAL,
     NOT_UPLOADED,
     NO_NEWER_VERSION,
+    RECOVERY_COPY,
     REMOTE,
     REMOTE_READ_ONLY,
     STALE_GENERATION,
@@ -46,6 +49,7 @@ def test_plan_is_a_pure_function() -> None:
         prefixes=[1, 2, 3],
         local_steps=[2, 3],
         rank=0,
+        keep_local=0,
     )
     first = plan(**kwargs)
     second = plan(**kwargs)
@@ -63,7 +67,25 @@ def test_plan_is_a_pure_function() -> None:
 
 
 def test_uploaded_version_is_reclaimed() -> None:
-    """本 rank 的 L2 一出现，本地这一版就是冗余副本。"""
+    """本 rank 的 L2 一出现，本地这一版就是冗余副本（恢复层窗口为 0 时立刻删）。"""
+    result = plan(
+        versions=[7],
+        rank_commits=[(7, 3)],
+        prefixes=[7],
+        local_steps=[7],
+        rank=3,
+        keep_local=0,
+    )
+
+    assert result.steps_for(LOCAL) == (7,)
+    assert result.reasons()[(LOCAL, 7)] == UPLOADED
+
+
+# --- 本地恢复层（keep_local） ----------------------------------------------
+
+
+def test_newest_committed_version_stays_as_recovery_copy() -> None:
+    """远端已提交 + 本 rank 已上传：最近一个本地版本留作热副本，不删。"""
     result = plan(
         versions=[7],
         rank_commits=[(7, 3)],
@@ -72,8 +94,78 @@ def test_uploaded_version_is_reclaimed() -> None:
         rank=3,
     )
 
-    assert result.steps_for(LOCAL) == (7,)
-    assert result.reasons()[(LOCAL, 7)] == UPLOADED
+    assert result.steps_for(LOCAL) == ()
+    assert result.reasons() == {}
+    assert result.kept == ((LOCAL, 7, RECOVERY_COPY), (REMOTE, 7, COMMITTED))
+    assert result.recovery_steps() == (7,)
+
+
+def test_recovery_copy_window_keeps_only_the_newest() -> None:
+    """窗口内的最新一代留下，更旧的已提交版本照旧回收。"""
+    result = plan(
+        versions=[1, 2],
+        rank_commits=[(1, 0), (2, 0)],
+        prefixes=[1, 2],
+        local_steps=[1, 2],
+        rank=0,
+    )
+
+    assert result.recovery_steps() == (2,)
+    assert result.steps_for(LOCAL) == (1,)
+    assert result.reasons() == {(LOCAL, 1): UPLOADED}
+
+
+def test_recovery_copy_does_not_keep_unreadable_versions() -> None:
+    """L3 读不出来（坏 JSON / 被删）的版本不当热副本：远端这份不保证可恢复。"""
+    result = plan(
+        versions=[3],
+        rank_commits=[(3, 0)],
+        prefixes=[3],
+        local_steps=[3],
+        rank=0,
+        unknown_versions=[3],
+    )
+
+    assert result.recovery_steps() == ()
+    assert result.steps_for(LOCAL) == (3,)
+
+
+def test_recovery_copy_does_not_keep_other_ranks_uploads() -> None:
+    """本 rank 还没传完的版本不进恢复层（本地仍是唯一副本，走 ``not_uploaded``）。"""
+    result = plan(
+        versions=[4],
+        rank_commits=[(4, 1)],
+        prefixes=[4],
+        local_steps=[4],
+        rank=0,
+    )
+
+    assert result.recovery_steps() == ()
+    assert result.kept == ((LOCAL, 4, NOT_UPLOADED), (REMOTE, 4, COMMITTED))
+
+
+def test_keep_local_zero_is_the_old_eager_reclaim() -> None:
+    """``keep_local=0`` 回到「上传完即删」，且负数是配置错误。"""
+    result = plan(
+        versions=[5],
+        rank_commits=[(5, 0)],
+        prefixes=[5],
+        local_steps=[5],
+        rank=0,
+        keep_local=0,
+    )
+
+    assert result.steps_for(LOCAL) == (5,)
+
+    with pytest.raises(ValueError):
+        plan(
+            versions=[5],
+            rank_commits=[(5, 0)],
+            prefixes=[5],
+            local_steps=[5],
+            rank=0,
+            keep_local=-1,
+        )
 
 
 def test_other_ranks_commit_does_not_free_local() -> None:
@@ -117,6 +209,7 @@ def test_superseded_version_is_reclaimed() -> None:
         prefixes=[8, 9],
         local_steps=[8, 9],
         rank=0,
+        keep_local=0,
     )
 
     # 远端 8 也没有版本提交点、又被 9 越过：本地与远端两侧都收掉
@@ -234,13 +327,13 @@ def test_dry_run_only_plans_then_real_run_deletes(state, tmp_path) -> None:
     _upload(local, remote, 1)
     _finalize(remote, 1)
 
-    plan_only = collect(local, remote, rank=0, dry_run=True)
+    plan_only = collect(local, remote, rank=0, dry_run=True, keep_local=0)
     assert plan_only.steps_for(LOCAL) == ()
     assert plan_only.planned[0].location == LOCAL
     assert plan_only.planned[0].reason == UPLOADED
     assert (local / version_key(1)).is_dir(), "dry_run 不能动文件"
 
-    report = collect(local, remote, rank=0, dry_run=False)
+    report = collect(local, remote, rank=0, dry_run=False, keep_local=0)
     assert report.steps_for(LOCAL) == (1,)
     assert report.reclaimed_bytes > 0
     assert not (local / version_key(1)).exists()
@@ -285,7 +378,7 @@ def test_superseded_version_is_reclaimed_on_disk(state, tmp_path) -> None:
     _upload(local, remote, 2)
     _finalize(remote, 2)
 
-    report = collect(local, remote, rank=0, dry_run=False)
+    report = collect(local, remote, rank=0, dry_run=False, keep_local=0)
 
     assert sorted(report.steps_for(LOCAL)) == [1, 2]
     assert {item.step: item.reason for item in report.deleted} == {
@@ -293,6 +386,30 @@ def test_superseded_version_is_reclaimed_on_disk(state, tmp_path) -> None:
         2: UPLOADED,
     }
     assert list(local.glob("step_*")) == []
+
+
+def test_recovery_copy_stays_local_and_is_reused(state, tmp_path) -> None:
+    """默认窗口下：最新的已提交版本留在本地，回退时零下载直接读。"""
+    local = tmp_path / "local"
+    remote = LocalStorage(tmp_path / "remote", conditional_writes=True)
+
+    _save(state, local, 1)
+    _upload(local, remote, 1)
+    _finalize(remote, 1)
+    _save(state, local, 2)
+    _upload(local, remote, 2)
+    _finalize(remote, 2)
+
+    report = collect(local, remote, rank=0, dry_run=False)
+
+    assert report.recovery_steps() == (2,)
+    assert report.steps_for(LOCAL) == (1,)
+    assert (local / version_key(2)).is_dir(), "最新一代留在本地当热副本"
+    assert not (local / version_key(1)).exists(), "更旧的一代照旧回收"
+
+    reused = ckpt.load_checkpoint(remote, local_root=local, step=2, device=DEVICE)
+    assert reused.source == "local"
+    assert reused.download_bytes == 0
 
 
 def test_remote_unreachable_deletes_nothing(state, tmp_path) -> None:
@@ -347,9 +464,10 @@ def test_gc_is_idempotent_after_interrupt(state, tmp_path) -> None:
     first = collect(local, remote, rank=0, dry_run=False)
     second = collect(local, remote, rank=0, dry_run=False)
 
-    assert sorted(first.steps_for(LOCAL)) == [1, 2]
+    assert first.steps_for(LOCAL) == (1,), "被打断的 1 收敛掉，2 留在恢复层"
+    assert first.recovery_steps() == (2,)
     assert second.deleted == (), "第二次没有东西可删"
-    assert [p.name for p in local.glob("step_*")] == []
+    assert [p.name for p in local.glob("step_*")] == [version_key(2)]
 
 
 def test_stale_remote_prefix_is_reclaimed_on_disk(state, tmp_path) -> None:
@@ -394,12 +512,28 @@ def test_worker_cleans_on_start_and_stops(state, tmp_path) -> None:
     _upload(local, remote, 1)
     _finalize(remote, 1)
 
-    worker = GcWorker(local, remote, rank=0, interval=0.05, dry_run=False)
+    worker = GcWorker(local, remote, rank=0, interval=0.05, dry_run=False, keep_local=0)
     with worker:
         assert _wait(lambda: not (local / version_key(1)).exists()), "启动那一次就该清掉"
 
     assert worker.reports and worker.reports[0].steps_for(LOCAL) == (1,)
     assert not worker.running
+
+
+def test_worker_keeps_the_recovery_copy_by_default(state, tmp_path) -> None:
+    """周期线程默认按恢复层窗口跑：最新已提交版本留在本地。"""
+    local = tmp_path / "local"
+    remote = LocalStorage(tmp_path / "remote", conditional_writes=True)
+
+    _save(state, local, 1)
+    _upload(local, remote, 1)
+    _finalize(remote, 1)
+
+    worker = GcWorker(local, remote, rank=0, interval=60.0, dry_run=False)
+    report = worker.run_once()
+
+    assert report.recovery_steps() == (1,)
+    assert (local / version_key(1)).is_dir()
 
 
 def test_worker_keeps_running_when_remote_is_down(state, tmp_path) -> None:
@@ -490,7 +624,8 @@ def test_collect_deletes_stale_generation_and_keeps_current(state, tmp_path) -> 
     ] == [stale.id]
     assert remote.list(f"step_5/{stale.id}") == [], "旧代整段删掉"
     assert remote.list(f"step_5/{current.id}"), "当前代不动"
-    assert report.steps_for(LOCAL) == (5,), "本 rank 已上传，本地可以删"
+    assert report.recovery_steps() == (5,), "本 rank 已上传，本地留作恢复层"
+    assert (local / version_key(5)).is_dir()
 
 
 def test_gen_pointer_alone_never_makes_a_version_visible(tmp_path) -> None:

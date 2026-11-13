@@ -523,7 +523,7 @@ def phase_resume(sc: Scenario, restored: Mapping[str, np.ndarray]) -> None:
 def phase_gc(sc: Scenario) -> None:
     print(
         "\n[7/7] 提交完成后的有界保留（只留最近 "
-        f"{ckpt.DEFAULT_KEEP_VERSIONS} 代）+ 回收本地暂存"
+        f"{ckpt.DEFAULT_KEEP_VERSIONS} 代）+ 回收本地暂存（最新 1 代留作恢复层）"
     )
     storage = sc.storage()
     try:
@@ -564,6 +564,36 @@ def phase_gc(sc: Scenario) -> None:
         }
         print(f"    幂等重跑无新增删除；本地剩余目录：{remaining}")
         assert sorted(committed_steps(storage)) == window, "本地回收不该碰远端已提交版本"
+
+        # 回退：本地恢复了什么就直接用什么。单 rank 的本地版本是完整的一份，远端同一代
+        # 又有版本 COMMIT ⇒ 零下载；多 rank 时每个本地 root 只有自己的分片，全局覆盖
+        # 校验不过 ⇒ 回落下载（两份数据一样，只是省不下带宽）。
+        newest = sorted(STEPS)[-1]
+        print(f"    回退到 step_{newest}：本地有完整热副本就零下载，否则整份下载")
+        for rank in range(sc.ranks):
+            root = sc.root(rank)
+            check = ckpt.local_copy_available(
+                root, storage, step=newest, tp=sc.tp, tp_rank=rank, shard_dims=COLUMN_DIM
+            )
+            loaded = ckpt.load_checkpoint(
+                storage,
+                local_root=root,
+                step=newest,
+                device=sc.device,
+                tp=sc.tp,
+                tp_rank=rank,
+                shard_dims=COLUMN_DIM,
+            )
+            print(
+                f"      rank {rank}: 本地判定={check.reason}；"
+                f"恢复来源={loaded.source}（下载 {loaded.download_bytes} 字节）"
+            )
+            if sc.ranks == 1:
+                assert check.usable, f"单 rank 的本地版本应当可直接读：{check.reason}"
+                assert loaded.source == "local" and loaded.download_bytes == 0
+            else:
+                assert not check.usable, "多 rank 的单 root 只有本 rank 分片，不能全局读"
+                assert loaded.source == "object", "覆盖不全就该回落到下载"
     finally:
         storage.close()
 

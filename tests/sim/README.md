@@ -131,8 +131,9 @@ load ≈ 500 MiB/s、峰值 RSS ≈ 240 MiB。
 CAS，落后写者写不了 L2、旧代提交不了 L3 —— 规格见 `docs/generation.md`）、
 **大文件分块流式上传**（条件挂在 `CompleteMultipartUpload` 上）、**条件写原语与端点
 能力探针**（`tests/test_conditional.py` / `tests/test_generation.py`）。**上传成功后
-的本地清理**与**对象存储侧的有界保留**见「回收链路」一节的 ``commit/gc.py``
-（用例在 `tests/test_gc.py` / `tests/test_retention.py`）。
+的本地清理**（最新 1 代留作热副本）与**对象存储侧的有界保留**见「回收链路」一节的
+``commit/gc.py``（用例在 `tests/test_gc.py` / `tests/test_retention.py` /
+`tests/test_local_recovery.py`）。
 
 上传侧待补：失败重试与后台上传队列（`save_async`）、`dist/` 真 gather/broadcast
 （现在代际广播借用 `all_reduce(MAX)`）。
@@ -149,6 +150,11 @@ CAS，落后写者写不了 L2、旧代提交不了 L3 —— 规格见 `docs/ge
   `finalize_upload` 写完版本 `COMMIT` 之后**执行，从最旧的一代开始删，先删版本
   `COMMIT` 再删分片提交点与数据。
 
+**本地恢复层**是残片判据的一个例外：最新 `keep_local`（默认 1）个「远端已有版本
+`COMMIT` + 本 rank 已上传」的本地版本留着当热副本，回退时
+`api.load_checkpoint(local_root=...)` 直接读它（`source="local"`、零下载），不满足
+条件（没留 / 缺文件 / 多 rank 单 root 覆盖不全 / 远端没 L3）就回落下载。
+
 | | 谁测 |
 |---|---|
 | 残片判据纯函数（删谁 / 留谁 / 为什么） | `tests/test_gc.py::test_plan_*` 等 9 条 |
@@ -156,6 +162,8 @@ CAS，落后写者写不了 L2、旧代提交不了 L3 —— 规格见 `docs/ge
 | 周期线程（启动即跑 / 远端挂了继续跑） | `tests/test_gc.py` 2 条 |
 | 有界保留（窗口 / 删除顺序 / dry_run / 幂等 / 裁剪失败） | `tests/test_retention.py` 10 条 |
 | 代际残片（判据 / 执行器 / 单代删除顺序 / 只读端点） | `tests/test_gc.py` 8 条 |
+| 本地恢复层（窗口 / 不越权的保留 / `keep_local=0`） | `tests/test_gc.py` 6 条 |
+| 本地优先恢复（热副本 / 回落 / 强制下载） | `tests/test_local_recovery.py` 7 条 |
 | 代际与 fence（CAS acquire / 落后写者 / 混代拒绝 / 恢复） | `tests/test_generation.py` 22 条 |
 | 长跑不泄漏（目录数、池、fd） | 本目录的 `test_many_steps_reuse_one_pool_without_leaking` 尚未接入 GC |
 

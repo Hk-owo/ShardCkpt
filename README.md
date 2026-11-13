@@ -27,7 +27,7 @@ ShardCkpt/
 │   ├── recover.py      COMMIT 门禁：选版本、校验 .metadata、读出索引
 │   ├── object.py       对象存储（boto3：PUT / 流式下载 / Range GET / list / delete
 │   │                   + 条件写 If-None-Match / If-Match + 端点能力探针）
-│   └── upload.py       上传闭环 + 对象存储恢复（代际前缀 / 三检查点 / 混代拒绝）
+│   └── upload.py       上传闭环 + 恢复（代际前缀 / 三检查点 / 混代拒绝 / 本地热副本优先）
 ├── commit/           提交协议、版本目录、代际与 fence、垃圾回收
 │   ├── local.py        .metadata → COMMIT，版本扫描与删除
 │   ├── generation.py   代际（gen_0007-xxx）与 GEN 寄存器：CAS 抢写权、读证明、seal
@@ -76,7 +76,7 @@ S3 用进程内的 `tests/s3_stub.py`。读取路径、提交点语义、Range G
 | 4 | 提交点语义：`finalize_upload(12)` 失败、`load_object(12)` 报错，最新仍是 9 |
 | 5 | 从对象存储恢复：整读一份 + 每 rank 取自己那片拼回全局，两者逐字节一致 |
 | 6 | 续训：从 step 9 恢复再跑 3 步 == 一口气训到 step 12（无容差） |
-| 7 | 有界保留：step 15 提交后远端只剩最近 3 代（step 3 不可恢复）；再回收本地暂存，`dry_run` 出计划、重跑幂等 |
+| 7 | 有界保留：step 15 提交后远端只剩最近 3 代（step 3 不可恢复）；再回收本地暂存（最新 1 代留作热副本），`dry_run` 出计划、重跑幂等、回退直接读本地 |
 
 脚本本身就是「外部调用方怎么用这套 API」的示例：`to_device()` 演示 host 数组 →
 device 张量，`sources_for_rank()` 演示分片全局坐标，`save_rank()` 是一个 rank 的完整动作。
@@ -124,10 +124,11 @@ data = api.load("/ckpt", device="cuda:0")           # 本地版本目录自动�
 | `begin_upload()` | `commit/generation.py` / `api.py` | 开一代（CAS 抢写权）并用一次 `all_reduce(MAX)` 广播；多 rank 必须先调它 |
 | `upload_local()` / `finalize_upload()` | `storage/upload.py` | 对象存储上传：每 rank 独立上传（`If-None-Match`）+ rank 0 `seal` 后 CAS 写 `COMMIT`，写完即做有界保留 |
 | `load_object()` | `storage/upload.py` | 对象存储恢复：COMMIT → 合并索引 → 整文件下载 → 本地读闭环 |
+| `load_checkpoint()` | `api.py` / `storage/upload.py` | 恢复入口：本地热副本优先（远端有同代 `COMMIT` ⇒ 零下载），否则回落 `load_object()` |
 | `RankCommit` | `storage/upload.py` | 分片提交点：`step_N/<gen>/rank_i/COMMIT`，证明本 rank 传完了 |
 | `Generation` / `FencedError` | `commit/generation.py` | 代际身份与「你已被取代」的裁决错误 |
 | `S3Storage` 条件写 | `storage/object.py` | `put_if_absent` / `put_if_match` / `head` / `write_file` / `probe_conditional_writes` |
-| `plan()` | `commit/gc.py` | 残片回收判据（纯函数）：上传来/被越过/代际残片，删哪些、留哪些、为什么 |
+| `plan()` | `commit/gc.py` | 残片回收判据（纯函数）：已上传/被越过/代际残片，删哪些、留哪些（含恢复层窗口）、为什么 |
 | `plan_retention()` / `retain_remote_versions()` | `commit/gc.py` | 对象存储侧有界保留：只留最近 `keep` 代（默认 3），先删版本 `COMMIT` 再删数据 |
 | `collect()` / `gc_local()` | `commit/gc.py` / `api.py` | 回收执行器：一次 `list` + 目录扫描 + 幂等删除，默认 `dry_run` |
 | `GcWorker` | `commit/gc.py` | 周期回收线程：启动时跑一次，之后每 `interval` 秒 |
@@ -357,7 +358,7 @@ uv pip install --python .venv/bin/python -r requirements.txt   # numpy + boto3 +
 #              + 本地层读闭环（布局不变 / TP 换卡数 / 默认 1 MiB 块 CRC-32C + 扩读与 COMMIT 门禁）
 #              + 对象存储上传（每 rank 独立上传 / rank 0 list 门禁 / 整文件下载恢复）
 #              + 条件写与代际（CAS 原语 / 端点探针 / 代际隔离 / fence / 混代拒绝）
-#              + 垃圾回收（判据纯函数 / 上传后回收 / 残片 / 幂等 / 降级 / 周期线程）
+#              + 垃圾回收（判据纯函数 / 上传后回收 / 本地恢复层 / 残片 / 幂等 / 降级 / 周期线程）
 #              + 仿真：训练 loop / 多 rank 分片 / 故障注入（见 tests/sim/README.md）
 #              + DTensor 适配（placements → 全局坐标；每 rank 上传后恢复拼回全局）
 #              + examples/e2e_sim.py 端到端剧本（1 / 2 个 rank 各跑一遍）
@@ -424,8 +425,8 @@ report.amplification                                    # 读放大（Range GET 
 - **已提交版本不会被重试破坏**：新一代只有在自己完整之后才能换掉 `COMMIT`；它写到
   一半崩掉，恢复端读到的仍是旧代，字节不变
 - **三层提交点**：本地 `step_N/COMMIT` 管「本 rank 写完了，可以传」；
-  `rank_i/COMMIT` 管「本 rank 传完了，本地可以删」；版本 `COMMIT` 管「这一版齐了，
-  可以恢复」。每一层只放开一个动作（见「垃圾回收」一节）
+  `rank_i/COMMIT` 管「本 rank 传完了，本地可以回收（最新一代留作热副本）」；版本
+  `COMMIT` 管「这一版齐了，可以恢复」。每一层只放开一个动作（见「垃圾回收」一节）
 - **rank 0 不读别人的索引**：`finalize_upload` 只有 `list` 和 `PUT`，`tests/`
   里用 `s3_server.store.requests` 断言这一点。齐全性由每个 rank 的分片提交点证明 ——
   「对象真的在」比「索引拼起来完整」更强，代价也不随 rank 数增长
@@ -589,22 +590,27 @@ ckpt.close_default_pool()   # 训练结束/显存紧张时显式释放常驻块
 
 `save_async()` 仍是 `NotImplementedError`：后台进程与上传队列还没做。
 
-## 垃圾回收（上传完即回收 + 远端有界保留）
+## 垃圾回收（本地恢复层 + 远端有界保留）
 
 回收有**两条互不重叠的判据**，各管一半：
 
 | 判据 | 谁触发 | 删什么 |
 |---|---|---|
-| 残片（下表四条） | `gc_local` / `GcWorker`，可周期跑 | 本地已上传的中转副本、本地与远端被更新版本越过的残片、被取代的代际前缀 |
+| 残片（下表四条） | `gc_local` / `GcWorker`，可周期跑 | 本地已上传且超出恢复层窗口的中转副本、本地与远端被更新版本越过的残片、被取代的代际前缀 |
 | 有界保留 | **rank 0 在 `finalize_upload` 写完版本 `COMMIT` 之后** | 远端「完整但过旧」的版本：`keep`（默认 3）之外最旧的那几代 |
 
-本地层只是**上传前的中转**：本 rank 的分片一到远端，本地那份就是纯冗余，可以直接删。
+本地层主要是**上传前的中转**，但留一层**热恢复副本**：最新 `keep_local`（默认 1）个
+「远端已经有版本 `COMMIT`、且本 rank 的分片已上传」的本地版本不删。回退到这一代时
+`load_checkpoint()` 直接读本地、零下载；这份副本不是唯一副本（远端同一代可恢复），所以
+它随时可以删。远端还没有版本 `COMMIT` 的本地版本不进恢复层 —— 那一代在远端本来也还
+不可恢复。
+
 残片判据只有一条不变量 —— **step 单调推进** —— 加上「代际只能靠 CAS 前进」，所以不需要
 租约、时间阈值或心跳（`commit/gc.py`）。
 
 | 位置 | 候选 | 删除条件 | 理由 |
 |---|---|---|---|
-| 本地 | `step_N/` | 远端有**当前代**的 `step_N/<gen>/rank_<本rank>/COMMIT` | `uploaded`：本分片已到远端 |
+| 本地 | `step_N/` | 远端有**当前代**的 `step_N/<gen>/rank_<本rank>/COMMIT`，且不在恢复层窗口内 | `uploaded`：本分片已到远端 |
 | 本地 | `step_N/` | 存在 `M > N` 的版本 `COMMIT` | `superseded`：训练已越过第 N 代 |
 | 远端 | `step_N/`（整个前缀） | 没有版本 `COMMIT`、没有代际前缀，且有 `M > N` 的版本 `COMMIT` | `superseded`：半途上传的残片 |
 | 远端 | `step_N/<gen>/`（单代） | 有版本 `COMMIT` 且这一代不是它声明的代；或没有版本 `COMMIT` 且不是本 step 序号最大的代 | `stale_generation`：被取代的尝试 |
@@ -642,6 +648,14 @@ report.skipped      # 保留的版本与理由
 report.deleted      # 真跑时删掉的版本；远端字节记 0（list 不带对象大小）
 report.reclaimed_bytes
 report.versions     # 本次看到的已提交 step
+report.recovery_steps()   # 留在本地当热副本的 step（reason="recovery_copy"）
+
+# 回退/续训：本地热副本优先，本地不满足条件才整份下载
+report = ckpt.load_checkpoint(s3, local_root="/ckpt/rank_0", step=39)
+report.source       # "local"（零下载）或 "object"（下载），download_bytes 随之记 0 或整份大小
+
+# 关掉恢复层（回到「上传完即删」）
+ckpt.gc_local("/ckpt/rank_0", s3, rank=0, dry_run=False, keep_local=0)
 
 # 周期回收：进程启动时先跑一次（收掉上次崩溃的残目录），之后每 interval 秒一次
 with GcWorker("/ckpt/rank_0", s3, rank=0, interval=60.0) as worker:
@@ -660,9 +674,12 @@ with GcWorker("/ckpt/rank_0", s3, rank=0, interval=60.0) as worker:
   下一次提交成功后被同一条判据收掉
 - **`save_local` 失败路径就地清理**：`ABORTED` 时直接删掉残缺目录并 `mark_cleaned()`，
   所以「本地无 `COMMIT` 的残目录」几乎只剩 SIGKILL 一种来源，定时回收只兜底
-- **保留窗口只有一个**：本地不留任何可恢复版本（正常恢复一律走 `load_object()`）；
-  远端的回滚距离就是 `keep` 个 checkpoint（默认 3 代），「每 M 步永久保留一份」还没做。
-  另外保留判据不看「谁正在读」——恰好读到被裁掉的那一代会报错（而不是读到半份数据）
+- **回滚窗口**：本地留最近 `keep_local`（默认 1）个**热副本**（零下载），远端留最近
+  `keep`（默认 3）代（可下载）；「每 M 步永久保留一份」还没做。另外保留判据不看
+  「谁正在读」——恰好读到被裁掉的那一代会报错（而不是读到半份数据）
+- **热副本不是唯一副本**：只有远端同一代已经写完版本 `COMMIT` 的本地版本才进恢复层；
+  本地有、远端还没提交的版本照旧保留（`not_uploaded`），但**不**当热副本用 —— 它是这一
+  代唯一的完整副本，坏了自己没有备份
 
 ## 本地层读闭环
 

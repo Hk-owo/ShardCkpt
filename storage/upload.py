@@ -91,9 +91,11 @@ from commit.local import (
     write_commit,
     write_metadata,
 )
-from core import FormatError
+from core import FormatError, PlanError
 from core.index import META_FILE, BlobMeta, CheckpointIndex, ShardMeta, TensorMeta
 from core.metadata import Device
+from planner.load_plan import build_load_plan
+from planner.targets import targets_for_layout
 from storage.base import (
     ConditionalBackend,
     ObjectNotFoundError,
@@ -102,6 +104,7 @@ from storage.base import (
 )
 from storage.local import LocalStorage
 from storage.local_load import LoadReport, load_local
+from storage.recover import recover_version
 
 COMMIT_FORMAT_VERSION = 2
 """v2 起用 ``step_N/<gen>/`` 布局；读侧仍接受 v1（``generation=None``）。"""
@@ -710,6 +713,7 @@ def open_object_version(
             f"{key}: COMMIT declares ranks {commit.ranks}, but rank(s) {not_committed} "
             f"have no per-rank COMMIT (分片提交点缺失，远端对象可能被删过)"
         )
+    index_payloads: dict[int, bytes] = {}
     for rank in commit.ranks:
         rank_commit = RankCommit.loads(
             storage.read(rank_commit_key(target, rank, commit.generation)).decode("utf-8")
@@ -766,7 +770,13 @@ def open_object_version(
     )
 
 
-# --- 读取：整文件下载到本地临时目录，再走本地读闭环 -------------------------
+# --- 读取：本地热副本优先，缺了再下载 --------------------------------------
+
+SOURCE_LOCAL = "local"
+"""恢复来源：本地保留的热副本（零下载）。"""
+
+SOURCE_OBJECT = "object"
+"""恢复来源：从对象存储整份下载到临时目录。"""
 
 
 @dataclass(frozen=True)
@@ -792,6 +802,8 @@ class ObjectLoadReport:
     io_requests: int = 0
     unverified: tuple[str, ...] = ()
     unverified_bytes: int = 0
+    source: str = SOURCE_OBJECT
+    """数据从哪来：``"local"``（本地热副本，零下载）或 ``"object"``（下载）。"""
 
     @property
     def amplification(self) -> float:
@@ -841,12 +853,12 @@ def load_object_version(
         )
 
         local = LocalStorage(staging_root)
-        metadata_bytes = write_metadata(local, version.step, version.index)
+        metadata = write_metadata(local, version.step, version.index)
         write_commit(
             local,
-            CommitRecord(
+            CommitRecord.of_metadata(
                 step=version.step,
-                metadata_bytes=metadata_bytes,
+                metadata=metadata,
                 files=sizes,
             ),
         )
@@ -887,6 +899,187 @@ def load_object_version(
         shutil.rmtree(staging_root, ignore_errors=True)
 
 
+# --- 恢复：本地热副本优先，缺了再下载 --------------------------------------
+
+REUSABLE = "reusable"
+"""本地热副本可用：远端有版本 ``COMMIT``，本地索引也覆盖请求的布局。"""
+
+NO_LOCAL_COPY = "no_local_copy"
+"""本地没有这个版本的 ``step_N/COMMIT``：只能下载。"""
+
+REMOTE_NOT_COMMITTED = "remote_not_committed"
+"""远端没有这一代的版本 ``COMMIT``：本地这份可能是唯一副本，不能当热副本用。"""
+
+PARTIAL_LOCAL_COPY = "partial_local_copy"
+"""本地索引覆盖不全（多 rank 时每个 rank 只留自己的分片）或缺文件：回落到下载。"""
+
+
+@dataclass(frozen=True, slots=True)
+class LocalCopyCheck:
+    """本地热副本能不能顶替一次下载。``bool(check)`` 等于 ``usable``。"""
+
+    step: int | None
+    usable: bool
+    reason: str
+
+    def __bool__(self) -> bool:
+        return self.usable
+
+
+def check_local_copy(
+    local_root: str | Path | None,
+    remote: StorageBackend | None,
+    *,
+    step: int | None = None,
+    tp: int = 1,
+    tp_rank: int = 0,
+    shard_dims: Mapping[str, int] | None = None,
+    column_strategy: str = "whole",
+) -> LocalCopyCheck:
+    """判断本地是否留着一份「可以直接读」的热副本。
+
+    两个条件缺一不可：
+
+    1. **远端有这一代（同一 step）的版本 ``COMMIT``（L3）**：本地这份不是唯一副本，
+       读它是安全的，删了也能重下；
+    2. **本地 ``step_N/`` 带 ``COMMIT`` 且索引覆盖请求的布局**：多 rank 时每个 rank
+       的本地目录只有自己的分片，覆盖不全就必须回落下载。
+
+    这只是**判定**，不读数据、不校验 CRC。CRC 是 :func:`storage.local_load.load_local`
+    在读的时候做的 —— 本地介质真坏了应该报 :class:`core.ChecksumError`，而不是悄悄
+    重下掩盖问题；要强制走下载传 ``prefer_local=False``。
+
+    ``step=None`` 取远端最新的已提交版本。读远端 L3 失败（``StorageError``）会往上抛：
+    远端不可达时下载同样不可用，这里不把它伪装成「本地没有热副本」。
+    """
+    if local_root is None or remote is None:
+        return LocalCopyCheck(step, False, NO_LOCAL_COPY)
+
+    target = step if step is not None else latest_step(remote)
+    if target is None:
+        # 远端一个已提交版本都没有：调用方的下一步（下载）会给出同样的错误。
+        return LocalCopyCheck(None, False, REMOTE_NOT_COMMITTED)
+
+    local = LocalStorage(local_root, direct_io=False)
+    if read_commit(local, target) is None:
+        return LocalCopyCheck(target, False, NO_LOCAL_COPY)
+    # 远端 L3 是 UploadCommit 格式（记 ranks），不用 CommitRecord 解析，只确认存在。
+    try:
+        remote.read(commit_key(target))
+    except ObjectNotFoundError:
+        return LocalCopyCheck(target, False, REMOTE_NOT_COMMITTED)
+
+    try:
+        version = recover_version(local, target)
+    except (FormatError, PlanError):
+        # 本地这个版本读不出来（索引缺/坏、COMMIT 对不上、只有本 rank 的分片所以
+        # 全局覆盖校验不通过）：远端有完整版本，回落到下载。
+        return LocalCopyCheck(target, False, PARTIAL_LOCAL_COPY)
+
+    targets = targets_for_layout(
+        version.index, tp=tp, tp_rank=tp_rank, shard_dims=shard_dims
+    )
+    cover = build_load_plan(
+        version.index, targets, strict=False, column_strategy=column_strategy
+    )
+    if cover.missing or cover.incomplete:
+        return LocalCopyCheck(target, False, PARTIAL_LOCAL_COPY)
+    return LocalCopyCheck(target, True, REUSABLE)
+
+
+def load_checkpoint_version(
+    storage: StorageBackend,
+    *,
+    local_root: str | Path | None = None,
+    step: int | None = None,
+    device: "str | Device" = "cpu",
+    tp: int = 1,
+    tp_rank: int = 0,
+    shard_dims: Mapping[str, int] | None = None,
+    budget_bytes: int = DEFAULT_BUDGET_BYTES,
+    column_strategy: str = "whole",
+    verify_crc: bool = True,
+    crc_padding: str = "block",
+    crc_padding_ratio: float = 0.125,
+    io_concurrency: int = 1,
+    local_staging_dir: str | Path | None = None,
+    prefer_local: bool = True,
+) -> ObjectLoadReport:
+    """恢复一个版本：**本地热副本优先**，本地不满足条件再走下载。
+
+    ``local_root`` 是本地层 root（``step_N/`` 的父目录）。判定见
+    :func:`check_local_copy`：远端有这一代的版本 ``COMMIT`` + 本地目录带 ``COMMIT``
+    + 本地索引覆盖请求的布局，三者齐了就直接读本地（``report.source == "local"``、
+    ``download_bytes == 0``）；否则与 :func:`load_object_version` 完全一样地下载。
+
+    ``prefer_local=False`` 强制走下载。``local_root=None`` 等价于旧的
+    ``load_object_version``：只从对象存储恢复。
+    """
+    if prefer_local:
+        check = check_local_copy(
+            local_root,
+            storage,
+            step=step,
+            tp=tp,
+            tp_rank=tp_rank,
+            shard_dims=shard_dims,
+            column_strategy=column_strategy,
+        )
+        if check.usable and check.step is not None and local_root is not None:
+            report = load_local(
+                local_root,
+                step=check.step,
+                device=device,
+                tp=tp,
+                tp_rank=tp_rank,
+                shard_dims=shard_dims,
+                verify_crc=verify_crc,
+                crc_padding=crc_padding,
+                crc_padding_ratio=crc_padding_ratio,
+                budget_bytes=budget_bytes,
+                column_strategy=column_strategy,
+            )
+            return ObjectLoadReport(
+                step=report.step,
+                device=report.device,
+                tensors=report.tensors,
+                blobs=report.blobs,
+                index=report.index,
+                requests=report.requests,
+                windows=report.windows,
+                read_bytes=report.read_bytes,
+                copied_bytes=report.copied_bytes,
+                h2d_bytes=report.h2d_bytes,
+                download_bytes=0,
+                local_staging=None,
+                crc_verified=report.crc_verified,
+                verified_blocks=report.verified_blocks,
+                io_requests=report.io_requests,
+                unverified=report.unverified,
+                unverified_bytes=report.unverified_bytes,
+                source=SOURCE_LOCAL,
+            )
+
+    return replace(
+        load_object_version(
+            storage,
+            step=step,
+            device=device,
+            tp=tp,
+            tp_rank=tp_rank,
+            shard_dims=shard_dims,
+            budget_bytes=budget_bytes,
+            column_strategy=column_strategy,
+            verify_crc=verify_crc,
+            crc_padding=crc_padding,
+            crc_padding_ratio=crc_padding_ratio,
+            io_concurrency=io_concurrency,
+            local_staging_dir=local_staging_dir,
+        ),
+        source=SOURCE_OBJECT,
+    )
+
+
 def _version_files(index: CheckpointIndex) -> list[str]:
     """版本里需要下载的全部数据文件（分片与小状态可能共用一个文件）。"""
     files = {
@@ -920,14 +1113,23 @@ def _download_files(
 __all__ = [
     "DEFAULT_BUDGET_BYTES",
     "DEFAULT_KEEP_VERSIONS",
+    "LocalCopyCheck",
+    "NO_LOCAL_COPY",
     "ObjectLoadReport",
     "ObjectVersion",
+    "PARTIAL_LOCAL_COPY",
     "RankCommit",
+    "REMOTE_NOT_COMMITTED",
+    "REUSABLE",
+    "SOURCE_LOCAL",
+    "SOURCE_OBJECT",
     "UploadCommit",
+    "check_local_copy",
     "commit_key",
     "data_key",
     "finalize_upload",
     "index_key",
+    "load_checkpoint_version",
     "load_object_version",
     "open_object_version",
     "rank_commit_key",

@@ -8,6 +8,13 @@
 2. 存在比 N 更新的**版本** ``COMMIT`` ⇒ 训练已经越过第 N 代 ⇒ 本地 ``step_N/``
    （无论有没有本地 ``COMMIT``）与远端整个 ``step_N/`` 前缀都是残片，可以删。
 
+判据 1 有一个**例外：本地恢复层**（:data:`RECOVERY_COPY`）。最新
+``keep_local``（默认 1）个「远端已有版本 ``COMMIT`` 且本 rank 已上传」的本地版本不删：
+它是一份**热副本** —— 回退到这一代不用从对象存储重下，直接读本地
+（:func:`storage.upload.load_checkpoint_version`）。这份副本不承担唯一副本的责任，
+远端同一代有版本 ``COMMIT``，删了也不丢数据；反过来，远端还没有版本 ``COMMIT`` 的
+本地版本不进恢复层 —— 那一代在远端本来也还不可恢复。
+
 反过来，「最新且未完成」一律保留 —— 它可能就是**正在写**（本地）或**正在传**
 （远端）的那一代，所以不需要任何「写入者是否活着」的外部判断：
 
@@ -75,8 +82,14 @@ REMOTE_READ_ONLY = "remote_read_only"
 STALE_GENERATION = "stale_generation"
 """同一 step 下不在当前代际里的 ``step_N/<gen>/``：被取代的尝试，整代删。"""
 
+RECOVERY_COPY = "recovery_copy"
+"""本地保留的热恢复副本：远端已有这一代的版本 ``COMMIT``，本地不删、回退时直接读。"""
+
 DEFAULT_KEEP_VERSIONS = 3
 """对象存储侧有界保留的默认窗口：只留最新的这么多代已提交版本。"""
+
+DEFAULT_KEEP_LOCAL_VERSIONS = 1
+"""本地恢复层的默认窗口：保留最近这么多个「远端已提交且本 rank 已上传」的本地版本。"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,6 +131,14 @@ class GcPlan:
     def reasons(self) -> Mapping[tuple[str, int], str]:
         return {(c.location, c.step): c.reason for c in self.candidates}
 
+    def recovery_steps(self) -> tuple[int, ...]:
+        """留在本地当热副本的 step（``RECOVERY_COPY``），升序。"""
+        return tuple(
+            step
+            for location, step, reason in self.kept
+            if location == LOCAL and reason == RECOVERY_COPY
+        )
+
 
 def plan(
     *,
@@ -129,6 +150,7 @@ def plan(
     generations: Mapping[int, Iterable[str]] | None = None,
     current_generations: Mapping[int, str | None] | None = None,
     unknown_versions: Iterable[int] = (),
+    keep_local: int = DEFAULT_KEEP_LOCAL_VERSIONS,
 ) -> GcPlan:
     """决定删哪些版本。**纯函数**：不碰 IO、不看时间、不看进程状态。
 
@@ -140,13 +162,17 @@ def plan(
     ``generations``:       ``step -> {generation}``：远端出现过的代际前缀
     ``current_generations``: ``step -> 当前代际``（从 L3 读出来；v1 是 ``None``）
     ``unknown_versions``:  读不出来的 L3 对应的 step：**一律保留**，不猜当前代
+    ``keep_local``:        本地恢复层窗口：保留最近这么多个「远端已提交且本 rank 已上传」
+                           的本地版本作为热副本（``0`` = 上传完即删，老行为）
 
     三条判据互不重叠：
 
-    1. 本地已上传 / 被更新版本越过 → 删本地目录；
+    1. 本地已上传 / 被更新版本越过 → 删本地目录（恢复层窗口内的除外）；
     2. 远端无 L3 且被更新版本越过 → 删整个 step 前缀；
     3. 远端有 L3 但不是当前代际（或没有 L3 且不是最大代）→ 只删这一代前缀。
     """
+    if keep_local < 0:
+        raise ValueError(f"keep_local must be >= 0, got {keep_local}")
     known = frozenset(int(step) for step in versions)
     newest = max(known) if known else None
     current = {int(step): gen for step, gen in (current_generations or {}).items()}
@@ -166,6 +192,17 @@ def plan(
     all_prefixes = {int(step) for step in prefixes}
     local = {int(step) for step in local_steps}
 
+    # 恢复层：远端可恢复（有 L3、且 L3 读得出来）+ 本 rank 已上传，取最近的几个。
+    # 只有这两个条件同时成立时，本地这份才「不是唯一副本」，删了也不丢东西。
+    reusable = sorted(
+        step
+        for step in local
+        if int(rank) in by_step.get(step, set())
+        and step in known
+        and step not in unknown
+    )
+    recovery = frozenset(reusable[-keep_local:]) if keep_local else frozenset()
+
     def superseded(step: int) -> bool:
         return newest is not None and newest > step
 
@@ -173,7 +210,9 @@ def plan(
     kept: list[tuple[str, int, str]] = []
 
     for step in sorted(local):
-        if int(rank) in by_step.get(step, set()):
+        if step in recovery:
+            kept.append((LOCAL, step, RECOVERY_COPY))
+        elif int(rank) in by_step.get(step, set()):
             candidates.append(GcCandidate(LOCAL, step, UPLOADED))
         elif superseded(step):
             candidates.append(GcCandidate(LOCAL, step, SUPERSEDED))
@@ -268,6 +307,14 @@ class GcReport:
 
     def steps_for(self, location: str) -> tuple[int, ...]:
         return tuple(item.step for item in self.deleted if item.location == location)
+
+    def recovery_steps(self) -> tuple[int, ...]:
+        """留在本地当热副本的 step（``RECOVERY_COPY``），升序。"""
+        return tuple(
+            step
+            for location, step, reason in self.skipped
+            if location == LOCAL and reason == RECOVERY_COPY
+        )
 
 
 def delete_local_version(root: str | Path, step: int) -> DeletedVersion:
@@ -467,10 +514,15 @@ def collect(
     *,
     rank: int,
     dry_run: bool = True,
+    keep_local: int = DEFAULT_KEEP_LOCAL_VERSIONS,
 ) -> GcReport:
     """跑一次回收：一次 ``list`` + 一次目录扫描 + 按 :func:`plan` 的决策删除。
 
     ``dry_run=True``（默认）只给出计划，不动任何文件。
+
+    ``keep_local`` 是本地恢复层窗口（默认 1）：最近这么多个「远端已提交且本 rank
+    已上传」的本地版本留在本地当热副本，回退时直接读，其余照旧回收；``0`` 回到
+    「上传完即删」。
 
     ``remote`` 不可达时**什么都不删**：本地判据依赖远端状态，「查不到」不能当成
     「可以删」。这种情况在 ``GcReport.aborted`` 里记原因，定时线程不会因此崩掉。
@@ -518,6 +570,7 @@ def collect(
         generations=layout.generations,
         current_generations=current,
         unknown_versions=unknown,
+        keep_local=keep_local,
     )
 
     deleted: list[DeletedVersion] = []
@@ -666,7 +719,8 @@ class GcWorker:
 
     它**不做有界保留**：裁剪「完整但过旧」的版本需要一个明确锚点（「刚提交完一代」），
     由 rank 0 在 :func:`storage.upload.finalize_upload` 里调
-    :func:`retain_remote_versions`，不放进周期线程。
+    :func:`retain_remote_versions`，不放进周期线程。**本地恢复层**（``keep_local``）
+    不是这种保留：它随每次 :func:`collect` 生效，判据是纯函数。
     """
 
     def __init__(
@@ -678,6 +732,7 @@ class GcWorker:
         interval: float = 60.0,
         dry_run: bool = False,
         history: int = 8,
+        keep_local: int = DEFAULT_KEEP_LOCAL_VERSIONS,
     ) -> None:
         if interval <= 0:
             raise ValueError(f"interval must be > 0, got {interval}")
@@ -686,6 +741,7 @@ class GcWorker:
         self.rank = int(rank)
         self.interval = float(interval)
         self.dry_run = dry_run
+        self.keep_local = int(keep_local)
         self.history = max(1, int(history))
         self.reports: list[GcReport] = []
         self.last_error: str | None = None
@@ -700,7 +756,13 @@ class GcWorker:
 
     def run_once(self) -> GcReport:
         """跑一次回收（不启线程时也可以直接调）。"""
-        report = collect(self.local_root, self.remote, rank=self.rank, dry_run=self.dry_run)
+        report = collect(
+            self.local_root,
+            self.remote,
+            rank=self.rank,
+            dry_run=self.dry_run,
+            keep_local=self.keep_local,
+        )
         self.reports.append(report)
         del self.reports[: -self.history]
         return report
@@ -740,6 +802,7 @@ class GcWorker:
 
 __all__ = [
     "COMMITTED",
+    "DEFAULT_KEEP_LOCAL_VERSIONS",
     "DEFAULT_KEEP_VERSIONS",
     "DeletedVersion",
     "GcCandidate",
@@ -749,6 +812,7 @@ __all__ = [
     "LOCAL",
     "NOT_UPLOADED",
     "NO_NEWER_VERSION",
+    "RECOVERY_COPY",
     "REMOTE",
     "REMOTE_READ_ONLY",
     "RETENTION",
