@@ -11,6 +11,9 @@
 - 对象级校验和：PUT / upload_part 带 ``x-amz-checksum-*`` 时**真的重算并比对**，
   不匹配回 400 ``BadDigest``；GET 带 ``x-amz-checksum-mode: ENABLED`` 时回传
   服务端记录的值（所以把 ``store.objects`` 里的内容改掉就能模拟静默损坏）
+- 条件写：PUT 与 ``CompleteMultipartUpload`` 求值 ``If-Match`` / ``If-None-Match``
+  （412 / 404 / 409 语义对齐 AWS S3），DELETE 只认 ``If-Match``；
+  ``ignore_conditional_headers`` 可以模拟「接受条件头但根本不执行」的端点
 
 不校验签名，不分页（对象数远小于 1000），也不校验分片大小。响应格式对齐 S3，
 boto3 能直接解析；``ObjectStore.requests`` 记录请求流水，供测试断言走的哪条路径。
@@ -87,10 +90,30 @@ class ObjectStore:
         self.checksum_headers: list[tuple[str, str, str]] = []
         # 测试注入：打开后不带校验和头的 PUT 直接 400，用来证明客户端确实在发
         self.require_checksum = False
+        # 条件写请求流水：(method, path, {条件头})。requests 是三元的、被既有用例
+        # 按位置解包，所以条件头单独记，不动原来的形状。
+        self.conditional_requests: list[tuple[str, str, dict[str, str]]] = []
+        # 测试注入：打开后完全忽略 If-Match / If-None-Match（模拟不执行条件写的端点）
+        self.ignore_conditional_headers = False
+        # 测试注入：接下来 N 次 CompleteMultipartUpload 返回 409 ConditionalRequestConflict，
+        # 且这次上传被服务端判死（客户端必须重新 CreateMultipartUpload）
+        self.fail_complete_times = 0
 
 
 def _etag(payload: bytes) -> str:
     return '"' + hashlib.md5(payload).hexdigest() + '"'
+
+
+def _etag_in(header: str, etag: str) -> bool:
+    """条件头里是否包含这个 ETag：支持逗号列表、``*`` 与带/不带引号。"""
+    target = etag.strip().strip('"')
+    for item in header.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if item == "*" or item.strip('"') == target:
+            return True
+    return False
 
 
 def _make_handler(store: ObjectStore) -> type[BaseHTTPRequestHandler]:
@@ -138,6 +161,12 @@ def _make_handler(store: ObjectStore) -> type[BaseHTTPRequestHandler]:
                 return
 
             payload = self.rfile.read(length) if length else b""
+            with store.lock:
+                existing = store.objects.get(key)
+            if self._precondition_failed(
+                key, _etag(existing) if existing is not None else None
+            ):
+                return
             if not self._verify_checksum(key, payload, required=store.require_checksum):
                 return
             with store.lock:
@@ -202,6 +231,20 @@ def _make_handler(store: ObjectStore) -> type[BaseHTTPRequestHandler]:
                     store.uploads.pop(query["uploadId"][0], None)
                 self._send(204, b"")
                 return
+            if_match = self.headers.get("If-Match")
+            with store.lock:
+                existing = store.objects.get(key)
+                if if_match is not None and not store.ignore_conditional_headers:
+                    store.conditional_requests.append(
+                        ("DELETE", unquote(urlparse(self.path).path), {"If-Match": if_match})
+                    )
+            if if_match is not None and not store.ignore_conditional_headers:
+                if existing is None:
+                    self._error(404, "NoSuchKey", key)
+                    return
+                if not _etag_in(if_match, _etag(existing)):
+                    self._error(412, "PreconditionFailed", f"{key}: If-Match not satisfied")
+                    return
             with store.lock:
                 store.objects.pop(key, None)
             self._send(204, b"")
@@ -211,6 +254,45 @@ def _make_handler(store: ObjectStore) -> type[BaseHTTPRequestHandler]:
             path = urlparse(self.path).path.lstrip("/")
             bucket, _, key = path.partition("/")
             return unquote(bucket), unquote(key)
+
+        def _precondition_failed(self, key: str, existing_etag: str | None) -> bool:
+            """按 RFC 7232 求值 ``If-Match`` / ``If-None-Match``；不满足时已回错误。
+
+            ``If-None-Match: *`` 的语义是「只有对象不存在才通过」；精确 ETag 列表则是
+            「当前 ETag 不在列表里才通过」。``If-Match`` 缺对象回 404、ETag 不符回 412
+            —— 与 AWS S3 的 conditional writes 文档一致。
+            """
+            if store.ignore_conditional_headers:
+                return False
+            headers = {
+                name: self.headers[name]
+                for name in ("If-Match", "If-None-Match")
+                if self.headers.get(name) is not None
+            }
+            if headers:
+                with store.lock:
+                    store.conditional_requests.append(
+                        (self.command, unquote(urlparse(self.path).path), headers)
+                    )
+            if_none_match = headers.get("If-None-Match")
+            if if_none_match is not None and existing_etag is not None:
+                matched = (
+                    True
+                    if if_none_match.strip() == "*"
+                    else _etag_in(if_none_match, existing_etag)
+                )
+                if matched:
+                    self._error(412, "PreconditionFailed", f"{key}: If-None-Match not satisfied")
+                    return True
+            if_match = headers.get("If-Match")
+            if if_match is not None:
+                if existing_etag is None:
+                    self._error(404, "NoSuchKey", key)
+                    return True
+                if not _etag_in(if_match, existing_etag):
+                    self._error(412, "PreconditionFailed", f"{key}: If-Match not satisfied")
+                    return True
+            return False
 
         def _create_multipart(self, key: str) -> None:
             upload_id = uuid.uuid4().hex
@@ -284,6 +366,24 @@ def _make_handler(store: ObjectStore) -> type[BaseHTTPRequestHandler]:
             length = int(self.headers.get("Content-Length") or 0)
             if length:
                 self.rfile.read(length)  # body 里的 Part 列表不校验，按 partNumber 排序合并
+
+            # 注入的 409：条件写与并发删除撞上，服务端把这次 MPU 判死
+            if store.fail_complete_times > 0:
+                with store.lock:
+                    store.fail_complete_times -= 1
+                    store.uploads.pop(upload_id, None)
+                self._error(409, "ConditionalRequestConflict", "injected conditional conflict")
+                return
+
+            with store.lock:
+                existing = store.objects.get(key)
+            if self._precondition_failed(
+                key, _etag(existing) if existing is not None else None
+            ):
+                with store.lock:
+                    store.uploads.pop(upload_id, None)
+                return
+
             with store.lock:
                 parts = store.uploads.pop(upload_id, None)
                 payload = b""

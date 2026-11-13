@@ -21,20 +21,40 @@ PUT / multipart 带 ``ChecksumAlgorithm``（默认 ``CRC32``），服务端独�
 不匹配回 400 ``BadDigest``；整对象 GET / 下载带 ``ChecksumMode=ENABLED`` 让
 botocore 回验返回值。不认识 ``x-amz-checksum-*`` 的端点把
 ``S3Config.checksum_algorithm`` 设成 ``None`` 即可退回旧行为。
+
+**条件写**是写路径的硬前置（对象存储端的代际与 fence 依赖它）：``put_if_absent``
+走 ``If-None-Match: *``，``put_if_match`` 走 ``If-Match: <etag>``，两者都由服务端
+原子判定，``412 PreconditionFailed`` 即「我没赢」。大对象的条件挂在
+``CompleteMultipartUpload`` 上 —— ``CreateMultipartUpload`` / ``UploadPart`` 在 AWS
+上不接受条件头，所以「分片上传」与「条件可见化」是同一条路径的两半。
+
+``S3Config.conditional_writes="off"`` 把这条连接降成**只读**端点：read / range /
+download / head / list 照常，任何写动作（含 ``write`` / ``delete``）直接抛
+:class:`storage.base.ConditionalWritesDisabled`。不做「无 CAS 的单写者写入」——
+那条路径的 fence 是静默失效的。
 """
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Iterable, Iterator
 from urllib.parse import urlparse
 
 import boto3
 from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 
-from storage.base import ObjectNotFoundError, StorageBackend, StorageError
+from storage.base import (
+    ConditionalWritesDisabled,
+    ObjectMeta,
+    ObjectNotFoundError,
+    StorageBackend,
+    StorageError,
+    UnsupportedConditionalWrites,
+    WriteOutcome,
+)
 
 # boto3 的 S3 client；不引入 mypy_boto3_s3 之类的额外类型依赖。
 S3Client = Any
@@ -76,6 +96,19 @@ GET 带 ``ChecksumMode=ENABLED`` 让 SDK 回验返回值。
 SUPPORTED_CHECKSUM_ALGORITHMS = frozenset({"CRC32", "CRC32C", "SHA1", "SHA256"})
 """S3 认的校验和算法。"""
 
+CONDITIONAL_WRITE_MODES = frozenset({"require", "off"})
+"""条件写模式。
+
+- ``require``（默认）：写路径必须走 CAS；首次使用时跑端点探针（见
+  :meth:`S3Storage.ensure_conditional_writes`），探针不过就拒绝启动写入。
+- ``off``：端点降为**只读**。read / range / download / head / list 照常，
+  所有写动作抛 :class:`storage.base.ConditionalWritesDisabled`。
+"""
+
+PROBE_PREFIX = "._ckpt_probe"
+"""端点探针写的一次性 key 前缀。远离 ``step_N/``，GC 的扫描不会把它当版本。"""
+
+
 # 对象不存在时 S3 可能用这几种 Code / 状态码，统一映射到 ObjectNotFoundError。
 _NOT_FOUND_CODES = frozenset({"NoSuchKey", "NoSuchBucket", "NotFound", "404"})
 
@@ -102,10 +135,17 @@ class S3Config:
     # 上传/回读附带的对象级校验和算法；None 表示这条连接不带校验头。
     # 老版本 SeaweedFS 之类不认识 x-amz-checksum-* 的端点需要显式设成 None。
     checksum_algorithm: str | None = DEFAULT_CHECKSUM_ALGORITHM
+    # 条件写模式：require 要 CAS（写路径硬前置）；off 把端点降成只读。
+    conditional_writes: str = "require"
 
     def __post_init__(self) -> None:
         if not self.bucket:
             raise ValueError("bucket is required")
+        if self.conditional_writes not in CONDITIONAL_WRITE_MODES:
+            raise ValueError(
+                f"unsupported conditional_writes {self.conditional_writes!r}, "
+                f"expected one of {sorted(CONDITIONAL_WRITE_MODES)}"
+            )
         if self.multipart_threshold <= 0:
             raise ValueError(
                 f"multipart_threshold must be > 0, got {self.multipart_threshold}"
@@ -197,6 +237,65 @@ def _join(prefix: str, key: str) -> str:
     return f"{prefix}/{key}" if prefix else key
 
 
+def _condition_failure(exc: ClientError) -> str | None:
+    """条件是**没满足**还是别的问题。
+
+    返回 ``"precondition"``（412）、``"notfound"``（404，``If-Match`` 且对象不存在）
+    或 ``None``（真正的错误，交给 :func:`_translate`）。
+    """
+    error = exc.response.get("Error", {})
+    code = str(error.get("Code", ""))
+    status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+    if status == 412 or code == "PreconditionFailed":
+        return "precondition"
+    if status == 404 or code in _NOT_FOUND_CODES:
+        return "notfound"
+    return None
+
+
+def _is_conditional_conflict(exc: ClientError) -> bool:
+    """409 ``ConditionalRequestConflict``：条件写与并发删除撞上。
+
+    普通 PUT 可以直接重试；**multipart 必须重新 ``CreateMultipartUpload``** ——
+    服务端已经把这次上传判死（``docs/generation.md`` 的失败模式矩阵）。
+    """
+    error = exc.response.get("Error", {})
+    code = str(error.get("Code", ""))
+    status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+    return status == 409 or code == "ConditionalRequestConflict"
+
+
+def _payload_chunks(payload: bytes, part_size: int) -> Iterator[bytes]:
+    for start in range(0, len(payload), part_size):
+        yield payload[start : start + part_size]
+
+
+def _file_chunks(path: Path, part_size: int) -> Iterator[bytes]:
+    """按 ``part_size`` 流式读文件：峰值内存是一个分片，不是整个 checkpoint。"""
+    with path.open("rb") as fh:
+        while True:
+            chunk = fh.read(part_size)
+            if not chunk:
+                return
+            yield chunk
+
+
+
+@dataclass(frozen=True, slots=True)
+class ConditionalProbe:
+    """端点能力探针的结果。
+
+    ``checks`` 是 ``(步骤名, 实际返回)`` 的流水，失败时直接打进异常信息 ——
+    「端点不支持」和「端点响应异常」是两类完全不同的运维问题，不能只说一句
+    "unsupported"。
+    """
+
+    supported: bool
+    endpoint: str
+    checks: tuple[tuple[str, str], ...] = ()
+    detail: str = ""
+
+
 class S3Storage(StorageBackend):
     """S3 兼容对象存储上的 checkpoint 根位置。
 
@@ -206,6 +305,7 @@ class S3Storage(StorageBackend):
     def __init__(self, config: S3Config, *, client: "S3Client | None" = None) -> None:
         self._config = config
         self._client = client if client is not None else _make_client(config)
+        self._probe: ConditionalProbe | None = None
 
     @classmethod
     def from_url(cls, url: str, **overrides: object) -> "S3Storage":
@@ -219,9 +319,15 @@ class S3Storage(StorageBackend):
     def client(self) -> "S3Client":
         return self._client
 
+    @property
+    def supports_conditional_writes(self) -> bool:
+        """``conditional_writes="off"`` 的端点是只读的：没有任何写路径。"""
+        return self._config.conditional_writes != "off"
+
     def object_key(self, key: str) -> str:
         """相对 key -> bucket 里的完整对象 key。"""
         return _join(self._config.prefix, _normalize_key(key))
+
 
     def _checksum_kwargs(self) -> dict[str, str]:
         """上传时附带对象级校验和：服务端独立重算并比对，不匹配回 400 ``BadDigest``。"""
@@ -236,6 +342,29 @@ class S3Storage(StorageBackend):
         """
         return {"ChecksumMode": "ENABLED"} if self._config.checksum_algorithm else {}
 
+    def _ensure_writable(self) -> None:
+        """只读端点在这里统一失败：不存在「无 CAS 的写入」这条降级路径。"""
+        if not self.supports_conditional_writes:
+            raise ConditionalWritesDisabled(
+                f"{self._config.url}: conditional_writes=off 是只读端点，"
+                "写路径要求 S3 conditional writes（If-None-Match / If-Match）"
+            )
+
+    def _condition_kwargs(
+        self, *, if_none_match: bool = False, if_match: str | None = None
+    ) -> dict[str, str]:
+        """把条件翻译成 boto3 的参数名。两个条件是互斥的（RFC 7232）。"""
+        self._ensure_writable()
+        if if_none_match and if_match is not None:
+            raise ValueError("If-None-Match 与 If-Match 不能同时给")
+        if if_none_match:
+            return {"IfNoneMatch": "*"}
+        if if_match is not None:
+            if not if_match:
+                raise ValueError("if_match must be a non-empty ETag")
+            return {"IfMatch": if_match}
+        return {}
+
     def close(self) -> None:
         close = getattr(self._client, "close", None)
         if callable(close):
@@ -243,14 +372,18 @@ class S3Storage(StorageBackend):
 
     # --- 写 -----------------------------------------------------------------
     def write(self, key: str, data: bytes) -> None:
+        self._ensure_writable()
         if not isinstance(data, (bytes, bytearray, memoryview)):
             raise TypeError(f"data must be bytes-like, got {type(data).__name__}")
         object_key = self.object_key(key)
         payload = bytes(data)
-        if len(payload) > self._config.multipart_threshold:
-            self._write_multipart(object_key, payload)
-            return
         try:
+            if len(payload) > self._config.multipart_threshold:
+                self._write_multipart(
+                    object_key,
+                    lambda: _payload_chunks(payload, self._config.part_size),
+                )
+                return
             self._client.put_object(
                 Bucket=self._config.bucket,
                 Key=object_key,
@@ -262,9 +395,156 @@ class S3Storage(StorageBackend):
         except BotoCoreError as exc:
             raise StorageError(f"{object_key}: {exc}") from exc
 
-    def _write_multipart(self, object_key: str, payload: bytes) -> None:
-        """create → upload_part × N → complete；任何一步失败都 abort 掉本次上传。"""
-        part_size = self._config.part_size
+    # --- 条件写（CAS）-------------------------------------------------------
+    def put_if_absent(self, key: str, data: bytes) -> WriteOutcome:
+        """``If-None-Match: *``：只有 key 不存在时才写入。"""
+        return self._conditional_write(key, data, if_none_match=True)
+
+    def put_if_match(self, key: str, data: bytes, etag: str) -> WriteOutcome:
+        """``If-Match: <etag>``：只有当前 ETag 仍是这个值时才替换。"""
+        return self._conditional_write(key, data, if_match=etag)
+
+    def head(self, key: str) -> ObjectMeta | None:
+        """取 ETag 与大小；对象不存在返回 ``None``（不是抛错）。"""
+        object_key = self.object_key(key)
+        try:
+            response = self._client.head_object(
+                Bucket=self._config.bucket, Key=object_key
+            )
+        except ClientError as exc:
+            if _condition_failure(exc) == "notfound":
+                return None
+            raise _translate(exc, object_key) from exc
+        except BotoCoreError as exc:
+            raise StorageError(f"{object_key}: {exc}") from exc
+        return ObjectMeta(
+            key=key,
+            etag=str(response.get("ETag", "")),
+            size=int(response.get("ContentLength", 0)),
+        )
+
+    def write_file(
+        self,
+        key: str,
+        path: "str | Path",
+        *,
+        if_none_match: bool = False,
+        if_match: str | None = None,
+    ) -> WriteOutcome:
+        """从本地文件写入；超过阈值走流式分片，条件挂在 complete 上。
+
+        「分片上传」与「条件可见化」是同一条路径：``UploadPart`` 不接受条件头，
+        所以整个对象在 ``CompleteMultipartUpload`` 落地那一刻才参与 CAS，这也正是
+        「同一 key 只有一个写者能把它变成可见对象」的判定点。
+        """
+        object_key = self.object_key(key)
+        target = Path(path)
+        condition = self._condition_kwargs(if_none_match=if_none_match, if_match=if_match)
+        size = target.stat().st_size
+        try:
+            if size > self._config.multipart_threshold:
+                self._write_multipart(
+                    object_key,
+                    lambda: _file_chunks(target, self._config.part_size),
+                    condition=condition,
+                )
+            else:
+                self._client.put_object(
+                    Bucket=self._config.bucket,
+                    Key=object_key,
+                    Body=target.read_bytes(),
+                    **self._checksum_kwargs(),
+                    **condition,
+                )
+        except ClientError as exc:
+            outcome = self._write_failure(exc, if_none_match=if_none_match)
+            if outcome is not None:
+                return outcome
+            raise _translate(exc, object_key) from exc
+        except BotoCoreError as exc:
+            raise StorageError(f"{object_key}: {exc}") from exc
+        return WriteOutcome.CREATED if if_none_match else WriteOutcome.SWAPPED
+
+    def _conditional_write(
+        self,
+        key: str,
+        data: bytes,
+        *,
+        if_none_match: bool = False,
+        if_match: str | None = None,
+    ) -> WriteOutcome:
+        if not isinstance(data, (bytes, bytearray, memoryview)):
+            raise TypeError(f"data must be bytes-like, got {type(data).__name__}")
+        object_key = self.object_key(key)
+        payload = bytes(data)
+        condition = self._condition_kwargs(if_none_match=if_none_match, if_match=if_match)
+        try:
+            if len(payload) > self._config.multipart_threshold:
+                self._write_multipart(
+                    object_key,
+                    lambda: _payload_chunks(payload, self._config.part_size),
+                    condition=condition,
+                )
+            else:
+                self._client.put_object(
+                    Bucket=self._config.bucket,
+                    Key=object_key,
+                    Body=payload,
+                    **self._checksum_kwargs(),
+                    **condition,
+                )
+        except ClientError as exc:
+            outcome = self._write_failure(exc, if_none_match=if_none_match)
+            if outcome is not None:
+                return outcome
+            raise _translate(exc, object_key) from exc
+        except BotoCoreError as exc:
+            raise StorageError(f"{object_key}: {exc}") from exc
+        return WriteOutcome.CREATED if if_none_match else WriteOutcome.SWAPPED
+
+    @staticmethod
+    def _write_failure(exc: ClientError, *, if_none_match: bool) -> WriteOutcome | None:
+        """条件没满足 → 结构化的 outcome；其它错误返回 ``None`` 交给 ``_translate``。"""
+        kind = _condition_failure(exc)
+        if kind == "precondition":
+            return WriteOutcome.EXISTS if if_none_match else WriteOutcome.CONFLICT
+        if kind == "notfound":
+            return WriteOutcome.GONE
+        return None
+
+    def _write_multipart(
+        self,
+        object_key: str,
+        chunk_source: Callable[[], Iterable[bytes]],
+        *,
+        condition: dict[str, str] | None = None,
+    ) -> None:
+        """create → upload_part × N → complete；任何一步失败都 abort 掉本次上传。
+
+        ``chunk_source`` 每次调用都应产出一份完整的分片序列（内存块或重新打开
+        的文件句柄）：409 重开 MPU 时要能从头再读一遍，峰值内存只有一片；
+        ``condition`` 只作用在 ``complete`` 上 —— 条件写与分片上传的唯一交点是
+        「对象可见」那一刻。
+
+        409 ``ConditionalRequestConflict``（条件写与并发删除撞上）时整条 MPU 已被
+        服务端判死，必须重新 ``CreateMultipartUpload``，所以这里重开一次。
+        """
+        condition = dict(condition or {})
+        try:
+            self._write_multipart_once(object_key, chunk_source(), condition)
+        except ClientError as exc:
+            if not _is_conditional_conflict(exc):
+                raise
+            # 409：这次 MPU 已被服务端判死，必须重新 create —— 分片来源重新构造，
+            # 所以它是 Callable 而不是一次性生成器。
+            self._write_multipart_once(object_key, chunk_source(), condition)
+
+    def _write_multipart_once(
+        self,
+        object_key: str,
+        chunks: Iterable[bytes],
+        condition: dict[str, str],
+    ) -> None:
         try:
             upload_id = self._client.create_multipart_upload(
                 Bucket=self._config.bucket, Key=object_key, **self._checksum_kwargs()
@@ -276,8 +556,7 @@ class S3Storage(StorageBackend):
 
         try:
             parts: list[dict[str, Any]] = []
-            for number, start in enumerate(range(0, len(payload), part_size), start=1):
-                chunk = payload[start : start + part_size]
+            for number, chunk in enumerate(chunks, start=1):
                 response = self._client.upload_part(
                     Bucket=self._config.bucket,
                     Key=object_key,
@@ -293,10 +572,11 @@ class S3Storage(StorageBackend):
                 Key=object_key,
                 UploadId=upload_id,
                 MultipartUpload={"Parts": parts},
+                **condition,
             )
-        except ClientError as exc:
+        except ClientError:
             self._abort_multipart(object_key, upload_id)
-            raise _translate(exc, object_key) from exc
+            raise
         except BotoCoreError as exc:
             self._abort_multipart(object_key, upload_id)
             raise StorageError(f"{object_key}: {exc}") from exc
@@ -314,8 +594,110 @@ class S3Storage(StorageBackend):
         except (ClientError, BotoCoreError):
             pass
 
+    # --- 端点能力探针 -------------------------------------------------------
+    def probe_conditional_writes(self) -> ConditionalProbe:
+        """在一次性 key 上验证「条件真的被服务端执行了」。
+
+        四个检查各自对应一条协议前提，任何一条不成立都说明 fence 会静默失效：
+
+        1. 首写 ``If-None-Match: *`` → ``CREATED``
+        2. 重写同一 key → ``EXISTS``，且**读回的内容没变**（防「接受条件但仍覆盖」）
+        3. ``If-Match`` 用过期的 ETag → ``CONFLICT``
+        4. ``If-Match`` 用当前 ETag → ``SWAPPED``，且内容确实换了
+
+        不抛异常：结果放在 :class:`ConditionalProbe` 里，由
+        :meth:`ensure_conditional_writes` 决定是否升级成错误 —— 探针本身也要能被
+        测试直接断言。
+        """
+        endpoint = self._config.endpoint_url or self._config.url
+        if not self.supports_conditional_writes:
+            return ConditionalProbe(
+                supported=False,
+                endpoint=endpoint,
+                detail="conditional_writes=off：只读端点，不运行探针",
+            )
+
+        key = f"{PROBE_PREFIX}/{uuid.uuid4().hex}"
+        checks: list[tuple[str, str]] = []
+
+        def verdict(ok: bool, detail: str = "") -> ConditionalProbe:
+            return ConditionalProbe(
+                supported=ok, endpoint=endpoint, checks=tuple(checks), detail=detail
+            )
+
+        try:
+            first = self.put_if_absent(key, b"probe-v1")
+            checks.append(("put_if_absent/first", first.value))
+            if first is not WriteOutcome.CREATED:
+                return verdict(False, f"首次 If-None-Match 写入返回 {first.value}，期望 created")
+
+            second = self.put_if_absent(key, b"probe-v2")
+            checks.append(("put_if_absent/second", second.value))
+            if second is not WriteOutcome.EXISTS:
+                return verdict(
+                    False,
+                    f"同一 key 的第二次 If-None-Match 写入返回 {second.value}，期望 exists："
+                    "端点没有执行 If-None-Match（或 If-None-Match: * 未被支持）",
+                )
+            if self.read(key) != b"probe-v1":
+                return verdict(False, "If-None-Match 返回 exists，但对象内容被覆盖了")
+
+            meta = self.head(key)
+            checks.append(("head", "missing" if meta is None else f"etag={meta.etag}"))
+            if meta is None or not meta.etag:
+                return verdict(False, "HEAD 拿不到 ETag：无法用 If-Match 做 CAS")
+
+            stale_etag = '"00000000000000000000000000000000"'
+            stale = self.put_if_match(key, b"probe-v3", stale_etag)
+            checks.append(("put_if_match/stale", stale.value))
+            if stale is not WriteOutcome.CONFLICT:
+                return verdict(
+                    False,
+                    f"过期 ETag 的 If-Match 写入返回 {stale.value}，期望 conflict："
+                    "端点没有执行 If-Match，CAS 会静默失效",
+                )
+            if self.read(key) != b"probe-v1":
+                return verdict(False, "If-Match 失败却改动了对象内容")
+
+            fresh = self.put_if_match(key, b"probe-v3", meta.etag)
+            checks.append(("put_if_match/current", fresh.value))
+            if fresh is not WriteOutcome.SWAPPED:
+                return verdict(False, f"当前 ETag 的 If-Match 写入返回 {fresh.value}，期望 swapped")
+            if self.read(key) != b"probe-v3":
+                return verdict(False, "If-Match 返回 swapped，但内容没有换")
+            return verdict(True)
+        finally:
+            self._drop_probe_object(key)
+
+    def ensure_conditional_writes(self) -> ConditionalProbe:
+        """写路径的前置检查：探针不过就拒绝写入（不降级）。"""
+        if not self.supports_conditional_writes:
+            raise ConditionalWritesDisabled(
+                f"{self._config.url}: conditional_writes=off 是只读端点，"
+                "写路径要求 S3 conditional writes（If-None-Match / If-Match）"
+            )
+        if self._probe is None:
+            self._probe = self.probe_conditional_writes()
+        if not self._probe.supported:
+            detail = self._probe.detail or "条件没有被端点执行"
+            checks = ", ".join(f"{name}={value}" for name, value in self._probe.checks)
+            raise UnsupportedConditionalWrites(
+                f"{self._probe.endpoint}: 不支持条件写（{detail}）；探针流水：{checks}"
+            )
+        return self._probe
+
+    def _drop_probe_object(self, key: str) -> None:
+        """删掉探针对象；清理失败不影响结论（它在 ``._ckpt_probe/`` 下，不参与恢复）。"""
+        try:
+            self._client.delete_object(
+                Bucket=self._config.bucket, Key=self.object_key(key)
+            )
+        except (ClientError, BotoCoreError):
+            pass
+
     def rename_or_put(self, src: str, dst: str) -> None:
         """对象存储没有 rename：超过 5 GiB 走 UploadPartCopy，否则 copy_object。"""
+        self._ensure_writable()
         if src == dst:
             return
         src_key = self.object_key(src)
@@ -410,6 +792,7 @@ class S3Storage(StorageBackend):
             raise
 
     def delete(self, key: str) -> None:
+        self._ensure_writable()
         object_key = self.object_key(key)
         try:
             self._client.delete_object(Bucket=self._config.bucket, Key=object_key)
@@ -523,7 +906,10 @@ class S3Storage(StorageBackend):
 
 
 __all__ = [
+    "CONDITIONAL_WRITE_MODES",
+    "ConditionalProbe",
     "DEFAULT_CHECKSUM_ALGORITHM",
+    "PROBE_PREFIX",
     "SUPPORTED_CHECKSUM_ALGORITHMS",
     "S3Config",
     "S3Storage",
