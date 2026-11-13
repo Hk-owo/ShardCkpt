@@ -1,18 +1,19 @@
 """GC 判据的纯函数测试：不碰 IO、不看时间、不看进程状态。
 
-判据只有一条不变量（step 单调推进）推导出的两条规则：
+判据只有一条不变量（step 单调推进）推导出的三条规则：
 
 1. 本 rank 的分片提交点（L2）在远端 ⇒ 本地 ``step_N/`` 是冗余副本；
-2. 存在更新的版本提交点（L3）⇒ 这一代是残片。
+2. 存在更新的版本提交点（L3）⇒ 这一代是残片；
+3. 同一个 step 下不在当前代际里的 ``step_N/<gen>/`` ⇒ 被取代的尝试，整代删。
 
 反过来「最新且未完成」一律保留，任何一条都不需要「写入者是否活着」的外部判断。
+只读端点（``conditional_writes="off"``）能列不能删：远端候选一律记
+``remote_read_only`` 跳过。
 """
 
 from __future__ import annotations
 
 import time
-
-import pytest
 
 import api as ckpt
 import sim
@@ -22,6 +23,8 @@ from commit.gc import (
     NOT_UPLOADED,
     NO_NEWER_VERSION,
     REMOTE,
+    REMOTE_READ_ONLY,
+    STALE_GENERATION,
     SUPERSEDED,
     UPLOADED,
     GcWorker,
@@ -225,7 +228,7 @@ def test_dry_run_only_plans_then_real_run_deletes(state, tmp_path) -> None:
     """``dry_run`` 只给计划；真跑之后本地目录消失，远端分片提交点不动。"""
     local = tmp_path / "local"
     remote_root = tmp_path / "remote"
-    remote = LocalStorage(remote_root)
+    remote = LocalStorage(remote_root, conditional_writes=True)
 
     _save(state, local, 1)
     _upload(local, remote, 1)
@@ -247,7 +250,7 @@ def test_dry_run_only_plans_then_real_run_deletes(state, tmp_path) -> None:
 def test_upload_incomplete_keeps_local(state, tmp_path) -> None:
     """没上传完（远端没有本 rank 的分片提交点）：本地是唯一副本，必须留着。"""
     local = tmp_path / "local"
-    remote = LocalStorage(tmp_path / "remote")
+    remote = LocalStorage(tmp_path / "remote", conditional_writes=True)
 
     _save(state, local, 1)
 
@@ -261,7 +264,7 @@ def test_upload_incomplete_keeps_local(state, tmp_path) -> None:
 def test_other_rank_upload_does_not_release_this_one(state, tmp_path) -> None:
     """远端有 rank 1 的分片提交点，不代表本 rank（0）那份传完了。"""
     local = tmp_path / "local"
-    remote = LocalStorage(tmp_path / "remote")
+    remote = LocalStorage(tmp_path / "remote", conditional_writes=True)
 
     _save(state, local, 1)
     _upload(local, remote, 1, rank=1)
@@ -275,7 +278,7 @@ def test_other_rank_upload_does_not_release_this_one(state, tmp_path) -> None:
 def test_superseded_version_is_reclaimed_on_disk(state, tmp_path) -> None:
     """第 1 代没传成功、第 2 代已经提交：本地 1 是确定的残片。"""
     local = tmp_path / "local"
-    remote = LocalStorage(tmp_path / "remote")
+    remote = LocalStorage(tmp_path / "remote", conditional_writes=True)
 
     _save(state, local, 1)          # 假设上传失败 / 被放弃
     _save(state, local, 2)
@@ -308,7 +311,7 @@ def test_remote_unreachable_deletes_nothing(state, tmp_path) -> None:
 def test_crash_residue_is_cleaned_once_superseded(state, tmp_path) -> None:
     """崩溃留下的无 COMMIT 残目录：等有更新的一代提交后自动回收。"""
     local = tmp_path / "local"
-    remote = LocalStorage(tmp_path / "remote")
+    remote = LocalStorage(tmp_path / "remote", conditional_writes=True)
 
     residue = local / version_key(1)
     residue.mkdir(parents=True)
@@ -328,7 +331,7 @@ def test_gc_is_idempotent_after_interrupt(state, tmp_path) -> None:
     """删到一半被打断（只剩数据文件、提交点已没）：重跑收敛且不抛错。"""
     local = tmp_path / "local"
     remote_root = tmp_path / "remote"
-    remote = LocalStorage(remote_root)
+    remote = LocalStorage(remote_root, conditional_writes=True)
 
     _save(state, local, 1)
     _upload(local, remote, 1)
@@ -353,7 +356,7 @@ def test_stale_remote_prefix_is_reclaimed_on_disk(state, tmp_path) -> None:
     """远端半途的上传前缀（没有版本提交点）+ 有更新的一代 ⇒ 整个前缀删掉。"""
     local = tmp_path / "local"
     remote_root = tmp_path / "remote"
-    remote = LocalStorage(remote_root)
+    remote = LocalStorage(remote_root, conditional_writes=True)
 
     stale = remote_root / version_key(1) / "rank_0"
     stale.mkdir(parents=True)
@@ -385,7 +388,7 @@ def _wait(predicate, timeout: float = 2.0) -> bool:
 def test_worker_cleans_on_start_and_stops(state, tmp_path) -> None:
     """启动时立刻跑一次（回收上次运行崩溃的残目录），之后按周期跑。"""
     local = tmp_path / "local"
-    remote = LocalStorage(tmp_path / "remote")
+    remote = LocalStorage(tmp_path / "remote", conditional_writes=True)
 
     _save(state, local, 1)
     _upload(local, remote, 1)
@@ -411,3 +414,155 @@ def test_worker_keeps_running_when_remote_is_down(state, tmp_path) -> None:
     assert all(report.aborted for report in worker.reports)
     assert all(report.deleted == () for report in worker.reports)
     assert (local / version_key(1)).is_dir(), "远端不可达时本地一个都不删"
+
+
+# --- 代际残片（stale generation） ------------------------------------------
+
+
+def _upload_generation(local, remote, step: int, generation) -> None:
+    ckpt.upload_local(local, remote, step=step, rank=0, generation=generation)
+
+
+def test_plan_marks_generations_outside_the_current_one() -> None:
+    """同一 step 下不在当前代际的前缀是残片；当前代永远保留。"""
+    result = plan(
+        versions={5},
+        rank_commits={(5, 0, "gen_0002-bbbbbbbb")},
+        prefixes={5},
+        local_steps=(),
+        rank=0,
+        generations={5: {"gen_0001-aaaaaaaa", "gen_0002-bbbbbbbb"}},
+        current_generations={5: "gen_0002-bbbbbbbb"},
+    )
+
+    assert result.steps_for(REMOTE) == (5,)
+    assert result.generations_for(5) == ("gen_0001-aaaaaaaa",)
+    assert result.reasons()[(REMOTE, 5)] == STALE_GENERATION
+
+
+def test_plan_keeps_the_newest_generation_when_there_is_no_commit() -> None:
+    """还没有 L3：保留序号最大的一代（可能正在传），其余按残片收掉。"""
+    result = plan(
+        versions=(),
+        rank_commits=(),
+        prefixes={7},
+        local_steps=(),
+        rank=0,
+        generations={7: {"gen_0001-aaaaaaaa", "gen_0003-cccccccc"}},
+    )
+
+    assert result.generations_for(7) == ("gen_0001-aaaaaaaa",)
+    assert (REMOTE, 7, NO_NEWER_VERSION) in result.kept
+
+
+def test_plan_keeps_everything_when_the_commit_is_unreadable() -> None:
+    """L3 读不出来（坏 JSON / 被删）：不猜当前代，一个代际都不删。"""
+    result = plan(
+        versions={5},
+        rank_commits={(5, 0, "gen_0001-aaaaaaaa")},
+        prefixes={5},
+        local_steps=(),
+        rank=0,
+        generations={5: {"gen_0001-aaaaaaaa", "gen_0002-bbbbbbbb"}},
+        current_generations={},
+        unknown_versions={5},
+    )
+
+    assert result.steps_for(REMOTE) == ()
+    assert (REMOTE, 5, COMMITTED) in result.kept
+
+
+def test_collect_deletes_stale_generation_and_keeps_current(state, tmp_path) -> None:
+    local = tmp_path / "local"
+    remote = LocalStorage(tmp_path / "remote", conditional_writes=True)
+    _save(state, local, 5)
+
+    stale = ckpt.begin_upload(remote, step=5, ranks=[0])
+    _upload_generation(local, remote, 5, stale)
+    current = ckpt.begin_upload(remote, step=5, ranks=[0])
+    _upload_generation(local, remote, 5, current)
+    _finalize(remote, 5)
+
+    report = collect(local, remote, rank=0, dry_run=False)
+
+    assert [
+        item.generation for item in report.deleted if item.location == REMOTE
+    ] == [stale.id]
+    assert remote.list(f"step_5/{stale.id}") == [], "旧代整段删掉"
+    assert remote.list(f"step_5/{current.id}"), "当前代不动"
+    assert report.steps_for(LOCAL) == (5,), "本 rank 已上传，本地可以删"
+
+
+def test_gen_pointer_alone_never_makes_a_version_visible(tmp_path) -> None:
+    """只写了 GEN、没写数据：既不是版本，也不会被当成「正在传」删掉。"""
+    remote = LocalStorage(tmp_path / "remote", conditional_writes=True)
+    generation = ckpt.begin_upload(remote, step=7, ranks=[0])
+
+    report = collect(tmp_path / "local", remote, rank=0, dry_run=False)
+
+    assert 7 not in report.versions
+    assert report.steps_for(REMOTE) == ()
+    assert remote.list(f"step_7/{generation.id}") == []
+    assert remote.list("step_7/GEN"), "GEN 本身不是数据，留着让下次重试知道序号"
+
+
+def test_stale_generation_delete_order_is_rank_commit_then_data(state, tmp_path) -> None:
+    """单代删除：先删 L2，再删数据 —— 不会留下「看着像传完了」的前缀。"""
+    local = tmp_path / "local"
+    remote = LocalStorage(tmp_path / "remote", conditional_writes=True)
+    _save(state, local, 5)
+    stale = ckpt.begin_upload(remote, step=5, ranks=[0])
+    _upload_generation(local, remote, 5, stale)
+    current = ckpt.begin_upload(remote, step=5, ranks=[0])
+    _upload_generation(local, remote, 5, current)
+    _finalize(remote, 5)
+
+    deleted: list[str] = []
+    real_delete = remote.delete
+    remote.delete = lambda key: (deleted.append(key), real_delete(key))[1]  # type: ignore[method-assign]
+
+    collect(local, remote, rank=0, dry_run=False)
+
+    old = [key for key in deleted if key.startswith(f"step_5/{stale.id}/")]
+    rank_commit = f"step_5/{stale.id}/rank_0/COMMIT"
+    data = next(key for key in old if key.endswith(".distcp"))
+    assert old[0] == rank_commit
+    assert old.index(rank_commit) < old.index(data)
+
+
+def test_read_only_remote_is_listed_but_never_deleted(state, tmp_path) -> None:
+    """只读端点：远端候选一律跳过（``remote_read_only``），一个对象都不删。"""
+    from storage.object import S3Config, S3Storage
+    import s3_stub
+
+    with s3_stub.start() as server:
+        config = dict(
+            bucket="ckpt",
+            prefix="runs",
+            endpoint_url=server.endpoint_url,
+            access_key_id="test-key",
+            secret_access_key="test-secret",
+        )
+        writer = S3Storage(S3Config(**config))
+        try:
+            # 已提交的 step 2 + 一段被越过的 step 1 残片（没有 L3）
+            root = tmp_path / "local-2"
+            _save(state.step_once(), root, 2)
+            generation = ckpt.begin_upload(writer, step=2, ranks=[0])
+            ckpt.upload_local(root, writer, step=2, rank=0, generation=generation)
+            ckpt.finalize_upload(
+                writer, step=2, ranks=[0], generation=generation, keep=None
+            )
+            writer.write("step_1/rank_0/junk.bin", b"stale residue")
+        finally:
+            writer.close()
+
+        reader = S3Storage(S3Config(**config, conditional_writes="off"))
+        try:
+            report = collect(tmp_path / "local-2", reader, rank=0, dry_run=False)
+        finally:
+            reader.close()
+
+    assert not [item for item in report.deleted if item.location == REMOTE]
+    assert (REMOTE, 1, REMOTE_READ_ONLY) in report.skipped
+    assert (REMOTE, 2, COMMITTED) in report.skipped

@@ -42,6 +42,7 @@ from async_ import (
     register_backend,
     reset_registry,
 )
+from commit.generation import FencedError, Generation, acquire_generation, new_writer
 from commit.gc import (
     DEFAULT_KEEP_VERSIONS,
     GcReport,
@@ -455,20 +456,77 @@ def save_local(
 # --- 对象存储上传（每 rank 独立上传，rank 0 只 list 检查） -------------------
 
 
+def begin_upload(
+    storage: Any,
+    *,
+    step: int,
+    ranks: "list[int] | tuple[int, ...]",
+    collective: "GateCollective | None" = None,
+    writer: str | None = None,
+) -> Generation:
+    """开一代（一次保存尝试）并把它广播给所有 rank。
+
+    **多 rank 必须先调这个函数**，然后把返回的 ``Generation`` 传给每个 rank 的
+    :func:`upload_local` 与 rank 0 的 :func:`finalize_upload`。原因：代际是「这次
+    尝试」的身份，两个 rank 各自 :func:`upload_local` 自动开代会落到不同的
+    ``gen_*`` 前缀下，那一版永远凑不齐（并且掩盖了真正的问题）。
+
+    ``collective`` 用一次 ``all_reduce(MAX)`` 把 rank 0 抢到的 ``(seq, writer)``
+    广播出去（rank 0 提真实值、其余提 0）：不需要新的通信原语，也不允许分支。
+    单 rank 直接走恒等路径。
+
+    端点探针在这里跑一次（``S3Storage.ensure_conditional_writes``）：没有真正执行
+    条件写的端点直接失败，不降级。
+    """
+    ensure = getattr(storage, "ensure_conditional_writes", None)
+    if callable(ensure):
+        ensure()
+    expected = tuple(int(rank) for rank in ranks)
+    if collective is None or collective.world_size == 1:
+        return acquire_generation(storage, step, ranks=expected, writer=writer)
+
+    if writer is not None and not _is_hex_writer(writer):
+        raise ValueError(
+            f"writer must be 8 hex chars when broadcasting, got {writer!r}"
+        )
+    if collective.rank == 0:
+        mine = acquire_generation(
+            storage, step, ranks=expected, writer=writer or new_writer()
+        )
+        seq, token = mine.seq, int(mine.writer, 16)
+    else:
+        mine, seq, token = None, 0, 0
+    seq, token = collective.all_reduce_max_int64([seq, token])
+    if mine is not None:
+        return mine
+    return Generation(step=step, seq=seq, writer=format(token, "08x"))
+
+
+def _is_hex_writer(writer: str) -> bool:
+    try:
+        return len(writer) == 8 and int(writer, 16) >= 0
+    except ValueError:
+        return False
+
+
 def upload_local(
     root: str | Path,
     storage: Any,
     *,
     step: int,
     rank: int,
+    generation: "Generation | str | None" = None,
 ) -> int:
     """把本地 ``step_<step>`` 里**本 rank** 的产物上传到对象存储，返回上传字节数。
 
-    每个 rank 只写自己的前缀（``step_42/rank_<i>/``），先数据文件、再索引、
-    最后 ``rank_<i>/COMMIT``；三个都落盘才算这个 rank 完成。这个提交点同时也是
-    「本地 ``step_<step>/`` 可以删了」的证据。
+    每个 rank 只写自己那一代的前缀（``step_42/gen_x/rank_<i>/``），先数据文件、
+    再索引、最后 ``rank_<i>/COMMIT``；三个都落盘才算这个 rank 完成。这个提交点
+    同时也是「本地 ``step_<step>/`` 可以删了」的证据。
+
+    ``generation`` 省略时走单 rank 便利路径（复用现有 GEN 或开第一代）。**多 rank
+    必须显式传入** :func:`begin_upload` 的结果，否则两次尝试的分片会混在同一代里。
     """
-    return _upload_rank(root, storage, step=step, rank=rank)
+    return _upload_rank(root, storage, step=step, rank=rank, generation=generation)
 
 
 def finalize_upload(
@@ -476,20 +534,31 @@ def finalize_upload(
     *,
     step: int,
     ranks: "list[int] | tuple[int, ...]",
+    generation: "Generation | str | None" = None,
     layout: Mapping[str, int] | None = None,
     keep: int | None = DEFAULT_KEEP_VERSIONS,
 ) -> UploadCommit:
-    """rank 0 的提交动作：``list`` 一次前缀确认全部 rank 都传完了，再写 ``COMMIT``。
+    """rank 0 的提交动作：``list`` 本代前缀确认全部 rank 都传完了，再 CAS 写 ``COMMIT``。
 
     它**不读**任何 rank 的索引，也不汇总分片：齐全性由每个 rank 的 ``rank_<i>/COMMIT``
     证明，分片怎么拼由各 rank 的 ``.metadata`` 在恢复端合并时证明。判据只看提交点在
     不在，所以这一步可以幂等重跑（rank 0 崩了，重启补一次即可）。
 
+    **fence**：先用 CAS 把 GEN 推到 ``sealed``，再用 CAS 写版本 ``COMMIT``。已经提交过
+    更高 ``seq`` 的版本会让本次提交直接 :class:`FencedError` —— 旧代接管不了 L3。
+
     **提交完成即做有界保留**：版本 ``COMMIT`` 落盘之后，rank 0 接着只留最新 ``keep``
     代（默认 3 代），从最旧的一代开始删 —— 先删版本 ``COMMIT``，再删分片提交点与数据。
     ``keep=None`` 关掉自动裁剪；要看/单跑这一步用 :func:`retain_remote_versions`。
     """
-    return _finalize_upload(storage, step, ranks=ranks, layout=layout, keep=keep)
+    return _finalize_upload(
+        storage,
+        step,
+        ranks=ranks,
+        generation=generation,
+        layout=layout,
+        keep=keep,
+    )
 
 
 def load_object(
@@ -582,7 +651,10 @@ __all__ = [
     "Tensor",
     "TriggerDecision",
     "UnsupportedDeviceError",
+    "FencedError",
+    "Generation",
     "available_device_types",
+    "begin_upload",
     "close_default_pool",
     "configure_default_pool",
     "cuda",

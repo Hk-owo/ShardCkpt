@@ -23,7 +23,7 @@ from commit.gc import (
 )
 from storage.base import StorageBackend, StorageError
 from storage.object import S3Config, S3Storage
-from storage.upload import commit_key, version_prefix
+from storage.upload import UploadCommit, commit_key, version_prefix
 
 DEVICE = "cuda:0"
 
@@ -86,11 +86,22 @@ def _versions(storage: StorageBackend) -> list[int]:
 
 
 class _RecordingRemote(StorageBackend):
-    """透传后端，只额外记录 ``delete`` 的顺序。"""
+    """透传后端，只额外记录 ``delete`` 的顺序。
+
+    条件写方法（``put_if_absent`` / ``put_if_match`` / ``head`` / ``write_file``）
+    用 ``__getattr__`` 原样透传：upload 路径要求条件后端，包装层不能把它们吃掉。
+    """
 
     def __init__(self, inner: StorageBackend) -> None:
         self.inner = inner
         self.deleted: list[str] = []
+
+    def __getattr__(self, name: str):
+        return getattr(self.inner, name)
+
+    @property
+    def supports_conditional_writes(self) -> bool:
+        return bool(getattr(self.inner, "supports_conditional_writes", False))
 
     def write(self, key: str, data: bytes) -> None:
         self.inner.write(key, data)
@@ -160,6 +171,8 @@ def test_each_commit_keeps_the_latest_three(state, tmp_path, storage) -> None:
 def test_oldest_version_commit_goes_before_its_data(state, tmp_path, storage) -> None:
     """删除顺序与写入镜像：版本 COMMIT → 分片 COMMIT → 数据。"""
     _commit_steps(state, tmp_path, storage, (1, 2, 3, 4), keep=None)
+    generation = UploadCommit.loads(storage.read(commit_key(1)).decode()).generation
+    assert generation is not None
 
     recording = _RecordingRemote(storage)
     report = retain_remote_versions(recording, keep=3)
@@ -170,9 +183,12 @@ def test_oldest_version_commit_goes_before_its_data(state, tmp_path, storage) ->
 
     old = [key for key in recording.deleted if key.startswith(f"{version_prefix(1)}/")]
     assert old[0] == commit_key(1), "先删这一版的版本 COMMIT"
-    rank_commit = f"{version_prefix(1)}/rank_0/COMMIT"
-    data = f"{version_prefix(1)}/rank_0/__0_0.distcp"
+    rank_commit = f"{version_prefix(1)}/{generation}/rank_0/COMMIT"
+    data = f"{version_prefix(1)}/{generation}/rank_0/__0_0.distcp"
     assert old.index(rank_commit) < old.index(data), "分片提交点排在数据之前"
+    assert old.index(f"{version_prefix(1)}/GEN") < old.index(rank_commit), (
+        "版本 COMMIT → GEN → 分片提交点 → 数据"
+    )
 
 
 def test_retention_dry_run_only_plans(state, tmp_path, storage) -> None:

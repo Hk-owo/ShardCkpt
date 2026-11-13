@@ -476,6 +476,9 @@ def test_dtensor_shards_round_trip_through_object_storage(tmp_path) -> None:
             )
         )
         try:
+            # 代际由 rank 0 分配一次，所有 rank 用同一个：各自开代会落到不同的
+            # gen_* 前缀下，这一版永远凑不齐。
+            generation = ckpt.begin_upload(storage, step=1, ranks=list(range(tp)))
             for tp_index in range(tp):
                 region = split(array.shape, 1, tp_index, tp)
                 local = np.ascontiguousarray(array[region.slices])
@@ -500,9 +503,17 @@ def test_dtensor_shards_round_trip_through_object_storage(tmp_path) -> None:
                     rank=tp_index,
                     sources=[shard.source],
                 )
-                ckpt.upload_local(root, storage, step=1, rank=tp_index)
+                ckpt.upload_local(
+                    root, storage, step=1, rank=tp_index, generation=generation
+                )
 
-            ckpt.finalize_upload(storage, step=1, ranks=list(range(tp)), layout={"tp": tp})
+            ckpt.finalize_upload(
+                storage,
+                step=1,
+                ranks=list(range(tp)),
+                generation=generation,
+                layout={"tp": tp},
+            )
             report = ckpt.load_object(storage, step=1, device="cpu")
         finally:
             storage.close()

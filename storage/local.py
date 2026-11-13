@@ -13,11 +13,22 @@
   C++ 扩展没构建时自动回退到它。
 
 ``write_view()`` 是本地层特有的零拷贝入口：它接受任何实现了 buffer 协议的对象
-（pinned 块、`native.AlignedView`、memoryview），不经过 `bytes` 复制。
+（pinned 块、`native.AlignedView`、memoryview），不经过 `bytes`` 复制。
+
+**条件写（可选）**：``LocalStorage(root, conditional_writes=True)`` 让这个后端也
+实现 :class:`storage.base.ConditionalBackend`，用于「把本地目录当远端」的仿真与
+GC 测试。语义与对象存储**不同**，只适合单写者：
+
+- ``If-None-Match`` 用 ``open(O_CREAT|O_EXCL)``，这是 POSIX 原子操作，可信；
+- ``If-Match`` 是「读内容算摘要 → 比较 → 原子 rename」，**读与写之间没有锁**，
+  并发写者可以插进来。生产写路径一律走 ``S3Storage``（服务端原子 CAS）。
+
+默认关闭：本地层自己的提交协议（``COMMIT`` 原子 rename）不需要它。
 """
 
 from __future__ import annotations
 
+import hashlib
 import itertools
 import os
 import shutil
@@ -25,7 +36,14 @@ from pathlib import Path
 from typing import Any
 
 from core import CheckpointError
-from storage.base import ObjectNotFoundError, StorageBackend, StorageError
+from storage.base import (
+    ConditionalWritesDisabled,
+    ObjectMeta,
+    ObjectNotFoundError,
+    StorageBackend,
+    StorageError,
+    WriteOutcome,
+)
 
 DEFAULT_ALIGNMENT = 4096
 """O_DIRECT 的块大小；planner 的对齐补齐也用它。"""
@@ -92,6 +110,8 @@ class LocalStorage(StorageBackend):
 
     ``direct_io``: 大块顺序写是否走 O_DIRECT（需要 buffer 按 alignment 对齐）
     ``engine``:   ``"auto"``（默认，native 可用就用）/ ``"native"`` / ``"python"``
+    ``conditional_writes``: 开启后实现 ``ConditionalBackend``（仿真/测试用；
+                   ``If-Match`` 是 best-effort，见模块 docstring）
     """
 
     def __init__(
@@ -101,6 +121,7 @@ class LocalStorage(StorageBackend):
         direct_io: bool = True,
         alignment: int = DEFAULT_ALIGNMENT,
         engine: str = "auto",
+        conditional_writes: bool = False,
     ) -> None:
         if engine not in ("auto", "native", "python"):
             raise ValueError(f"unknown engine {engine!r}")
@@ -108,11 +129,16 @@ class LocalStorage(StorageBackend):
         self.direct_io = direct_io
         self.alignment = alignment
         self._engine = self._resolve_engine(engine)
+        self._conditional = bool(conditional_writes)
 
     # --- 基本信息 -----------------------------------------------------------
     @property
     def root(self) -> Path:
         return self._root
+
+    @property
+    def supports_conditional_writes(self) -> bool:
+        return self._conditional
 
     @property
     def engine(self) -> str:
@@ -321,6 +347,82 @@ class LocalStorage(StorageBackend):
             path.unlink(missing_ok=True)  # 幂等，与对象存储后端一致
         except OSError as exc:
             raise StorageError(f"{key}: {exc}") from exc
+
+    # --- 条件写（可选，仿真/测试用）-----------------------------------------
+    def _require_conditional(self) -> None:
+        if not self._conditional:
+            raise ConditionalWritesDisabled(
+                f"{self._root}: LocalStorage 默认不提供条件写；"
+                "把目录当远端做仿真时请显式传 conditional_writes=True"
+            )
+
+    def head(self, key: str) -> ObjectMeta | None:
+        """ETag 是内容摘要（sha256 前 16 位十六进制），只作 CAS token。"""
+        self._require_conditional()
+        path = self.path_for(key)
+        try:
+            payload = path.read_bytes()
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise StorageError(f"{key}: {exc}") from exc
+        return ObjectMeta(key=key, etag=_content_etag(payload), size=len(payload))
+
+    def put_if_absent(self, key: str, data: bytes) -> WriteOutcome:
+        """``O_CREAT | O_EXCL``：POSIX 保证只有一个创建者。"""
+        self._require_conditional()
+        path = self.path_for(key)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666)
+        except FileExistsError:
+            return WriteOutcome.EXISTS
+        except OSError as exc:
+            raise StorageError(f"{key}: {exc}") from exc
+        try:
+            os.write(fd, bytes(data))
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        _fsync_dir(path.parent)
+        return WriteOutcome.CREATED
+
+    def put_if_match(self, key: str, data: bytes, etag: str) -> WriteOutcome:
+        """读-比较-写；**不是原子 CAS**（本地盘没有可比的原语），见模块 docstring。"""
+        self._require_conditional()
+        path = self.path_for(key)
+        if not path.is_file():
+            return WriteOutcome.GONE
+        if not etag:
+            raise ValueError("if_match must be a non-empty ETag")
+        if self.head(key).etag != etag:
+            return WriteOutcome.CONFLICT
+        self.write(key, bytes(data))
+        return WriteOutcome.SWAPPED
+
+    def write_file(
+        self,
+        key: str,
+        path: str | Path,
+        *,
+        if_none_match: bool = False,
+        if_match: str | None = None,
+    ) -> WriteOutcome:
+        self._require_conditional()
+        if if_none_match and if_match is not None:
+            raise ValueError("If-None-Match 与 If-Match 不能同时给")
+        if not if_none_match and if_match is None:
+            raise ValueError("write_file 需要显式条件：写路径必须走 CAS")
+        payload = Path(path).read_bytes()
+        if if_none_match:
+            return self.put_if_absent(key, payload)
+        assert if_match is not None
+        return self.put_if_match(key, payload, if_match)
+
+
+def _content_etag(payload: bytes) -> str:
+    """本地后端的 ETag：内容摘要，带引号以对齐 S3 的返回形状。"""
+    return '"' + hashlib.sha256(payload).hexdigest()[:16] + '"'
 
 
 def _as_view(buffer: Any) -> memoryview:

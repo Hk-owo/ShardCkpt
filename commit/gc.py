@@ -23,7 +23,11 @@
 ``rank_<r>/COMMIT``），再删数据，最后删空目录。判据只看提交点在不在，所以删到一半
 被打断，重跑一次收敛。
 
-上面两条判据**只删残片**，远端已提交的版本一个都不碰。对象存储侧的**有界保留**是另一
+除此之外还有一条**代际残片**判据（:data:`STALE_GENERATION`）：同一个 step 下不在
+当前代际里的 ``step_N/<gen>/`` 前缀只可能是被取代的尝试，直接删；没有版本 ``COMMIT``
+的 step 保留序号最大的一代（它可能就是正在传的那一次），其余按残片收掉。
+
+上面这些判据**只删残片**，远端已提交的版本一个都不碰。对象存储侧的**有界保留**是另一
 条独立判据（:func:`plan_retention` / :func:`retain_remote_versions`）：版本 ``COMMIT``
 一写完，rank 0 就只留最新的 ``keep`` 代（默认 3），从最旧的一代开始删，同样先删版本
 ``COMMIT`` 再删其余数据 —— 提交点一消失这一版立刻不可恢复，删到一半被打断也不会被
@@ -33,11 +37,13 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import threading
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Iterable, Mapping
 
+from commit.generation import GENERATION_FILE, Generation
 from commit.local import COMMIT_FILE, delete_version, version_key
 from storage.base import StorageBackend, StorageError
 from storage.local import LocalStorage
@@ -63,17 +69,27 @@ COMMITTED = "committed"
 RETENTION = "retention"
 """远端已提交但超出保留窗口的版本：由 rank 0 在提交完成后删除。"""
 
+REMOTE_READ_ONLY = "remote_read_only"
+"""远端是只读端点（``conditional_writes="off"``）：能列、不能删，远端候选一律跳过。"""
+
+STALE_GENERATION = "stale_generation"
+"""同一 step 下不在当前代际里的 ``step_N/<gen>/``：被取代的尝试，整代删。"""
+
 DEFAULT_KEEP_VERSIONS = 3
 """对象存储侧有界保留的默认窗口：只留最新的这么多代已提交版本。"""
 
 
 @dataclass(frozen=True, slots=True)
 class GcCandidate:
-    """一个待删的版本。``location`` 是 ``"local"`` 或 ``"remote"``。"""
+    """一个待删的版本。``location`` 是 ``"local"`` 或 ``"remote"``。
+
+    ``generation`` 非空表示只删这一代（``step_N/<gen>/``），空表示删整个 step 前缀。
+    """
 
     location: str
     step: int
     reason: str
+    generation: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,7 +104,16 @@ class GcPlan:
     """本次看到的、带版本 ``COMMIT`` 的 step。"""
 
     def steps_for(self, location: str) -> tuple[int, ...]:
-        return tuple(c.step for c in self.candidates if c.location == location)
+        return tuple(
+            dict.fromkeys(c.step for c in self.candidates if c.location == location)
+        )
+
+    def generations_for(self, step: int) -> tuple[str, ...]:
+        return tuple(
+            c.generation
+            for c in self.candidates
+            if c.step == step and c.generation is not None
+        )
 
     def reasons(self) -> Mapping[tuple[str, int], str]:
         return {(c.location, c.step): c.reason for c in self.candidates}
@@ -97,22 +122,47 @@ class GcPlan:
 def plan(
     *,
     versions: Iterable[int],
-    rank_commits: Iterable[tuple[int, int]],
+    rank_commits: Iterable[tuple[int, int, str | None]],
     prefixes: Iterable[int],
     local_steps: Iterable[int],
     rank: int,
+    generations: Mapping[int, Iterable[str]] | None = None,
+    current_generations: Mapping[int, str | None] | None = None,
+    unknown_versions: Iterable[int] = (),
 ) -> GcPlan:
     """决定删哪些版本。**纯函数**：不碰 IO、不看时间、不看进程状态。
 
-    ``versions``:     远端有版本 ``COMMIT`` 的 step（L3）
-    ``rank_commits``: 远端有分片 ``COMMIT`` 的 ``(step, rank)``（L2）
-    ``prefixes``:     远端存在 ``step_N/`` 前缀的 step
-    ``local_steps``:  本地 root 下存在 ``step_N/`` 目录的 step
-    ``rank``:         本进程的 rank 号（本地判据只看自己的分片提交点）
+    ``versions``:          远端有版本 ``COMMIT`` 的 step（L3）
+    ``rank_commits``:      远端有分片 ``COMMIT`` 的 ``(step, rank, generation)``（L2）
+    ``prefixes``:          远端存在 ``step_N/`` 前缀的 step
+    ``local_steps``:       本地 root 下存在 ``step_N/`` 目录的 step
+    ``rank``:              本进程的 rank 号（本地判据只看自己的分片提交点）
+    ``generations``:       ``step -> {generation}``：远端出现过的代际前缀
+    ``current_generations``: ``step -> 当前代际``（从 L3 读出来；v1 是 ``None``）
+    ``unknown_versions``:  读不出来的 L3 对应的 step：**一律保留**，不猜当前代
+
+    三条判据互不重叠：
+
+    1. 本地已上传 / 被更新版本越过 → 删本地目录；
+    2. 远端无 L3 且被更新版本越过 → 删整个 step 前缀；
+    3. 远端有 L3 但不是当前代际（或没有 L3 且不是最大代）→ 只删这一代前缀。
     """
     known = frozenset(int(step) for step in versions)
     newest = max(known) if known else None
-    uploaded = {int(step) for step, owner in rank_commits if int(owner) == int(rank)}
+    current = {int(step): gen for step, gen in (current_generations or {}).items()}
+    unknown = frozenset(int(step) for step in unknown_versions)
+    gens_of = {
+        int(step): {str(gen) for gen in values}
+        for step, values in (generations or {}).items()
+    }
+    by_step: dict[int, set[int]] = {}
+    for item in rank_commits:
+        # 二元组是 v1 语义（没有代际），三元组带 generation。
+        step, owner = int(item[0]), int(item[1])
+        generation = item[2] if len(item) > 2 else None
+        # 只认**当前代**的分片提交点：别的代的 L2 不能证明这一版传完了。
+        if step in known and current.get(step) == generation:
+            by_step.setdefault(step, set()).add(owner)
     all_prefixes = {int(step) for step in prefixes}
     local = {int(step) for step in local_steps}
 
@@ -123,7 +173,7 @@ def plan(
     kept: list[tuple[str, int, str]] = []
 
     for step in sorted(local):
-        if step in uploaded:
+        if int(rank) in by_step.get(step, set()):
             candidates.append(GcCandidate(LOCAL, step, UPLOADED))
         elif superseded(step):
             candidates.append(GcCandidate(LOCAL, step, SUPERSEDED))
@@ -131,9 +181,30 @@ def plan(
             kept.append((LOCAL, step, NOT_UPLOADED))
 
     for step in sorted(all_prefixes):
+        gens = gens_of.get(step, set())
+        if step in unknown:
+            kept.append((REMOTE, step, COMMITTED))
+            continue
         if step in known:
             kept.append((REMOTE, step, COMMITTED))
-        elif superseded(step):
+            # 同一个 step 下不在当前代的代际前缀：被取代的尝试，整代删
+            for generation in sorted(gens):
+                if generation != current.get(step):
+                    candidates.append(
+                        GcCandidate(REMOTE, step, STALE_GENERATION, generation)
+                    )
+            continue
+        if gens:
+            # 还没有 L3：保留序号最大的一代（可能正在传），其余是残片
+            newest_gen = max(gens, key=lambda gen: _generation_seq(gen, step=step))
+            kept.append((REMOTE, step, NO_NEWER_VERSION))
+            for generation in sorted(gens):
+                if generation != newest_gen:
+                    candidates.append(
+                        GcCandidate(REMOTE, step, STALE_GENERATION, generation)
+                    )
+            continue
+        if superseded(step):
             candidates.append(GcCandidate(REMOTE, step, SUPERSEDED))
         else:
             kept.append((REMOTE, step, NO_NEWER_VERSION))
@@ -173,6 +244,7 @@ class DeletedVersion:
     objects: int
     bytes: int
     reason: str
+    generation: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -234,16 +306,37 @@ def _scan_local(root: Path) -> set[int]:
     return found
 
 
-def _scan_remote(
-    keys: Iterable[str],
-) -> tuple[set[int], set[tuple[int, int]], set[int]]:
-    """从一次 ``list("")`` 的结果里解析出三层信息。
+@dataclass(frozen=True, slots=True)
+class RemoteLayout:
+    """一次 ``list("")`` 解析出的远端结构（纯数据，执行器与判据共用）。"""
 
-    ``step_N/COMMIT`` 是版本提交点，``step_N/rank_r/COMMIT`` 是分片提交点，
-    其余 ``step_N/...`` 只用来确认前缀存在。
+    versions: set[int]
+    """有版本 ``COMMIT``（L3）的 step。"""
+
+    rank_commits: set[tuple[int, int, str | None]]
+    """``(step, rank, generation)``：有分片 ``COMMIT``（L2）的组合；v1 布局的
+    ``generation`` 是 ``None``。"""
+
+    generations: dict[int, set[str]] = field(default_factory=dict)
+    """``step -> {generation}``：远端出现过的代际前缀。"""
+
+    prefixes: set[int] = field(default_factory=set)
+    """存在 ``step_N/`` 前缀的 step。"""
+
+
+def _scan_remote(keys: Iterable[str]) -> RemoteLayout:
+    """从一次 ``list("")`` 的结果里解析出四层信息。
+
+    - ``step_N/COMMIT``：版本提交点（L3）；
+    - ``step_N/<gen>/rank_r/COMMIT``：某一代的分片提交点（L2）；
+    - ``step_N/<gen>/...``：代际前缀；
+    - 其余 ``step_N/...``：只用来确认前缀存在。
+
+    v1 老布局（``step_N/rank_r/COMMIT``，没有 gen 层）仍然认，``generation=None``。
     """
     versions: set[int] = set()
-    rank_commits: set[tuple[int, int]] = set()
+    rank_commits: set[tuple[int, int, str | None]] = set()
+    generations: dict[int, set[str]] = {}
     prefixes: set[int] = set()
     for key in keys:
         parts = key.split("/")
@@ -256,51 +349,116 @@ def _scan_remote(
         prefixes.add(step)
         if len(parts) == 2 and parts[1] == COMMIT_FILE:
             versions.add(step)
-        elif (
-            len(parts) == 3
-            and parts[2] == COMMIT_FILE
-            and parts[1].startswith("rank_")
-        ):
+        elif len(parts) == 4 and parts[2].startswith("rank_") and parts[3] == COMMIT_FILE:
+            generation = parts[1]
             try:
-                rank_commits.add((step, int(parts[1][len("rank_") :])))
+                rank = int(parts[2][len("rank_") :])
             except ValueError:
                 continue
-    return versions, rank_commits, prefixes
+            rank_commits.add((step, rank, generation))
+            generations.setdefault(step, set()).add(generation)
+        elif len(parts) >= 3:
+            if parts[1].startswith("gen_"):
+                generations.setdefault(step, set()).add(parts[1])
+            elif len(parts) == 3 and parts[1].startswith("rank_") and parts[2] == COMMIT_FILE:
+                try:
+                    rank_commits.add((step, int(parts[1][len("rank_") :]), None))
+                except ValueError:
+                    continue
+    return RemoteLayout(
+        versions=versions,
+        rank_commits=rank_commits,
+        generations=generations,
+        prefixes=prefixes,
+    )
 
 
-def _delete_remote_prefix(remote: StorageBackend, step: int, keys: Iterable[str]) -> int:
-    """删远端整个 ``step_N/`` 前缀，顺序与写入镜像。
+def _generation_seq(generation: str, *, step: int) -> int:
+    """代际前缀的序号；解析不了就排最前（宁可保留它也不误删）。"""
+    try:
+        return Generation.parse(generation, step=step).seq
+    except Exception:
+        return -1
 
-    先删**版本提交点** ``step_N/COMMIT``（L3）—— 它一消失这一版立刻不可恢复、也不会
-    再被当成「已提交版本」；再删各 ``rank_r/COMMIT``（L2）；最后才是数据对象。删到一半
-    被打断也不会留下「看着像完整版本」的前缀，重跑一次收敛。
+
+def _delete_remote_prefix(
+    remote: StorageBackend,
+    step: int,
+    keys: Iterable[str],
+    *,
+    generation: str | None = None,
+) -> int:
+    """删远端 ``step_N/``（或其中一代 ``step_N/<gen>/``），顺序与写入镜像。
+
+    **整版**：先删**版本提交点** ``step_N/COMMIT``（L3）—— 它一消失这一版立刻不可恢复、
+    也不会再被当成「已提交版本」；再删 ``GEN``（让残留写者下一轮检查立即被 fence）；
+    再删各 ``rank_r/COMMIT``（L2）；最后才是数据对象。
+
+    **单代**：这一代没有 L3 可删，先删它的 L2，再删数据 —— 删到一半被打断也不会留下
+    「看着像这一代传完了」的前缀，重跑一次收敛。
     """
-    prefix = f"{version_key(step)}/"
+    root = version_key(step)
+    prefix = f"{root}/{generation}/" if generation else f"{root}/"
     mine = sorted(key for key in keys if key.startswith(prefix))
-    version_commit = f"{version_key(step)}/{COMMIT_FILE}"
     rank_commits = {
-        key for key in mine if key.count("/") == 2 and key.endswith(f"/{COMMIT_FILE}")
+        key for key in mine if key.count("/") == 3 and key.endswith(f"/{COMMIT_FILE}")
     }
-    rest = [key for key in mine if key != version_commit and key not in rank_commits]
-    ordered = ([version_commit] if version_commit in mine else [])
-    ordered += sorted(rank_commits) + rest
+    if generation:
+        ordered = sorted(rank_commits) + [key for key in mine if key not in rank_commits]
+    else:
+        version_commit = f"{root}/{COMMIT_FILE}"
+        marker = f"{root}/{GENERATION_FILE}"
+        markers = {marker} & set(mine)
+        rest = [
+            key
+            for key in mine
+            if key != version_commit and key not in rank_commits and key not in markers
+        ]
+        ordered = ([version_commit] if version_commit in mine else [])
+        ordered += sorted(markers) + sorted(rank_commits) + rest
     for key in ordered:
         remote.delete(key)
-    _prune_remote_dirs(remote, step)
+    _prune_remote_dirs(remote, step, generation=generation)
     return len(mine)
 
 
-def _prune_remote_dirs(remote: StorageBackend, step: int) -> None:
+def _prune_remote_dirs(
+    remote: StorageBackend, step: int, *, generation: str | None = None
+) -> None:
     """本地盘后端会把空目录留下来（对象存储没有目录概念），顺手收掉。"""
     if not isinstance(remote, LocalStorage):
         return
     directory = remote.path_for(version_key(step))
+    if generation:
+        with contextlib.suppress(OSError):  # 非空 = 有人还在写，留着
+            (directory / generation).rmdir()
+        return
     for child in sorted(directory.glob("*"), reverse=True):
         if child.is_dir():
             with contextlib.suppress(OSError):  # 非空 = 有人还在写，留着
                 child.rmdir()
     with contextlib.suppress(OSError):
         directory.rmdir()
+
+
+_UNKNOWN_VERSION = object()
+"""L3 读不出来（被删 / 坏 JSON / 远端抖动）时的哨兵：这一 step 一律保留。"""
+
+
+def _read_version_generation(remote: StorageBackend, step: int) -> object:
+    """读 L3 里声明的代际；``None`` 表示 v1 老布局，哨兵表示读不出来。"""
+    try:
+        payload = remote.read(f"{version_key(step)}/{COMMIT_FILE}")
+    except StorageError:
+        return _UNKNOWN_VERSION
+    try:
+        data = json.loads(payload)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _UNKNOWN_VERSION
+    if not isinstance(data, dict):
+        return _UNKNOWN_VERSION
+    generation = data.get("generation")
+    return None if generation is None else str(generation)
 
 
 def collect(
@@ -342,22 +500,48 @@ def collect(
             aborted=f"remote unreachable: {exc}",
         )
 
-    versions, rank_commits, prefixes = _scan_remote(keys)
+    layout = _scan_remote(keys)
+    current: dict[int, str | None] = {}
+    unknown: set[int] = set()
+    for step in sorted(layout.versions):
+        generation = _read_version_generation(remote, step)
+        if generation is _UNKNOWN_VERSION:
+            unknown.add(step)
+        else:
+            current[step] = generation  # type: ignore[assignment]
     result = plan(
-        versions=versions,
-        rank_commits=rank_commits,
-        prefixes=prefixes,
+        versions=layout.versions - unknown,
+        rank_commits=layout.rank_commits,
+        prefixes=layout.prefixes,
         local_steps=_scan_local(root),
         rank=rank,
+        generations=layout.generations,
+        current_generations=current,
+        unknown_versions=unknown,
     )
 
     deleted: list[DeletedVersion] = []
+    skipped: list[tuple[str, int, str]] = list(result.kept)
+    writable = bool(getattr(remote, "supports_conditional_writes", True))
     if not dry_run:
         for candidate in result.candidates:
             if candidate.location == REMOTE:
-                count = _delete_remote_prefix(remote, candidate.step, keys)
+                if not writable:
+                    # 只读端点：list 能看、delete 不能做。远端一个对象都不动。
+                    skipped.append((REMOTE, candidate.step, REMOTE_READ_ONLY))
+                    continue
+                count = _delete_remote_prefix(
+                    remote, candidate.step, keys, generation=candidate.generation
+                )
                 deleted.append(
-                    DeletedVersion(REMOTE, candidate.step, count, 0, candidate.reason)
+                    DeletedVersion(
+                        REMOTE,
+                        candidate.step,
+                        count,
+                        0,
+                        candidate.reason,
+                        candidate.generation,
+                    )
                 )
             else:
                 record = delete_local_version(root, candidate.step)
@@ -367,7 +551,7 @@ def collect(
         dry_run=dry_run,
         planned=result.candidates,
         deleted=tuple(deleted),
-        skipped=result.kept,
+        skipped=tuple(skipped),
         reclaimed_bytes=sum(item.bytes for item in deleted),
         versions=result.versions,
     )
@@ -446,9 +630,9 @@ def retain_remote_versions(
             aborted=f"remote unreachable: {exc}",
         )
 
-    versions, _, _ = _scan_remote(keys)
-    doomed = plan_retention(versions=versions, keep=keep)
-    kept = tuple(sorted(versions - set(doomed)))
+    layout = _scan_remote(keys)
+    doomed = plan_retention(versions=layout.versions, keep=keep)
+    kept = tuple(sorted(layout.versions - set(doomed)))
 
     deleted: list[DeletedVersion] = []
     aborted: str | None = None
@@ -566,8 +750,11 @@ __all__ = [
     "NOT_UPLOADED",
     "NO_NEWER_VERSION",
     "REMOTE",
+    "REMOTE_READ_ONLY",
     "RETENTION",
+    "RemoteLayout",
     "RetentionReport",
+    "STALE_GENERATION",
     "SUPERSEDED",
     "UPLOADED",
     "collect",

@@ -63,6 +63,19 @@ def blobs_for(rank: int) -> dict[str, bytes]:
     return {f"rng/rank_{rank}": bytes([rank]) * 16, "lr_scheduler": b"L" * 32}
 
 
+def begin_version(s3_config: dict, *, step: int, ranks: list[int]) -> str:
+    """主进程里开一代（等价于 rank 0 的 ``begin_upload``），返回 generation id。
+
+    多 rank 必须先 begin 再广播：两个 rank 各自自动开代会落到不同的 ``gen_*``
+    前缀下，那一版永远凑不齐 —— 这正是代际要防的那个 bug。
+    """
+    client = S3Storage(S3Config(**s3_config))
+    try:
+        return ckpt.begin_upload(client, step=step, ranks=list(ranks)).id
+    finally:
+        client.close()
+
+
 def upload_ranks(
     state: sim.TrainingState,
     *,
@@ -71,8 +84,19 @@ def upload_ranks(
     s3_config: dict,
     step: int,
     ranks: list[int] | None = None,
+    generation: str | None = None,
+    expected: list[int] | None = None,
 ) -> list[dict]:
-    """spawn 每个 rank 的进程：本地提交 + 独立上传。"""
+    """spawn 每个 rank 的进程：本地提交 + 独立上传（同一代际）。
+
+    ``ranks`` 是**这次真的上传的** rank，``expected`` 是 GEN 里声明的写者清单
+    （默认与 ``ranks`` 相同）。两者分开是为了构造「少传一个 rank」：
+    GEN 声明 [0, 1]，实际只传 [0]。
+    """
+    uploading = ranks if ranks is not None else list(range(tp))
+    world = expected if expected is not None else uploading
+    if generation is None:
+        generation = begin_version(s3_config, step=step, ranks=world)
     jobs = [
         {
             "root": str(local_root / f"rank_{rank}"),
@@ -85,12 +109,16 @@ def upload_ranks(
             "blobs": blobs_for(rank),
             "device": DEVICE,
             "s3": s3_config,
+            "generation": generation,
         }
-        for rank in (ranks if ranks is not None else list(range(tp)))
+        for rank in uploading
     ]
     context = multiprocessing.get_context("spawn")
     with ProcessPoolExecutor(max_workers=len(jobs), mp_context=context) as pool:
-        return list(pool.map(sim.save_and_upload_rank, jobs))
+        results = list(pool.map(sim.save_and_upload_rank, jobs))
+    for info in results:
+        info["generation"] = generation
+    return results
 
 
 def keys_of(storage: S3Storage, prefix: str) -> set[str]:
@@ -111,12 +139,13 @@ def test_ranks_upload_independently_and_rank0_only_lists(
     )
     assert [item["rank"] for item in summaries] == list(range(tp))
     assert all(item["uploaded"] > 0 for item in summaries)
+    generation = summaries[0]["generation"]
 
     keys = keys_of(storage, version_prefix(STEP))
     for rank in range(tp):
-        assert index_key(STEP, rank) in keys
-        assert rank_commit_key(STEP, rank) in keys
-        assert f"{version_prefix(STEP)}/rank_{rank}/__{rank}_0.distcp" in keys
+        assert index_key(STEP, rank, generation) in keys
+        assert rank_commit_key(STEP, rank, generation) in keys
+        assert f"{version_prefix(STEP)}/{generation}/rank_{rank}/__{rank}_0.distcp" in keys
     assert commit_key(STEP) not in keys, "commit 之前这一版对恢复端不可见"
 
     # rank 0 的提交动作：只允许 list（前缀查询）与 PUT，不允许读任何 rank 的索引
@@ -212,7 +241,13 @@ def test_finalize_rejects_missing_rank(state, tmp_path, storage, s3_config) -> N
     """少一个 rank 上传：rank 0 的 list 检查直接失败，且不写 COMMIT。"""
     saved = state.step_once()
     upload_ranks(
-        saved, tp=2, local_root=tmp_path / "local", s3_config=s3_config, step=STEP, ranks=[0]
+        saved,
+        tp=2,
+        local_root=tmp_path / "local",
+        s3_config=s3_config,
+        step=STEP,
+        ranks=[0],
+        expected=[0, 1],
     )
 
     with pytest.raises(FormatError, match="not all uploaded"):
@@ -226,10 +261,10 @@ def test_finalize_rejects_missing_rank(state, tmp_path, storage, s3_config) -> N
 def test_finalize_rejects_half_uploaded_rank(state, tmp_path, storage, s3_config) -> None:
     """数据传了、分片提交点还没写（进程死在中间）：同样不算完成。"""
     saved = state.step_once()
-    upload_ranks(
+    summaries = upload_ranks(
         saved, tp=2, local_root=tmp_path / "local", s3_config=s3_config, step=STEP, ranks=[0, 1]
     )
-    storage.delete(rank_commit_key(STEP, 1))
+    storage.delete(rank_commit_key(STEP, 1, summaries[0]["generation"]))
 
     with pytest.raises(FormatError, match="not all uploaded"):
         ckpt.finalize_upload(storage, step=STEP, ranks=[0, 1], layout={"tp": 2})
@@ -240,11 +275,12 @@ def test_finalize_rejects_half_uploaded_rank(state, tmp_path, storage, s3_config
 def test_finalize_rejects_stray_rank_prefix(state, tmp_path, storage, s3_config) -> None:
     """COMMIT 之外的 rank 前缀是上一次重试的残片，必须报出来而不是悄悄忽略。"""
     saved = state.step_once()
-    upload_ranks(
+    summaries = upload_ranks(
         saved, tp=2, local_root=tmp_path / "local", s3_config=s3_config, step=STEP, ranks=[0]
     )
-    storage.write(index_key(STEP, 9), b"{}")
-    storage.write(rank_commit_key(STEP, 9), b"{}")
+    generation = summaries[0]["generation"]
+    storage.write(index_key(STEP, 9, generation), b"{}")
+    storage.write(rank_commit_key(STEP, 9, generation), b"{}")
 
     with pytest.raises(FormatError, match="unexpected rank prefix"):
         ckpt.finalize_upload(storage, step=STEP, ranks=[0], layout={"tp": 2})
@@ -256,10 +292,12 @@ def test_finalize_rejects_stray_rank_prefix(state, tmp_path, storage, s3_config)
 def test_restore_rejects_missing_rank_index(state, tmp_path, storage, s3_config) -> None:
     """COMMIT 声明了 rank 1，但它的索引对象不在了：直接拒绝，不吐半份数据。"""
     saved = state.step_once()
-    upload_ranks(saved, tp=2, local_root=tmp_path / "local", s3_config=s3_config, step=STEP)
+    summaries = upload_ranks(
+        saved, tp=2, local_root=tmp_path / "local", s3_config=s3_config, step=STEP
+    )
     ckpt.finalize_upload(storage, step=STEP, ranks=[0, 1], layout={"tp": 2})
 
-    storage.delete(index_key(STEP, 1))
+    storage.delete(index_key(STEP, 1, summaries[0]["generation"]))
 
     with pytest.raises(FormatError, match="index objects are missing"):
         ckpt.load_object(storage, step=STEP, device=DEVICE)
@@ -272,10 +310,12 @@ def test_restore_reports_missing_rank_commit(state, tmp_path, storage, s3_config
     只让报错能精确指向哪个 rank 的对象被外部删过。
     """
     saved = state.step_once()
-    upload_ranks(saved, tp=2, local_root=tmp_path / "local", s3_config=s3_config, step=STEP)
+    summaries = upload_ranks(
+        saved, tp=2, local_root=tmp_path / "local", s3_config=s3_config, step=STEP
+    )
     ckpt.finalize_upload(storage, step=STEP, ranks=[0, 1], layout={"tp": 2})
 
-    storage.delete(rank_commit_key(STEP, 1))
+    storage.delete(rank_commit_key(STEP, 1, summaries[0]["generation"]))
 
     with pytest.raises(FormatError, match=r"rank\(s\) \[1\]"):
         ckpt.load_object(storage, step=STEP, device=DEVICE)
@@ -288,10 +328,12 @@ def test_missing_data_object_is_caught_at_restore(state, tmp_path, storage, s3_c
     那是 O(对象数) 的额外往返，而且它本来就不知道每个 rank 写了哪些文件。
     """
     saved = state.step_once()
-    upload_ranks(saved, tp=2, local_root=tmp_path / "local", s3_config=s3_config, step=STEP)
+    summaries = upload_ranks(
+        saved, tp=2, local_root=tmp_path / "local", s3_config=s3_config, step=STEP
+    )
     ckpt.finalize_upload(storage, step=STEP, ranks=[0, 1], layout={"tp": 2})
 
-    storage.delete(data_key(STEP, 1, "__1_0.distcp"))
+    storage.delete(data_key(STEP, 1, "__1_0.distcp", summaries[0]["generation"]))
 
     with pytest.raises((ObjectNotFoundError, StorageError)):
         ckpt.load_object(storage, step=STEP, device=DEVICE)
@@ -362,8 +404,9 @@ def test_large_object_restore_downloads_and_verifies_chunks(tmp_path, storage) -
     array = np.arange(3 * MiB, dtype=np.float32)  # 12 MiB -> 3 个 4 MiB 块
     local = tmp_path / "local"
     ckpt.save_local({"big": make_large_tensor("big", array)}, local, step=1)
-    ckpt.upload_local(local, storage, step=1, rank=0)
-    ckpt.finalize_upload(storage, step=1, ranks=[0], layout={})
+    generation = ckpt.begin_upload(storage, step=1, ranks=[0])
+    ckpt.upload_local(local, storage, step=1, rank=0, generation=generation)
+    ckpt.finalize_upload(storage, step=1, ranks=[0], layout={}, generation=generation)
 
     report = ckpt.load_object(storage, step=1, device="cpu")
 
@@ -381,10 +424,11 @@ def test_object_restore_detects_middle_chunk_corruption(tmp_path, storage) -> No
     array = np.arange(3 * MiB, dtype=np.float32)
     local = tmp_path / "local"
     ckpt.save_local({"big": make_large_tensor("big", array)}, local, step=1)
-    ckpt.upload_local(local, storage, step=1, rank=0)
-    ckpt.finalize_upload(storage, step=1, ranks=[0], layout={})
+    generation = ckpt.begin_upload(storage, step=1, ranks=[0])
+    ckpt.upload_local(local, storage, step=1, rank=0, generation=generation)
+    ckpt.finalize_upload(storage, step=1, ranks=[0], layout={}, generation=generation)
 
-    key = data_key(1, 0, "__0_0.distcp")
+    key = data_key(1, 0, "__0_0.distcp", generation)
     payload = bytearray(storage.read(key))
     payload[4 * MiB] ^= 0xFF  # 第二块开头，长度不变
     storage.write(key, bytes(payload))

@@ -461,6 +461,8 @@ def save_and_upload_rank(job: Mapping[str, Any]) -> dict[str, Any]:
 
     ``job["s3"]`` 是 ``S3Config`` 的关键字参数（endpoint/bucket/prefix/凭据），
     子进程自己建连接 —— 与「每个 rank 一条独立上传通道」的真实形态一致。
+    ``job["generation"]`` 是 rank 0 分配的代际（缺席时走单 rank 自动路径）：
+    多 rank 各自开代会落到不同的 ``gen_*`` 前缀下，那一版永远凑不齐。
     """
     import api as ckpt
     from storage.object import S3Config, S3Storage
@@ -469,7 +471,11 @@ def save_and_upload_rank(job: Mapping[str, Any]) -> dict[str, Any]:
     storage = S3Storage(S3Config(**job["s3"]))
     try:
         info["uploaded"] = ckpt.upload_local(
-            job["root"], storage, step=job["step"], rank=job["rank"]
+            job["root"],
+            storage,
+            step=job["step"],
+            rank=job["rank"],
+            generation=job.get("generation"),
         )
     finally:
         storage.close()

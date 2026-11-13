@@ -251,7 +251,13 @@ def save_rank(job: Mapping[str, Any]) -> dict[str, Any]:
     if job.get("s3"):
         storage = S3Storage(S3Config(**job["s3"]))
         try:
-            info["uploaded"] = ckpt.upload_local(job["root"], storage, step=step, rank=rank)
+            info["uploaded"] = ckpt.upload_local(
+                job["root"],
+                storage,
+                step=step,
+                rank=rank,
+                generation=job.get("generation"),
+            )
         finally:
             storage.close()
     return info
@@ -305,6 +311,7 @@ class Scenario:
             "device": self.device,
             # 故障那一版不上传：先死在写 COMMIT 上，模拟训练进程崩溃
             "s3": None if fault else dict(self.s3),
+            "generation": None,
         }
 
     def storage(self) -> S3Storage:
@@ -330,10 +337,26 @@ def _spawn(targets: Sequence[Any], jobs: Sequence[Mapping[str, Any]]) -> list[in
 
 
 def _run_ranks(sc: Scenario, step: int, *, fault_rank: int | None = None) -> list[int]:
-    """把这一版写到每个 rank 的本地目录（并上传），返回各进程退出码。"""
+    """把这一版写到每个 rank 的本地目录（并上传），返回各进程退出码。
+
+    代际在这里统一分配（等价于 rank 0 的 ``begin_upload``）再下发：多 rank 各自
+    开代会落到不同的 ``gen_*`` 前缀下，那一版永远凑不齐。
+    """
     jobs = [
         sc.job(step, rank, fault=rank == fault_rank) for rank in range(sc.ranks)
     ]
+    uploading = [job for job in jobs if job["s3"]]
+    if uploading:
+        # 只有真的要上传时才开一代（崩溃阶段一个字节都不传）
+        storage = sc.storage()
+        try:
+            generation = ckpt.begin_upload(
+                storage, step=step, ranks=list(range(sc.ranks))
+            ).id
+        finally:
+            storage.close()
+        for job in uploading:
+            job["generation"] = generation
     if sc.ranks == 1 and fault_rank is None:
         _worker(jobs[0])  # 单 rank 直接在主进程跑，省一次 spawn
         return [0]
