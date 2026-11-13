@@ -138,10 +138,10 @@ def write_tp_version(root: Path, tensors, *, step: int, tp: int, dims) -> Checkp
     )
     index.validate()
 
-    metadata_bytes = write_metadata(storage, step, index)
+    metadata = write_metadata(storage, step, index)
     write_commit(
         storage,
-        CommitRecord(step=step, metadata_bytes=metadata_bytes, files=files),
+        CommitRecord.of_metadata(step=step, metadata=metadata, files=files),
     )
     return index
 
@@ -408,10 +408,7 @@ def test_corrupted_data_byte_is_ignored_when_verification_is_off(saved) -> None:
 
 
 def test_corrupted_metadata_raises_before_any_tensor_is_read(saved) -> None:
-    """索引被改坏：不再靠 crc32，靠 JSON 解析 + ``CheckpointIndex.validate()``。
-
-    两者都能在读任何张量之前失败，代价为零，所以索引侧的校验和是多余的。
-    """
+    """索引字节被改坏：COMMIT 里的 CRC-32C 在读任何张量之前就报出来。"""
     root, _, _ = saved
     storage = LocalStorage(root)
     key = f"{version_key(42)}/{META_FILE}"
@@ -419,7 +416,43 @@ def test_corrupted_metadata_raises_before_any_tensor_is_read(saved) -> None:
     payload[10] ^= 0x01
     storage.write(key, bytes(payload))
 
-    with pytest.raises((FormatError, ChecksumError)):
+    with pytest.raises(ChecksumError, match="crc32c"):
+        load_local(root, step=42, device="cpu")
+
+
+def test_rewritten_metadata_is_caught_by_commit_crc(saved) -> None:
+    """长度不变、JSON 合法、``validate()`` 也通过：只有 COMMIT 的 CRC-32C 能抓住。
+
+    这正是只记长度时会漏掉的那一类 —— 索引被整段重写成一个「结构自洽、指向别处」
+    的版本，字节数分毫不差，任何结构性校验都看不出问题，读出来的却是另一份元数据。
+    """
+    root, _, report = saved
+    storage = LocalStorage(root)
+    key = f"{version_key(42)}/{META_FILE}"
+    text = storage.read(key).decode("utf-8")
+
+    before = f'"step": {report.step}'
+    after = f'"step": {report.step + 1}'
+    assert text.count(before) == 1
+    payload = text.replace(before, after).encode("utf-8")
+    assert len(payload) == len(text.encode("utf-8")), "篡改必须保持字节数不变"
+    storage.write(key, payload)
+
+    # ``verify_crc=False`` 说明这不是块级 CRC 兜住的：索引本身在解析之前就被拒了
+    with pytest.raises(ChecksumError, match="crc32c"):
+        load_local(root, step=42, device="cpu", verify_crc=False)
+
+
+def test_commit_without_metadata_crc_is_rejected(saved) -> None:
+    """旧格式（只记字节数）的 COMMIT 不再被接受：摘要缺席就不算提交点。"""
+    root, _, _ = saved
+    storage = LocalStorage(root)
+    key = f"{version_key(42)}/{COMMIT_FILE}"
+    payload = read_commit_json(storage, 42)
+    del payload["metadata"]["crc32c"]
+    storage.write(key, json.dumps(payload).encode("utf-8"))
+
+    with pytest.raises(FormatError, match="crc32c"):
         load_local(root, step=42, device="cpu")
 
 

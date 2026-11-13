@@ -13,25 +13,45 @@
 step」。指针省下的只是一次 ``list``（反正不读对象内容），却会带来「指针失效就
 恢复不了」「删版本要维护指针」「谁能写指针」三类问题，所以直接扫描。
 
-``COMMIT`` 只记 ``.metadata`` 的**字节数**，不记校验和：原子 rename/PUT 已经排除
-「半写」，剩下的「长度不变、内容被改坏」由 JSON 解析 + ``CheckpointIndex.validate()``
-兜住结构性问题，而字节级正确性由索引里的块级 CRC-32C（读路径）与上传时的对象级
-校验和（``storage/object.py``）负责。
+``COMMIT`` 记 ``.metadata`` 的**字节数 + CRC-32C**。原子 rename/PUT 只排除「半写」，
+「长度不变、内容被改坏」它抓不到；JSON 解析与 ``CheckpointIndex.validate()`` 只兜
+结构性问题 —— 一份少了一个分片、或某个 ``byte_offset`` 被改过的索引在结构上完全
+合法，照样解析得出来，只是指向错的数据。所以提交点自己带上索引的字节级摘要：恢复端
+读完 ``.metadata`` 先比长度、再比 CRC-32C，任一不符都在读第一个张量之前报错。
+
+算法与本地分片块 CRC-32C 是同一套（:func:`storage.checksum.crc32c_hex`），所以这里
+存的是 8 位小写十六进制；对象级校验和（``storage/object.py``）仍然只在对象存储边界
+管「发回来的 = 存进去的」，两层互不替代。
 """
 
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Mapping
 
 from core import FormatError
 from core.index import META_FILE, CheckpointIndex
 from storage.base import ObjectNotFoundError, StorageBackend
+from storage.checksum import crc32c_hex
 
 COMMIT_FILE = "COMMIT"
 COMMIT_TEMP = "COMMIT.tmp"
-COMMIT_FORMAT_VERSION = 1
+COMMIT_FORMAT_VERSION = 2
+"""v2 起 ``COMMIT`` 记 ``.metadata`` 的 CRC-32C；v1（只记字节数）不再兼容。"""
+
+_CRC32C_RE = re.compile(r"^[0-9a-f]{8}$")
+
+
+def check_crc32c(value: str, what: str) -> str:
+    """校验一个 CRC-32C 的写法：8 位小写十六进制。
+
+    L1 的 ``COMMIT`` 与对象存储的 L2 分片提交点共用这一处判据，别各写一套。
+    """
+    if not isinstance(value, str) or not _CRC32C_RE.match(value):
+        raise FormatError(f"{what} must be 8 lowercase hex digits, got {value!r}")
+    return value
 
 
 def version_key(step: int) -> str:
@@ -47,6 +67,9 @@ class CommitRecord:
 
     step: int
     metadata_bytes: int
+    metadata_crc32c: str
+    """``.metadata`` 原始字节的 CRC-32C（8 位小写十六进制），与块级 CRC 同一算法。"""
+
     files: Mapping[str, int] = field(default_factory=dict)
     """版本目录内的文件清单：文件名 -> 字节数（含 O_DIRECT 尾块补齐）。"""
 
@@ -60,10 +83,41 @@ class CommitRecord:
             )
         if self.step < 0:
             raise FormatError(f"step must be >= 0, got {self.step}")
+        if self.metadata_bytes < 0:
+            raise FormatError(
+                f"metadata bytes must be >= 0, got {self.metadata_bytes}"
+            )
+        check_crc32c(self.metadata_crc32c, "COMMIT metadata.crc32c")
         object.__setattr__(self, "files", dict(self.files))
 
+    @classmethod
+    def of_metadata(
+        cls,
+        *,
+        step: int,
+        metadata: bytes | bytearray | memoryview,
+        files: Mapping[str, int] | None = None,
+    ) -> "CommitRecord":
+        """从 ``.metadata`` 的原始字节造提交记录：长度与 CRC-32C 一起记下。
+
+        写侧只该走这条路：:func:`write_metadata` 把写下去的 payload 原样返回，这里
+        直接对它算摘要，不重新序列化索引 —— 既省一次 JSON，也保证记录的就是落盘的
+        那份字节。
+        """
+        payload = bytes(metadata)
+        return cls(
+            step=step,
+            metadata_bytes=len(payload),
+            metadata_crc32c=crc32c_hex(payload),
+            files={} if files is None else files,
+        )
+
     def dumps(self) -> str:
-        metadata: dict[str, object] = {"file": META_FILE, "bytes": self.metadata_bytes}
+        metadata: dict[str, object] = {
+            "file": META_FILE,
+            "bytes": self.metadata_bytes,
+            "crc32c": self.metadata_crc32c,
+        }
         return json.dumps(
             {
                 "format_version": self.format_version,
@@ -87,6 +141,9 @@ class CommitRecord:
         metadata = data.get("metadata")
         if not isinstance(metadata, dict):
             raise FormatError("COMMIT missing 'metadata' object")
+        crc32c = metadata.get("crc32c")
+        if not isinstance(crc32c, str):
+            raise FormatError("COMMIT missing 'metadata.crc32c' (index checksum)")
         files = data.get("files", {})
         if not isinstance(files, dict):
             raise FormatError("COMMIT 'files' must be an object")
@@ -94,6 +151,7 @@ class CommitRecord:
             return cls(
                 step=int(data["step"]),
                 metadata_bytes=int(metadata["bytes"]),
+                metadata_crc32c=crc32c,
                 files={str(name): int(size) for name, size in files.items()},
                 format_version=int(data.get("format_version", COMMIT_FORMAT_VERSION)),
             )
@@ -101,12 +159,17 @@ class CommitRecord:
             raise FormatError(f"COMMIT is malformed: {exc}") from exc
 
 
-def write_metadata(storage: StorageBackend, step: int, index: CheckpointIndex) -> int:
-    """写 ``.metadata``（索引本身也是提交点之一），返回字节数。"""
-    text = index.dumps()
-    payload = text.encode("utf-8")
+def write_metadata(
+    storage: StorageBackend, step: int, index: CheckpointIndex
+) -> bytes:
+    """写 ``.metadata``（索引本身也是提交点之一），返回写入的原始字节。
+
+    返回 payload 而不是字节数：调用方拿它造 ``COMMIT``
+    （:meth:`CommitRecord.of_metadata`），长度与 CRC-32C 都从同一份字节来。
+    """
+    payload = index.dumps().encode("utf-8")
     storage.write(f"{version_key(step)}/{META_FILE}", payload)
-    return len(payload)
+    return payload
 
 
 def write_commit(storage: StorageBackend, record: CommitRecord) -> None:
@@ -170,6 +233,7 @@ __all__ = [
     "COMMIT_FORMAT_VERSION",
     "COMMIT_TEMP",
     "CommitRecord",
+    "check_crc32c",
     "committed_steps",
     "delete_version",
     "latest_step",

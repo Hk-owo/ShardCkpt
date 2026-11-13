@@ -26,10 +26,11 @@ from commit.generation import (
     pointer_key,
     verify_holder,
 )
-from core import FormatError
+from core import ChecksumError, FormatError
 from core.index import META_FILE
 from core.metadata import CPU
 from storage.base import WriteOutcome
+from storage.checksum import crc32c_hex
 from storage.object import S3Config, S3Storage
 from storage.upload import (
     COMMIT_FILE,
@@ -357,10 +358,12 @@ def test_recovery_rejects_mismatched_rank_commit_generation(
     ckpt.upload_local(local, storage, step=STEP, rank=0, generation=gen)
     ckpt.finalize_upload(storage, step=STEP, ranks=[0], generation=gen)
 
+    index_payload = storage.read(index_key(STEP, 0, gen))
     forged = RankCommit(
         step=STEP,
         rank=0,
-        metadata_bytes=storage.head(index_key(STEP, 0, gen)).size,
+        metadata_bytes=len(index_payload),
+        metadata_crc32c=crc32c_hex(index_payload),
         files={},
         generation=Generation(step=STEP, seq=gen.seq + 5, writer="deadbeef").id,
         seq=gen.seq + 5,
@@ -425,6 +428,58 @@ def test_legacy_v1_layout_still_restores(storage: S3Storage, tmp_path) -> None:
     )
 
     assert commit_value(storage) == pytest.approx(3.0)
+
+
+# --- L2 的索引摘要 ----------------------------------------------------------
+
+
+def test_rank_commit_records_metadata_crc(storage: S3Storage, tmp_path) -> None:
+    """L2 记下本 rank ``.metadata`` 的字节数与 CRC-32C，与 L1 的 COMMIT 同一算法。"""
+    local = tmp_path / "local"
+    save_one(local)
+    gen = ckpt.begin_upload(storage, step=STEP, ranks=[0])
+    ckpt.upload_local(local, storage, step=STEP, rank=0, generation=gen)
+
+    rank_commit = RankCommit.loads(
+        storage.read(rank_commit_key(STEP, 0, gen)).decode("utf-8")
+    )
+    payload = storage.read(index_key(STEP, 0, gen))
+
+    assert rank_commit.metadata_bytes == len(payload)
+    assert rank_commit.metadata_crc32c == crc32c_hex(payload)
+
+
+def test_rank_commit_v2_requires_metadata_crc() -> None:
+    """写侧必须给摘要：v2 的 L2 少了它就不是提交点。"""
+    with pytest.raises(FormatError, match="crc32c"):
+        RankCommit(step=STEP, rank=0, metadata_bytes=8)
+    with pytest.raises(FormatError, match="crc32c"):
+        RankCommit(step=STEP, rank=0, metadata_bytes=8, metadata_crc32c="deadbee")
+
+
+def test_corrupted_rank_metadata_is_rejected(storage: S3Storage, tmp_path) -> None:
+    """某个 rank 的 ``.metadata`` 被改坏（长度不变）：合并索引之前就报出来。
+
+    没有 L2 摘要时这类篡改会被合并进索引 —— 改的是 step 这种「结构上完全合法」的
+    字段，``CheckpointIndex.validate()`` 也无从判断。
+    """
+    local = tmp_path / "local"
+    save_one(local, value=1.0)
+    gen = ckpt.begin_upload(storage, step=STEP, ranks=[0])
+    ckpt.upload_local(local, storage, step=STEP, rank=0, generation=gen)
+    ckpt.finalize_upload(storage, step=STEP, ranks=[0], generation=gen)
+
+    key = index_key(STEP, 0, gen)
+    text = storage.read(key).decode("utf-8")
+    before = f'"step": {STEP}'
+    after = f'"step": {STEP + 1}'
+    assert text.count(before) == 1
+    tampered = text.replace(before, after).encode("utf-8")
+    assert len(tampered) == len(text.encode("utf-8")), "篡改必须保持字节数不变"
+    storage.write(key, tampered)
+
+    with pytest.raises(ChecksumError, match="crc32c"):
+        ckpt.load_object(storage, step=STEP, device=DEVICE)
 
 
 def test_finalize_is_idempotent_without_extra_writes(

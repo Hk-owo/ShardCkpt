@@ -13,6 +13,7 @@ import api as ckpt
 from async_ import PinnedBufferPool, SnapshotManager, SnapshotState, aligned_allocator
 from commit.local import (
     COMMIT_FILE,
+    COMMIT_FORMAT_VERSION,
     committed_steps,
     delete_version,
     latest_step,
@@ -24,7 +25,7 @@ from core.index import META_FILE, CheckpointIndex
 from core.metadata import numpy_dtype
 from core.region import Region
 from planner.save_plan import ShardSource
-from storage.checksum import crc32c_chunks
+from storage.checksum import crc32c_chunks, crc32c_hex
 from storage.local import LocalStorage
 
 BLOBS = {"lr_scheduler": b"L" * 32, "rng/rank_0": bytes(range(64))}
@@ -255,14 +256,22 @@ def test_second_save_reuses_the_pinned_block(dataset: Path, tmp_path: Path) -> N
 
 
 def test_commit_record_is_stable_json(saved) -> None:
-    _, _, report = saved
+    root, _, report = saved
     text = report.commit.dumps()
     payload = json.loads(text)
 
     assert payload["step"] == 42
     assert payload["metadata"]["file"] == META_FILE
-    assert payload["format_version"] == 1
+    assert payload["format_version"] == COMMIT_FORMAT_VERSION
     assert list(payload["files"]) == [report.file]
+    # 索引的摘要落在提交点里，写法与块级 CRC 一致（8 位小写十六进制）
+    assert payload["metadata"]["crc32c"] == report.commit.metadata_crc32c
+    assert len(payload["metadata"]["crc32c"]) == 8
+
+    storage = LocalStorage(root)
+    metadata = storage.read(f"{report.key}/{META_FILE}")
+    assert payload["metadata"]["bytes"] == len(metadata)
+    assert payload["metadata"]["crc32c"] == crc32c_hex(metadata)
 
 
 # --- 两条引擎的临时文件命名必须同构 -------------------------------------------

@@ -116,7 +116,7 @@ data = api.load("/ckpt", device="cuda:0")           # 本地版本目录自动�
 | `default_pool()` | `async_/pinned.py` | 保存路径的进程级常驻池：跨 step 复用同一块，`trim()` 削掉多余空闲块 |
 | `SnapshotManager` | `async_/machine.py` | 一代快照的状态机 + 多代门闸（单/双缓冲） |
 | `LocalStorage` | `storage/local.py` | 本地目录后端：native 写（O_DIRECT+fsync+rename）/ preadv 读；`conditional_writes=True` 时兼作条件写替身（仿真/GC 测试） |
-| `CommitRecord` | `commit/local.py` | COMMIT 内容：step、metadata 字节数、文件清单 |
+| `CommitRecord` | `commit/local.py` | COMMIT 内容：step、metadata 字节数与 CRC-32C、文件清单 |
 | `save_local()` | `api.py` | 本地层写闭环：plan → D2H → 数据 + `.metadata` + COMMIT |
 | `open_version()` | `storage/recover.py` | 恢复门禁：只认带 COMMIT 的版本，校验 `.metadata` 与数据文件 |
 | `targets_for_layout()` | `planner/targets.py` | 新布局 → 本 rank 的目标区域（`tp=1` 时整读） |
@@ -125,7 +125,7 @@ data = api.load("/ckpt", device="cuda:0")           # 本地版本目录自动�
 | `upload_local()` / `finalize_upload()` | `storage/upload.py` | 对象存储上传：每 rank 独立上传（`If-None-Match`）+ rank 0 `seal` 后 CAS 写 `COMMIT`，写完即做有界保留 |
 | `load_object()` | `storage/upload.py` | 对象存储恢复：COMMIT → 合并索引 → 整文件下载 → 本地读闭环 |
 | `load_checkpoint()` | `api.py` / `storage/upload.py` | 恢复入口：本地热副本优先（远端有同代 `COMMIT` ⇒ 零下载），否则回落 `load_object()` |
-| `RankCommit` | `storage/upload.py` | 分片提交点：`step_N/<gen>/rank_i/COMMIT`，证明本 rank 传完了 |
+| `RankCommit` | `storage/upload.py` | 分片提交点：`step_N/<gen>/rank_i/COMMIT`，证明本 rank 传完了（带本 rank `.metadata` 的字节数与 CRC-32C） |
 | `Generation` / `FencedError` | `commit/generation.py` | 代际身份与「你已被取代」的裁决错误 |
 | `S3Storage` 条件写 | `storage/object.py` | `put_if_absent` / `put_if_match` / `head` / `write_file` / `probe_conditional_writes` |
 | `plan()` | `commit/gc.py` | 残片回收判据（纯函数）：已上传/被越过/代际残片，删哪些、留哪些（含恢复层窗口）、为什么 |
@@ -435,8 +435,9 @@ report.amplification                                    # 读放大（Range GET 
   这一版对恢复端不可见；反过来它是**幂等可重跑**的，rank 0 崩在最后一步，重启
   补调一次就能把这一版补成可恢复（重跑不产生任何写入）
 - **恢复端才做全局校验**：`open_object_version` 按 `COMMIT` 的 generation 与 rank
-  清单读各 rank 的 `.metadata`，把分片 `file` 加上 `rank_<i>/` 前缀后合并，再
-  `validate()` 查覆盖与重叠。缺任何一个 rank 的索引都在读数据之前报错
+  清单读各 rank 的 `.metadata`，先按每个 rank 的 L2 比对字节数与 CRC-32C（不符即
+  `ChecksumError`），再把分片 `file` 加上 `rank_<i>/` 前缀后合并，最后 `validate()`
+  查覆盖与重叠。缺任何一个 rank 的索引都在读数据之前报错
 - **提交完成即有界保留**：`COMMIT` 写完，同一个 rank 0 接着只留最新 `keep` 代
   （默认 `DEFAULT_KEEP_VERSIONS = 3`），从最旧的一代开始删 —— **先删它的版本
   `COMMIT`，再删 `GEN`、分片提交点与数据**。提交点一消失这一版立刻不可恢复
@@ -549,7 +550,7 @@ ckpt/
   step_42/
     __0_0.distcp      # 数据：planner 布局，按 4096 补齐到块边界
     .metadata         # 索引：分片全局坐标 + 字节区间
-    COMMIT            # 提交标记：索引字节数 + 文件清单
+    COMMIT            # 提交标记：索引字节数 + CRC-32C + 文件清单
 ```
 
 没有 `latest` 指针：`step=None` 的答案恒等于「所有带 `COMMIT` 的版本里最大的 step」，
@@ -716,8 +717,10 @@ report = ckpt.load_local(
 )
 ```
 
-- **COMMIT 是第一道门**：没有 `COMMIT` 的目录、`.metadata` 长度与 `COMMIT` 不符、
-  `COMMIT` 清单缺文件、数据文件大小不符 —— 全部在读第一个张量之前报错，不会吐出半份数据
+- **COMMIT 是第一道门**：没有 `COMMIT` 的目录、`.metadata` 长度或 CRC-32C 与 `COMMIT`
+  不符、`COMMIT` 清单缺文件、数据文件大小不符 —— 全部在读第一个张量之前报错，不会吐出
+  半份数据。索引的 CRC-32C 是必须的：一份被重写过的索引可以长度分毫不差、JSON 合法、
+  `CheckpointIndex.validate()` 也通过，只有摘要认得出它指向了别处
 - **staging 复用**：一个窗口内所有读请求紧凑排进一块 pinned 块（`PinnedBufferPool`，
   与写路径同一个 `aligned_allocator`），读完、拷完才归还；`budget_bytes` 控制窗口大小，
   单块大于预算时自己占一个窗口
@@ -732,8 +735,10 @@ report = ckpt.load_local(
 
 ## 本地分片 CRC 与对象存储校验的分工
 
-本地版本目录的完整性由 `tmp → fsync → rename → fsync` 与 `COMMIT` 的文件清单兜结构性问题；
-字节级正确性由**块级 CRC-32C** 兜，默认开启。
+本地版本目录的结构性问题由 `tmp → fsync → rename → fsync` 与 `COMMIT` 的文件清单兜；
+字节级正确性分两处：**索引本身**由 `COMMIT` 里记的 `metadata.crc32c` 兜（读完
+`.metadata` 先比长度、再比 CRC-32C，不符就在解析之前报 `ChecksumError`），**数据文件**
+由索引里的块级 CRC-32C 兜，默认开启。
 
 - **写侧总是算**。`save_local` 为每个分片与小状态按 `crc_chunk_max`（默认 1 MiB，
   可配置）切块，每块算一次 CRC-32C（Castagnoli；默认用 `google-crc32c`，走
@@ -775,8 +780,10 @@ report = ckpt.load_local(
 
 ### 旧格式已删除
 
-`manifest.json` 读取路径、`.metadata` / `COMMIT` 里的旧整片 `crc32c`、`COMMIT` 的
-`metadata.crc32` 都已删除。旧 checkpoint 不再兼容：要么重新保存，要么用旧版本程序读取。
+`manifest.json` 读取路径、`.metadata` / `COMMIT` 里的旧整片 `crc32c` 都已删除。
+`COMMIT` 现在记的是 `metadata.crc32c`（CRC-32C，与块级校验同一算法，不再是旧的
+`metadata.crc32`）；`format_version` 随之升到 2，v1 的「只记字节数」不再兼容 ——
+旧 checkpoint 要么重新保存，要么用旧版本程序读取。
 
 注意区分：`planner/save_plan.py` 的 `default_writer` 仍用 `zlib.crc32(fqn) % n`，那是
 **哈希分桶**（决定 Replicate 副本里谁落盘），不是校验，不能跟着改——否则历史版本的

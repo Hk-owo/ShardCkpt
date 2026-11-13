@@ -385,10 +385,10 @@ def merge_rank_versions(
     )
     index.validate()
 
-    metadata_bytes = write_metadata(storage, step, index)
+    metadata = write_metadata(storage, step, index)
     write_commit(
         storage,
-        CommitRecord(step=step, metadata_bytes=metadata_bytes, files=files),
+        CommitRecord.of_metadata(step=step, metadata=metadata, files=files),
     )
     return index
 

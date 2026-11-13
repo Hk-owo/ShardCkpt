@@ -1,12 +1,13 @@
 """恢复端的第一道门：选版本 → 校验提交点 → 把 ``.metadata`` 读成索引。
 
-读取只认带 ``COMMIT`` 的版本目录。``COMMIT`` 里记着 ``.metadata`` 的字节数与
-数据文件清单（名字 -> 字节数），所以「索引写了一半、被截断、缺文件、版本错配」
-这些问题都在读第一个张量之前就能发现。
+读取只认带 ``COMMIT`` 的版本目录。``COMMIT`` 里记着 ``.metadata`` 的字节数、
+CRC-32C 与数据文件清单（名字 -> 字节数），所以「索引写了一半、被截断、内容被改坏、
+缺文件、版本错配」这些问题都在读第一个张量之前就能发现。
 
-**这里不做字节级校验和。** 原子 rename/PUT 已经排除半写，长度对得上就够；
-「长度不变但内容坏了」由 JSON 解析与 ``CheckpointIndex.validate()`` 拦住结构性
-问题，字节级的把关放在上传边界（对象级校验和，见 :mod:`storage.object`）。
+索引的 CRC-32C 是本层唯一的字节级校验：JSON 解析与 ``CheckpointIndex.validate()``
+只看结构，一份被改过 ``byte_offset`` 的索引在结构上完全合法，只有摘要能识别。数据
+文件本身仍由索引里的块级 CRC-32C 在读路径上把关（:mod:`storage.local_load`），
+对象存储的对象级校验和在 :mod:`storage.object`。
 
 这一步不做任何张量 IO，也因此不碰 device：选版本、验索引、查文件大小，全部是
 元数据操作。真正的批量读在 :mod:`storage.local_load`。
@@ -18,9 +19,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from commit.local import CommitRecord, latest_step, read_commit, version_key
-from core import FormatError
+from core import ChecksumError, FormatError
 from core.index import META_FILE, CheckpointIndex
 from storage.base import ObjectNotFoundError, StorageBackend
+from storage.checksum import crc32c_hex
 from storage.local import DEFAULT_ALIGNMENT, LocalStorage
 
 
@@ -100,7 +102,7 @@ def open_version(
 def _read_metadata(
     storage: StorageBackend, key: str, record: CommitRecord
 ) -> bytes:
-    """读 ``.metadata`` 并与 COMMIT 里记的字节数对照（不校验校验和）。"""
+    """读 ``.metadata``，先比长度再比 CRC-32C：内容坏了在解析之前就报错。"""
     meta_key = f"{key}/{META_FILE}"
     try:
         payload = storage.read(meta_key)
@@ -110,6 +112,12 @@ def _read_metadata(
     if len(payload) != record.metadata_bytes:
         raise FormatError(
             f"{meta_key}: {len(payload)} bytes, COMMIT records {record.metadata_bytes}"
+        )
+    actual = crc32c_hex(payload)
+    if actual != record.metadata_crc32c:
+        raise ChecksumError(
+            f"{meta_key}: crc32c {actual}, COMMIT records {record.metadata_crc32c}"
+            "（索引内容与提交点不符）"
         )
     return payload
 

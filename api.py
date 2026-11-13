@@ -417,13 +417,13 @@ def save_local(
             raise PlanError(f"{key}/{plan.file}: 写入 {file_size} 字节，期望 {aligned_size}")
 
         # 2) 索引，也兼作提交点之一
-        metadata_bytes = write_metadata(storage, step, index)
+        metadata = write_metadata(storage, step, index)
         snapshot.persist_ok()  # 本 rank 的数据已落地
 
-        # 3) COMMIT：这一步之后这一版才可恢复
-        record = CommitRecord(
+        # 3) COMMIT：这一步之后这一版才可恢复（索引的长度 + CRC-32C 一起记下）
+        record = CommitRecord.of_metadata(
             step=step,
-            metadata_bytes=metadata_bytes,
+            metadata=metadata,
             files={plan.file: file_size},
         )
         write_commit(storage, record)

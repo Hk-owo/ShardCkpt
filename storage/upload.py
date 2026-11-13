@@ -45,6 +45,11 @@ key 布局（相对存储配置里的 prefix）::
 3. 恢复端先读版本 ``COMMIT``（没有就拒绝），再按 ``COMMIT`` 里的 rank 清单读索引；
    缺任何一个 rank 的索引都直接报错，不会交出半份数据。
 
+两层提交点都记着自己那份 ``.metadata`` 的**字节数 + CRC-32C**（本地 ``COMMIT`` 记本地
+索引，``rank_<r>/COMMIT`` 记本 rank 索引），算法统一走 :mod:`storage.checksum`。
+恢复端逐份比对后才合并 —— 合并后的 ``validate()`` 只看结构，改一个 ``step`` 或挪一个
+``byte_offset`` 的索引在结构上完全合法。
+
 对象存储侧**有界保留**：rank 0 写完版本 ``COMMIT`` 之后立刻只留最新 ``keep`` 代
 （默认 3 代），从最旧的一代开始删 —— 先删它的版本 ``COMMIT``，再删分片提交点与数据
 （:func:`commit.gc.retain_remote_versions`）。``keep=None`` 关掉自动裁剪。
@@ -74,6 +79,7 @@ from typing import Mapping, Sequence
 from async_ import Tensor
 from commit.gc import DEFAULT_KEEP_VERSIONS, retain_remote_versions
 from commit.generation import (
+    GENERATION_FORMAT_VERSION,
     SUPPORTED_FORMAT_VERSIONS,
     FencedError,
     Generation,
@@ -86,12 +92,13 @@ from commit.generation import (
 from commit.local import (
     COMMIT_FILE,
     CommitRecord,
+    check_crc32c,
     latest_step,
     read_commit,
     write_commit,
     write_metadata,
 )
-from core import FormatError, PlanError
+from core import ChecksumError, FormatError, PlanError
 from core.index import META_FILE, BlobMeta, CheckpointIndex, ShardMeta, TensorMeta
 from core.metadata import Device
 from planner.load_plan import build_load_plan
@@ -102,12 +109,16 @@ from storage.base import (
     StorageBackend,
     StorageError,
 )
+from storage.checksum import crc32c_hex
 from storage.local import LocalStorage
 from storage.local_load import LoadReport, load_local
 from storage.recover import recover_version
 
 COMMIT_FORMAT_VERSION = 2
-"""v2 起用 ``step_N/<gen>/`` 布局；读侧仍接受 v1（``generation=None``）。"""
+"""v2 起用 ``step_N/<gen>/`` 布局，且 L2 的 ``.metadata`` 记 CRC-32C。
+
+读侧仍接受 v1（``generation=None``、没有 ``metadata.crc32c``，跳过校验）。
+"""
 
 DEFAULT_BUDGET_BYTES = 8 << 20
 
@@ -265,11 +276,18 @@ class RankCommit:
        半传时不用再逐个 head 对象；
     2. **驱动本地回收**：本 rank 的 L2 一出现，本地的 ``step_N/`` 就可以删了，
        不必等最慢的 rank，也不必等 rank 0 写完 L3。
+
+    ``metadata_crc32c`` 是**本 rank** 那份 ``.metadata`` 的字节级摘要，算法与 L1 的
+    ``COMMIT`` 一致（CRC-32C，8 位小写十六进制）。恢复端的合并索引是 N 份 ``.metadata``
+    拼出来的，任何一份被改坏都会让「分片怎么拼」出错，而这在合并后的
+    ``CheckpointIndex.validate()`` 里看不出来（结构自洽、指向别处的索引照样通过）。
+    v1 老布局没有这个字段（``None``）：读侧跳过校验，写侧总是写。
     """
 
     step: int
     rank: int
     metadata_bytes: int = 0
+    metadata_crc32c: str | None = None
     files: Mapping[str, int] = field(default_factory=dict)
     generation: str | None = None
     seq: int = 0
@@ -288,6 +306,13 @@ class RankCommit:
             raise FormatError(f"rank must be >= 0, got {self.rank}")
         if self.metadata_bytes < 0:
             raise FormatError(f"metadata bytes must be >= 0, got {self.metadata_bytes}")
+        if self.metadata_crc32c is None:
+            if self.format_version >= GENERATION_FORMAT_VERSION:
+                raise FormatError(
+                    "rank COMMIT v2 must record 'metadata.crc32c' (index checksum)"
+                )
+        else:
+            check_crc32c(self.metadata_crc32c, "rank COMMIT metadata.crc32c")
         if self.generation is not None:
             parsed = Generation.parse(self.generation, step=self.step)
             if parsed.seq != self.seq:
@@ -296,11 +321,14 @@ class RankCommit:
                 )
 
     def dumps(self) -> str:
+        metadata: dict[str, object] = {"bytes": self.metadata_bytes}
+        if self.metadata_crc32c is not None:
+            metadata["crc32c"] = self.metadata_crc32c
         data: dict[str, object] = {
             "format_version": self.format_version,
             "step": self.step,
             "rank": self.rank,
-            "metadata": {"bytes": self.metadata_bytes},
+            "metadata": metadata,
             "files": {name: int(size) for name, size in sorted(self.files.items())},
         }
         if self.generation is not None:
@@ -324,12 +352,16 @@ class RankCommit:
             raise FormatError("rank COMMIT 'metadata' must be an object")
         if not isinstance(files, dict):
             raise FormatError("rank COMMIT 'files' must be an object")
+        crc32c = metadata.get("crc32c")
+        if crc32c is not None and not isinstance(crc32c, str):
+            raise FormatError("rank COMMIT 'metadata.crc32c' must be a string")
         generation = data.get("generation")
         try:
             return cls(
                 step=int(data["step"]),
                 rank=int(data["rank"]),
                 metadata_bytes=int(metadata.get("bytes", 0)),
+                metadata_crc32c=crc32c,
                 files={str(name): int(size) for name, size in files.items()},
                 generation=None if generation is None else str(generation),
                 seq=int(data.get("seq", 0)),
@@ -450,6 +482,7 @@ def upload_rank(
         step=step,
         rank=rank,
         metadata_bytes=len(metadata),
+        metadata_crc32c=crc32c_hex(metadata),
         files=sizes,
         generation=gen.id,
         seq=gen.seq,
@@ -729,13 +762,30 @@ def open_object_version(
                 "这一版混了两次尝试的分片，拒绝恢复"
             )
 
+        # 合并索引是 N 份 ``.metadata`` 拼出来的：任何一份被改坏都会让「分片怎么拼」
+        # 出错，而合并后的 ``validate()`` 看不出结构自洽的篡改 —— 长度 + CRC-32C 才是
+        # 逐 rank 的字节级凭据（v1 老布局没有摘要，只能靠结构校验）。
+        rank_index_payload = storage.read(index_key(target, rank, commit.generation))
+        # 长度只在 L2 真记了字节数时校验：v1 的 L2 可能根本没记（缺省 0）
+        if rank_commit.metadata_bytes and len(rank_index_payload) != rank_commit.metadata_bytes:
+            raise FormatError(
+                f"{base}/rank_{rank}/{META_FILE}: {len(rank_index_payload)} bytes, "
+                f"rank COMMIT records {rank_commit.metadata_bytes}"
+            )
+        if rank_commit.metadata_crc32c is not None:
+            actual = crc32c_hex(rank_index_payload)
+            if actual != rank_commit.metadata_crc32c:
+                raise ChecksumError(
+                    f"{base}/rank_{rank}/{META_FILE}: crc32c {actual}, rank COMMIT "
+                    f"records {rank_commit.metadata_crc32c}（分片索引与提交点不符）"
+                )
+        index_payloads[rank] = rank_index_payload
+
     shards: dict[str, list[ShardMeta]] = {}
     metas: dict[str, TensorMeta] = {}
     blobs: dict[str, BlobMeta] = {}
     for rank in commit.ranks:
-        rank_index = CheckpointIndex.loads(
-            storage.read(index_key(target, rank, commit.generation)).decode("utf-8")
-        )
+        rank_index = CheckpointIndex.loads(index_payloads[rank].decode("utf-8"))
         for name, meta in rank_index.tensors.items():
             metas.setdefault(name, meta)
             shards.setdefault(name, []).extend(
