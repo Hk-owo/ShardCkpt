@@ -18,7 +18,7 @@
 ## 运行方式
 
 ```bash
-.venv/bin/python -m pytest tests/sim -q              # 默认套件（22 个用例，约 2s）
+.venv/bin/python -m pytest tests/sim -q              # 默认套件（25 个用例，约 2s）
 .venv/bin/python -m pytest tests/sim -m workload -s  # 规模/性能仿真（另 2 个，约 1s）
 .venv/bin/python -m pytest -q                        # 全仓（sim 已并入默认套件）
 ```
@@ -91,17 +91,21 @@ collective。真 gather 落地后把这个函数换成通信实现，**用例一
 
 ### L3 故障注入 — ✅ 部分落地（崩溃 / 提交点 / 写失败）
 
-`tests/sim/test_fault.py`，8 个用例：
+`tests/sim/test_fault.py`，11 个用例：
 
 | 用例 | 守的性质 |
 |---|---|
 | `test_crash_before_commit_leaves_version_invisible` | 子进程写完数据与 `.metadata`、在写 COMMIT 前被 `SIGKILL`：目录有残缺、无 COMMIT，没有更新的提交，旧版本仍完整可读 |
+| `test_resaving_a_committed_step_crashes_fail_closed[2 种]` | **重存同一个 step** 崩在写 COMMIT 前 / 写 `.metadata` 前：本地层没有代际隔离，这一版报废（`COMMIT` 还在、`latest_step()` 仍指向它），但两道门分别报错 —— 索引 CRC-32C（元数据门）与块 CRC-32C（数据门），绝不返回半份数据 |
+| `test_failed_resave_deletes_the_previously_committed_version` | 重存同一 step 在 `PERSISTING` 阶段失败：`ABORTED` 清理删的是**整个 `step_N/`**，上一份已提交版本一起消失；与 `DROPPED`（`SNAPSHOTTING` 阶段失败，什么都不清理）语义相反 |
 | `test_commit_gate_rejects_damaged_version[5 种]` | COMMIT 缺失 / `.metadata` 截断 / 数据文件缺失 / 数据文件截断 / COMMIT 清单漏文件 —— 全部在读第一个张量前 `FormatError` |
 | `test_write_failure_leaves_no_newer_commit` | 写失败 → 没有更新的已提交版本，`latest_step()` 仍指向上一个版本 |
 | `test_local_corruption_detected_by_default` | 改一个字节：默认按块 CRC-32C 校验，在读数据前抛 `ChecksumError`；显式 `verify_crc=False` 时才放行 |
 
-崩溃注入是**确定性**的：不按时间随机 kill，而是让 `write_commit` 那一步直接
-`SIGKILL`，所以每次留下的都是「数据齐、提交点缺失」这一种半成品。
+崩溃注入是**确定性**的：不按时间随机 kill，而是让某一步直接 `SIGKILL`
+（`sim.save_rank_then_die(before="commit" | "metadata")`）。首次保存只会落在
+「数据齐、提交点缺失」；重存同一个 step 时还能落在「数据已换、索引与提交点未换」那
+一步 —— 那是本地层没有代际隔离才会出现的半成品。
 
 ### L4 规模与性能仿真 — ✅ 最小版本落地
 

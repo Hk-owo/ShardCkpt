@@ -435,23 +435,37 @@ def save_rank(job: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def save_rank_then_die(job: Mapping[str, Any]) -> dict[str, Any]:
-    """子进程：写完数据文件与 ``.metadata``，在写 ``COMMIT`` 之前被 SIGKILL。
+_DYING_STEP = {"commit": "write_commit", "metadata": "write_metadata"}
+"""``save_rank_then_die(before=...)`` 能选的死法：那一步之前直接 SIGKILL。"""
 
-    模拟「保存打到一半掉电/被 kill」：数据文件与索引都已落盘，提交点缺失。
-    这里不随机 kill，而是精确地让写 COMMIT 的那一步直接终止进程，所以结果是
-    确定的半成品目录，不会 flaky。
+
+def save_rank_then_die(
+    job: Mapping[str, Any], before: str = "commit"
+) -> dict[str, Any]:
+    """子进程：写到 ``before`` 那一步之前被 SIGKILL。
+
+    模拟「保存打到一半掉电/被 kill」：这里不随机 kill，而是精确地让某一步直接终止
+    进程，所以结果是确定的半成品目录，不会 flaky。
+
+    ``before="commit"``（默认）：数据文件与 ``.metadata`` 都已落盘，提交点缺失。
+    首次保存和重存同一个 step 都会出现这种半成品。
+    ``before="metadata"``：数据文件已 rename 覆盖，索引与提交点还是上一次的。只有
+    **重存同一个 step** 才可能落在这一步 —— 它暴露的是本地层没有代际隔离那一面，
+    见 ``tests/sim/test_fault.py`` 的重存用例。
     """
     import os
     import signal
 
     import api as ckpt
 
-    def kill_before_commit(*args: Any, **kwargs: Any) -> None:
-        # 不执行 original：COMMIT 绝不能落盘，留下的正是「数据齐、提交点缺失」
+    if before not in _DYING_STEP:
+        raise ValueError(f"before must be one of {sorted(_DYING_STEP)}, got {before!r}")
+
+    def die(*args: Any, **kwargs: Any) -> None:
+        # 不执行 original：这一步绝不能落盘
         os.kill(os.getpid(), signal.SIGKILL)
 
-    ckpt.write_commit = kill_before_commit  # type: ignore[assignment]
+    setattr(ckpt, _DYING_STEP[before], die)
     save_rank(job)
     raise AssertionError("unreachable: 子进程应当已经被 SIGKILL")
 
