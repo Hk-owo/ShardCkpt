@@ -62,7 +62,13 @@ from commit.local import (
 )
 from core.index import BlobMeta, CheckpointIndex, ShardMeta, TensorMeta
 from core.region import Region
-from planner.save_plan import SavePlan, ShardSource, build_save_plan
+from planner.save_plan import (
+    PLANNER_MODES,
+    SavePlan,
+    ShardSource,
+    build_save_plan,
+    plan_ranks,
+)
 from storage.local import DEFAULT_ALIGNMENT, LocalStorage
 from core import (
     CheckpointError,
@@ -271,6 +277,83 @@ def _build_index(
     )
 
 
+def _require_object_collective(collective: Any, *, rank: int) -> None:
+    """gathered 模式的能力检查：缺原语就在碰数据之前失败，不留半份。"""
+    if collective is None:
+        raise ValueError("planner='gathered' 需要 collective：分配必须跨 rank 完成")
+    if collective.rank != rank:
+        raise ValueError(
+            f"rank={rank} 与 collective.rank={collective.rank} 不一致："
+            "gathered 模式下两者必须指向同一个 rank"
+        )
+    for method in ("all_gather_objects", "scatter_objects"):
+        if not callable(getattr(collective, method, None)):
+            raise TypeError(
+                f"planner='gathered' 需要 collective 实现 {method}()，"
+                f"{type(collective).__name__} 没有"
+            )
+
+
+def _check_assignment(
+    plan: SavePlan,
+    *,
+    rank: int,
+    tensors: Mapping[str, Tensor],
+    blob_names: set[str],
+) -> None:
+    """scatter 下来的计划必须与本地**实际持有**的数据对得上。
+
+    rank 0 的分配依据是各 rank 自己上报的 sources；如果上报与本地 tensors 不一致
+    （例如上报了别人的张量），只有在收到计划时才能发现。这里把这种错配挡在 D2H 之前。
+    """
+    if plan.rank != rank:
+        raise PlanError(f"收到 rank {plan.rank} 的计划，本 rank 是 {rank}")
+    missing = [item.fqn for item in plan.items if item.fqn not in tensors]
+    if missing:
+        raise PlanError(f"rank 0 把这些张量分给了本 rank，但本地没有：{missing}")
+    unknown_blobs = [blob.name for blob in plan.blobs if blob.name not in blob_names]
+    if unknown_blobs:
+        raise PlanError(f"rank 0 把这些小状态分给了本 rank，但本地没有：{unknown_blobs}")
+
+
+def _plan_via_rank0(
+    sources: list[ShardSource],
+    blob_sizes: Mapping[str, int],
+    *,
+    tensors: Mapping[str, Tensor],
+    blob_names: set[str],
+    rank: int,
+    alignment: int,
+    collective: Any,
+) -> SavePlan:
+    """gathered 模式：全员上报 → rank 0 统一去重与分配 → scatter 回本 rank。
+
+    分工：这里只管「通信 + 校验」，分配算法在 :func:`planner.save_plan.plan_ranks`
+    （纯函数，可单测）。**布局零变化** —— ``plan_ranks`` 复用 ``build_save_plan``
+    的布局算法，所以本函数的结果与各 rank 自己编计划逐字段相同；多出来的是写盘
+    之前的跨 rank 副本标注校验与全局覆盖校验。
+    """
+    _require_object_collective(collective, rank=rank)
+    world = collective.world_size
+    payloads = collective.all_gather_objects((list(sources), dict(blob_sizes)))
+    if len(payloads) != world:
+        raise PlanError(
+            f"all_gather_objects 返回 {len(payloads)} 份，期望 world_size={world}"
+        )
+    per_rank = {r: payloads[r][0] for r in range(world)}
+    per_rank_blobs = {r: payloads[r][1] for r in range(world)}
+
+    assignments: list[SavePlan] | None = None
+    if collective.rank == 0:
+        # 全局覆盖与副本标注在这里校验：单 rank 视角下查不出来，写盘前就能报错。
+        global_plan = plan_ranks(per_rank, blobs=per_rank_blobs, align=alignment)
+        assignments = [global_plan.plan_for(r) for r in range(world)]
+
+    plan = collective.scatter_objects(assignments)
+    _check_assignment(plan, rank=rank, tensors=tensors, blob_names=blob_names)
+    return plan
+
+
 def _clear_padding(plan: SavePlan, view: memoryview, end: int) -> None:
     """对齐缓冲区没初始化，必须把「不属于任何项」的字节清零，否则写盘内容不确定。"""
     spans = [(item.byte_offset, item.end) for item in plan.items]
@@ -293,6 +376,7 @@ def save_local(
     layout: Mapping[str, int] | None = None,
     rank: int = 0,
     sources: list[ShardSource] | None = None,
+    planner: str = "local",
     alignment: int = DEFAULT_ALIGNMENT,
     engine: str = "auto",
     direct_io: bool = True,
@@ -310,6 +394,11 @@ def save_local(
     ``tensors``: FQN -> ``Tensor``（真机在 GPU 上，mock 下是 host 内存）
     ``blobs``:   小状态的**已序列化字节**（RNG / lr scheduler / dataloader 位置）
     ``layout``:  写进索引的 ``saved_layout``，只用于诊断与快路径
+    ``planner``: ``"local"``（默认）每 rank 自己编计划；``"gathered"`` 先全员上报
+                 分片描述、由 rank 0 统一去重与分配、再 scatter 回各 rank。
+                 **两者的物理布局逐字段相同**，gathered 多出来的是写盘之前的跨 rank
+                 校验：``n_replicas`` 一致、``replica_index`` 铺满副本、全局覆盖完整。
+                 代价是每代一次 ``all_gather_objects`` + 一次 ``scatter_objects``。
     ``crc_chunk_max``: CRC 块上限（默认 1 MiB）；块数由分片长度推导，不会截断
     ``pool``:    pinned 块池；``None`` 时用进程级常驻池（``api.default_pool()``），
                  同一份 checkpoint 反复保存时复用同一块，不再每次现造现弃。
@@ -318,6 +407,8 @@ def save_local(
                  一次 ``all_reduce(MAX)`` 统一得出：任一 rank 拿不到 buffer，**全体**
                  这一 step 都不写，不会出现「有的 rank 写、有的跳过」的残缺版本。
                  通信世界的 rank / world_size 由 collective 自己给出。
+                 ``planner="gathered"`` 还要求它实现 ``all_gather_objects`` /
+                 ``scatter_objects``（``dist`` 的两个实现都满足）。
     ``world_size``: 只用于**显式声明**参与通信的 rank 数；不填则按 collective 推导
                  （没有 collective 即 1）。声明 > 1 却没给 collective 直接报错。
     """
@@ -326,19 +417,36 @@ def save_local(
             "manager 与 collective 只能给一个：collective 必须经 SnapshotManager 注入，"
             "两者同时给会有一份被静默忽略"
         )
+    if planner not in PLANNER_MODES:
+        raise ValueError(f"planner must be one of {PLANNER_MODES}, got {planner!r}")
     blob_payloads = dict(blobs or {})
     if sources is None:
         sources = _sources_from_tensors(tensors)
+    blob_sizes = {name: len(payload) for name, payload in blob_payloads.items()}
 
-    plan = build_save_plan(
-        sources,
-        rank=rank,
-        blobs={name: len(payload) for name, payload in blob_payloads.items()},
-        align=alignment,
-    )
+    if planner == "gathered":
+        plan = _plan_via_rank0(
+            sources,
+            blob_sizes,
+            tensors=tensors,
+            blob_names=set(blob_payloads),
+            rank=rank,
+            alignment=alignment,
+            collective=collective,
+        )
+    else:
+        plan = build_save_plan(
+            sources,
+            rank=rank,
+            blobs=blob_sizes,
+            align=alignment,
+        )
     plan.validate()
-    if plan.size == 0:
+    if plan.size == 0 and planner != "gathered":
         raise PlanError("保存计划是空的：没有分片也没有小状态")
+    # gathered 模式下空计划是**合法**的：本 rank 的分片全被去重跳过了（DP 副本里
+    # 必然有一半如此）。它仍然要参与门闸、写一份空索引与 COMMIT，这样「每个 rank
+    # 在 step_N 都有一个已提交版本」这条不变量对所有 rank 一致成立。
 
     # O_DIRECT 要求长度对齐：文件按块边界补齐，读取端按索引里的 length 截断
     aligned_size = -(-plan.size // alignment) * alignment
@@ -412,10 +520,17 @@ def save_local(
         index.validate(complete=False)
 
         # 1) 数据文件：临时文件 -> fsync -> rename -> 目录 fsync
-        storage.write_view(f"{key}/{plan.file}", view[:aligned_size])
-        file_size = storage.path_for(f"{key}/{plan.file}").stat().st_size
-        if file_size != aligned_size:
-            raise PlanError(f"{key}/{plan.file}: 写入 {file_size} 字节，期望 {aligned_size}")
+        #    空计划（gathered 下全被去重跳过）不写数据文件，也不在 COMMIT 里记
+        #    任何文件 —— 只有空索引 + COMMIT 两层提交点。
+        files: dict[str, int] = {}
+        if aligned_size:
+            storage.write_view(f"{key}/{plan.file}", view[:aligned_size])
+            file_size = storage.path_for(f"{key}/{plan.file}").stat().st_size
+            if file_size != aligned_size:
+                raise PlanError(
+                    f"{key}/{plan.file}: 写入 {file_size} 字节，期望 {aligned_size}"
+                )
+            files[plan.file] = file_size
 
         # 2) 索引，也兼作提交点之一
         metadata = write_metadata(storage, step, index)
@@ -425,7 +540,7 @@ def save_local(
         record = CommitRecord.of_metadata(
             step=step,
             metadata=metadata,
-            files={plan.file: file_size},
+            files=files,
         )
         write_commit(storage, record)
         snapshot.commit_ok()

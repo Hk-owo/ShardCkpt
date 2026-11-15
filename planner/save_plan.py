@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import zlib
 from dataclasses import dataclass
-from typing import Callable, Iterable, Mapping
+from typing import Callable, Iterable, Mapping, Sequence
 
 from core import PlanError
 from core.index import BlobMeta, CheckpointIndex, ShardMeta, TensorMeta
@@ -29,6 +29,17 @@ DEFAULT_ALIGN = 4096
 
 DEFAULT_FILE = "__{rank}_{shard}.distcp"
 """数据文件名：``__<rank>_<序号>.distcp``，与文档 §3 的示例一致。"""
+
+PLANNER_MODES = ("local", "gathered")
+"""谁负责编计划。
+
+``local``     每 rank 自己编（默认）。去重只看 ``(fqn, n_replicas)``，所以各 rank
+              独立算出的「谁写哪份」本来就是全局一致的，不需要通信。
+``gathered``  全员先上报分片描述，由 rank 0 统一去重与分配，再 scatter 回各 rank
+              （:func:`plan_ranks`）。**布局与 ``local`` 逐字段相同**，多出来的是
+              跨 rank 的副本标注校验与全局覆盖校验 —— 这两件事单 rank 视角下都
+              查不出来，只能在写盘之前由汇总方发现。
+"""
 
 WriterFn = Callable[[str, int], int]
 """``writer(fqn, n_replicas) -> 写者副本编号``；默认按 FQN 的 CRC32 取模。"""
@@ -418,14 +429,173 @@ def _with_offsets(
     )
 
 
+# --- 全局分配（rank 0 汇总） ------------------------------------------------
+
+
+def _extent(source: ShardSource) -> tuple[object, ...]:
+    """分片覆盖范围的规范形式，用于跨 rank 比对「谁声明了同一块」。"""
+    if source.flat is not None:
+        return ("flat", source.flat.start, source.flat.length)
+    assert source.region is not None
+    return ("region", source.region.offsets, source.region.shape)
+
+
+def _check_replica_labels(per_rank: Mapping[int, Sequence[ShardSource]]) -> None:
+    """跨 rank 的副本标注校验：单 rank 视角下看不见的那一半。
+
+    三条不变量，任何一条不满足都说明「谁写哪份」的决策会出错，而单 rank 的
+    ``validate(complete=False)`` 一条都查不出来：
+
+    1. 同一个 FQN 的所有分片必须声明同一个 ``n_replicas`` —— 否则
+       ``crc32(fqn) % n_replicas`` 给出不同的 owner，同一个张量的分片被拆开写
+       （标错时甚至只写一半，且不报错）；
+    2. 同一个 FQN 的同一块覆盖范围，``replica_index`` 必须恰好是
+       ``{0, ..., n_replicas - 1}`` 各一次 —— 缺一个就是副本声明不全（必然漏写）；
+    3. 同一个 ``replica_index`` 不能由两个 rank 同时声明（两份内容可能不同，
+       选谁都说不清）。
+    """
+    declared: dict[tuple[object, ...], dict[int, int]] = {}
+    n_replicas_of: dict[str, int] = {}
+    for rank in sorted(per_rank):
+        for source in per_rank[rank]:
+            known = n_replicas_of.setdefault(source.fqn, source.n_replicas)
+            if known != source.n_replicas:
+                raise PlanError(
+                    f"{source.fqn}: n_replicas 标注不一致 —— rank {rank} 声明 "
+                    f"{source.n_replicas}，已有 rank 声明 {known}；同一张量的所有分片"
+                    f"必须共享同一套 Replicate 语义"
+                )
+            slots = declared.setdefault((source.fqn, _extent(source)), {})
+            other = slots.get(source.replica_index)
+            if other is not None:
+                raise PlanError(
+                    f"{source.fqn}: 覆盖范围 {_extent(source)[1:]} 的 replica_index "
+                    f"{source.replica_index} 被 rank {other} 与 rank {rank} 同时声明"
+                )
+            slots[source.replica_index] = rank
+
+    for key, slots in declared.items():
+        fqn = key[0]
+        expected = set(range(n_replicas_of[fqn]))
+        if set(slots) != expected:
+            raise PlanError(
+                f"{fqn}: 覆盖范围 {key[1:]} 的副本声明不完整 —— "
+                f"缺 replica_index {sorted(expected - set(slots))}，"
+                f"多出 {sorted(set(slots) - expected)}"
+                f"（n_replicas={n_replicas_of[fqn]}）"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class GlobalPlan:
+    """rank 0 汇总出的全局写计划：每 rank 一份 ``SavePlan`` + 不带 CRC 的几何骨架。
+
+    ``skeleton`` 是各 rank ``partial_index()`` 的合并结果：只含几何（文件、字节
+    区间、覆盖范围），**不含 CRC-32C** —— 块 CRC 只能在 D2H 之后对本 rank 的
+    pinned buffer 算，rank 0 拿不到。所以它是「写前自检 / 诊断」用的骨架，不是
+    可提交的索引。
+    """
+
+    ranks: tuple[int, ...]
+    per_rank: Mapping[int, SavePlan]
+    skeleton: CheckpointIndex
+    total_bytes: int
+
+    def plan_for(self, rank: int) -> SavePlan:
+        try:
+            return self.per_rank[rank]
+        except KeyError:
+            raise PlanError(f"rank {rank} 不在全局计划里：{self.ranks}") from None
+
+
+def plan_ranks(
+    per_rank: Mapping[int, Iterable[ShardSource]],
+    *,
+    blobs: Mapping[int, Mapping[str, int]] | None = None,
+    align: int = DEFAULT_ALIGN,
+    writer: WriterFn | None = None,
+) -> GlobalPlan:
+    """rank 0 侧：把**所有 rank** 的分片编成「每 rank 一份计划」+ 全局几何骨架。
+
+    布局算法完全复用 :func:`build_save_plan`，**不引入新的偏移策略**：同一个
+    ``per_rank`` 下，``per_rank[r]`` 与 rank r 自己调 ``build_save_plan`` 的结果
+    逐字段相同（有对拍测试锁住）。多出来的只有两件事：
+
+    - 跨 rank 的副本标注校验（:func:`_check_replica_labels`），单 rank 看不到；
+    - 全局覆盖校验（``validate(complete=True)``），落盘前就发现「凑不齐」。
+
+    ``blobs`` 是 ``rank -> {名字: 字节数}``；省略即「没有小状态」，与
+    :func:`build_save_plan` 的默认一致。
+    """
+    ranks = sorted(per_rank)
+    if ranks != list(range(len(ranks))):
+        raise ValueError(f"per_rank 的 rank 必须从 0 连续编号，得到 {ranks}")
+
+    materialized: dict[int, list[ShardSource]] = {}
+    for rank in ranks:
+        sources = list(per_rank[rank])
+        for source in sources:
+            if not isinstance(source, ShardSource):
+                raise TypeError(
+                    f"rank {rank}: expected ShardSource, got {type(source).__name__}"
+                )
+        materialized[rank] = sources
+
+    _check_replica_labels(materialized)
+
+    blob_sizes = blobs or {}
+    plans: dict[int, SavePlan] = {}
+    for rank in ranks:
+        plans[rank] = build_save_plan(
+            materialized[rank],
+            rank=rank,
+            blobs=blob_sizes.get(rank),
+            align=align,
+            writer=writer,
+        )
+
+    shards: dict[str, list[ShardMeta]] = {}
+    metas: dict[str, tuple[Shape, str]] = {}
+    merged_blobs: dict[str, BlobMeta] = {}
+    for rank in ranks:
+        for fqn, meta in plans[rank].partial_index().items():
+            shards.setdefault(fqn, []).extend(meta.shards)
+            metas.setdefault(fqn, (meta.global_shape, meta.dtype))
+        for name, blob in plans[rank].partial_blobs().items():
+            # 同名小状态每个 rank 都写一份（内容相同），只留第一份 —— 与
+            # storage/upload.py 读侧合并的约定一致。
+            merged_blobs.setdefault(name, blob)
+
+    skeleton = CheckpointIndex(
+        tensors={
+            fqn: TensorMeta(
+                global_shape=metas[fqn][0], dtype=metas[fqn][1], shards=tuple(entries)
+            )
+            for fqn, entries in shards.items()
+        },
+        blobs=merged_blobs,
+    )
+    skeleton.validate()  # complete=True：漏分片 / 重叠在这里暴露
+
+    return GlobalPlan(
+        ranks=tuple(ranks),
+        per_rank=plans,
+        skeleton=skeleton,
+        total_bytes=sum(plan.size for plan in plans.values()),
+    )
+
+
 __all__ = [
     "DEFAULT_ALIGN",
     "DEFAULT_FILE",
+    "PLANNER_MODES",
     "BlobItem",
+    "GlobalPlan",
     "SavePlan",
     "ShardSource",
     "WriteItem",
     "WriterFn",
     "build_save_plan",
     "default_writer",
+    "plan_ranks",
 ]
