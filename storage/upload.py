@@ -77,7 +77,11 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 from async_ import Tensor
-from commit.gc import DEFAULT_KEEP_VERSIONS, retain_remote_versions
+from commit.gc import (
+    DEFAULT_KEEP_VERSIONS,
+    reclaim_stale_generations,
+    retain_remote_versions,
+)
 from commit.generation import (
     GENERATION_FORMAT_VERSION,
     SUPPORTED_FORMAT_VERSIONS,
@@ -560,6 +564,7 @@ def finalize_upload(
     generation: "Generation | str | None" = None,
     layout: Mapping[str, int] | None = None,
     keep: int | None = DEFAULT_KEEP_VERSIONS,
+    reclaim_stale: bool = True,
 ) -> UploadCommit:
     """rank 0 的提交动作：``list`` 本代前缀，确认每个 rank 都传完了，再 CAS 写 ``COMMIT``。
 
@@ -580,8 +585,14 @@ def finalize_upload(
     从最旧的一代开始删，先删版本 ``COMMIT`` 再删其余数据。``keep=None`` 关掉这一步
     （交给运维手工调 :func:`commit.gc.retain_remote_versions`）。
 
-    保留失败（远端抖动、删到一半）**不影响这次提交**：版本 ``COMMIT`` 已经写完，这一版
-    就是可恢复的；残留的旧代会在下一次提交成功后被同一条判据收掉。
+    **同 step 旧代**：``COMMIT`` 落盘之后顺手删掉**序号更早**的代际前缀
+    （:func:`commit.gc.reclaim_stale_generations`）—— L3 已经指向本代，更早的尝试
+    只可能是被 fence 的残片。不必等周期 ``collect()`` 才回收，也就不会出现「只有
+    ``finalize_upload`` 在跑、同 step 旧代一直留着」的漏洞。``reclaim_stale=False``
+    关掉这一步。更新的一代（``seq`` 更大）永远不动 —— 那一代可能已经在传。
+
+    保留 / 清代的失败（远端抖动、删到一半）**不影响这次提交**：版本 ``COMMIT`` 已经
+    写完了，这一版就是可恢复的；残留的旧代会在下一次提交或 ``collect()`` 时收掉。
     """
     expected = tuple(int(rank) for rank in ranks)
     gen = as_generation(generation, step=step)
@@ -645,6 +656,14 @@ def finalize_upload(
     )
     commit = _write_upload_commit(storage, commit, existing=existing)
     mark_committed(storage, gen)
+    if reclaim_stale:
+        # L3 已经指向本代：同一个 step 下序号更早的前缀只可能是被 fence 的残片，
+        # 顺手收掉，不必等周期 collect()。只删 seq 严格更小的代 —— 更新的一代
+        # 可能已经在传。失败不能反过来把提交判成失败。
+        try:
+            reclaim_stale_generations(storage, step, keep=gen.id)
+        except Exception:  # pragma: no cover - 收尾动作，不能回滚提交
+            pass
     if keep is not None:
         # 提交已经成立，裁剪失败不能反过来把这次提交判成失败：retain_remote_versions
         # 自己吞掉 StorageError（记进 aborted），这里再兜住其它意外。

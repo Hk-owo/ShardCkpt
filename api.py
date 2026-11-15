@@ -51,6 +51,7 @@ from commit.gc import (
     RetentionReport,
     collect,
     delete_local_version,
+    reclaim_stale_generations,
     retain_remote_versions,
 )
 from commit.local import (
@@ -541,6 +542,7 @@ def finalize_upload(
     generation: "Generation | str | None" = None,
     layout: Mapping[str, int] | None = None,
     keep: int | None = DEFAULT_KEEP_VERSIONS,
+    reclaim_stale: bool = True,
 ) -> UploadCommit:
     """rank 0 的提交动作：``list`` 本代前缀确认全部 rank 都传完了，再 CAS 写 ``COMMIT``。
 
@@ -554,6 +556,10 @@ def finalize_upload(
     **提交完成即做有界保留**：版本 ``COMMIT`` 落盘之后，rank 0 接着只留最新 ``keep``
     代（默认 3 代），从最旧的一代开始删 —— 先删版本 ``COMMIT``，再删分片提交点与数据。
     ``keep=None`` 关掉自动裁剪；要看/单跑这一步用 :func:`retain_remote_versions`。
+
+    **同 step 旧代顺带回收**：``COMMIT`` 落盘之后还会删掉**序号更早**的代际前缀
+    （:func:`commit.gc.reclaim_stale_generations`），不必等周期 ``gc_local()``；更新的
+    一代永远不动。``reclaim_stale=False`` 关掉这一步。
     """
     return _finalize_upload(
         storage,
@@ -562,6 +568,7 @@ def finalize_upload(
         generation=generation,
         layout=layout,
         keep=keep,
+        reclaim_stale=reclaim_stale,
     )
 
 
@@ -755,6 +762,7 @@ __all__ = [
     "load_local",
     "load_object",
     "local_copy_available",
+    "reclaim_stale_generations",
     "register_backend",
     "reset_registry",
     "retain_remote_versions",

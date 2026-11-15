@@ -130,6 +130,7 @@ data = api.load("/ckpt", device="cuda:0")           # 本地版本目录自动�
 | `S3Storage` 条件写 | `storage/object.py` | `put_if_absent` / `put_if_match` / `head` / `write_file` / `probe_conditional_writes` |
 | `plan()` | `commit/gc.py` | 残片回收判据（纯函数）：已上传/被越过/代际残片，删哪些、留哪些（含恢复层窗口）、为什么 |
 | `plan_retention()` / `retain_remote_versions()` | `commit/gc.py` | 对象存储侧有界保留：只留最近 `keep` 代（默认 3），先删版本 `COMMIT` 再删数据 |
+| `reclaim_stale_generations()` | `commit/gc.py` | 提交后的收尾：删同一 step 下序号更早的代（`finalize_upload(reclaim_stale=)`） |
 | `collect()` / `gc_local()` | `commit/gc.py` / `api.py` | 回收执行器：一次 `list` + 目录扫描 + 幂等删除，默认 `dry_run` |
 | `GcWorker` | `commit/gc.py` | 周期回收线程：启动时跑一次，之后每 `interval` 秒 |
 
@@ -598,6 +599,7 @@ ckpt.close_default_pool()   # 训练结束/显存紧张时显式释放常驻块
 | 判据 | 谁触发 | 删什么 |
 |---|---|---|
 | 残片（下表四条） | `gc_local` / `GcWorker`，可周期跑 | 本地已上传且超出恢复层窗口的中转副本、本地与远端被更新版本越过的残片、被取代的代际前缀 |
+| 同 step 旧代 | **rank 0 在 `finalize_upload` 写完版本 `COMMIT` 之后** | 同一 step 下序号更早的代际前缀（`reclaim_stale_generations`，`reclaim_stale=False` 关掉） |
 | 有界保留 | **rank 0 在 `finalize_upload` 写完版本 `COMMIT` 之后** | 远端「完整但过旧」的版本：`keep`（默认 3）之外最旧的那几代 |
 
 本地层主要是**上传前的中转**，但留一层**热恢复副本**：最新 `keep_local`（默认 1）个
@@ -611,10 +613,16 @@ ckpt.close_default_pool()   # 训练结束/显存紧张时显式释放常驻块
 
 | 位置 | 候选 | 删除条件 | 理由 |
 |---|---|---|---|
-| 本地 | `step_N/` | 远端有**当前代**的 `step_N/<gen>/rank_<本rank>/COMMIT`，且不在恢复层窗口内 | `uploaded`：本分片已到远端 |
+| 本地 | `step_N/` | 远端有**最新一次尝试**的 `step_N/<gen>/rank_<本rank>/COMMIT`，且不在恢复层窗口内 | `uploaded`：本分片已到远端 |
 | 本地 | `step_N/` | 存在 `M > N` 的版本 `COMMIT` | `superseded`：训练已越过第 N 代 |
 | 远端 | `step_N/`（整个前缀） | 没有版本 `COMMIT`、没有代际前缀，且有 `M > N` 的版本 `COMMIT` | `superseded`：半途上传的残片 |
-| 远端 | `step_N/<gen>/`（单代） | 有版本 `COMMIT` 且这一代不是它声明的代；或没有版本 `COMMIT` 且不是本 step 序号最大的代 | `stale_generation`：被取代的尝试 |
+| 远端 | `step_N/<gen>/`（单代） | 这一代既不是版本 `COMMIT` 声明的代，序号也**严格小于「最新一次尝试」** | `stale_generation`：被取代的尝试 |
+
+「最新一次尝试」= `max(step_N/GEN 声明的代, 目录里序号最大的代)`，**不是**版本
+`COMMIT` 声明的代：版本 `COMMIT` 只在提交成功时才写，拿它当当前代会在「新一代已
+acquire、正在传」的整个窗口里把正在传的那一代（连带本地刚写好的数据）删掉。`GEN` 读
+不出来时降级为「目录里序号最大的那一代」—— 宁可晚一代回收，也不误删正在写的那一代。
+本地 `uploaded` 判据同理：只认**最新一次尝试**里本 rank 的分片提交点。
 
 只读端点（`conditional_writes="off"`）能列不能删：远端候选一律记
 `remote_read_only` 跳过，本地判据照常（远端状态仍然看得到）。版本 `COMMIT` 读不出来
@@ -633,8 +641,10 @@ ckpt.close_default_pool()   # 训练结束/显存紧张时显式释放常驻块
 import api as ckpt
 from commit.gc import GcWorker
 
-# 提交完成（rank 0）：seal GEN → 写版本 COMMIT → 立刻裁剪，只留最近 3 代
-ckpt.finalize_upload(s3, step=42, ranks=range(8), generation=gen, keep=3)  # keep=None 关掉
+# 提交完成（rank 0）：seal GEN → 写版本 COMMIT → 清同 step 旧代 → 裁剪到最近 3 代
+ckpt.finalize_upload(s3, step=42, ranks=range(8), generation=gen, keep=3)
+# 只想关掉其中一条：keep=None 关裁剪，reclaim_stale=False 把旧代留给 gc_local
+ckpt.finalize_upload(s3, step=42, ranks=range(8), generation=gen, keep=None, reclaim_stale=False)
 
 # 运维单独看一眼/单跑裁剪（dry_run 只出计划）
 report = ckpt.retain_remote_versions(s3, keep=3, dry_run=True)

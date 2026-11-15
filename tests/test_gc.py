@@ -313,8 +313,14 @@ def _upload(local, remote, step: int, rank: int = 0) -> None:
     ckpt.upload_local(local, remote, step=step, rank=rank)
 
 
-def _finalize(remote, step: int, ranks=(0,)) -> None:
-    ckpt.finalize_upload(remote, step=step, ranks=list(ranks), layout={"tp": 1})
+def _finalize(remote, step: int, ranks=(0,), *, reclaim_stale: bool = True) -> None:
+    ckpt.finalize_upload(
+        remote,
+        step=step,
+        ranks=list(ranks),
+        layout={"tp": 1},
+        reclaim_stale=reclaim_stale,
+    )
 
 
 def test_dry_run_only_plans_then_real_run_deletes(state, tmp_path) -> None:
@@ -615,7 +621,7 @@ def test_collect_deletes_stale_generation_and_keeps_current(state, tmp_path) -> 
     _upload_generation(local, remote, 5, stale)
     current = ckpt.begin_upload(remote, step=5, ranks=[0])
     _upload_generation(local, remote, 5, current)
-    _finalize(remote, 5)
+    _finalize(remote, 5, reclaim_stale=False)  # 旧代留给 collect 收
 
     report = collect(local, remote, rank=0, dry_run=False)
 
@@ -650,7 +656,7 @@ def test_stale_generation_delete_order_is_rank_commit_then_data(state, tmp_path)
     _upload_generation(local, remote, 5, stale)
     current = ckpt.begin_upload(remote, step=5, ranks=[0])
     _upload_generation(local, remote, 5, current)
-    _finalize(remote, 5)
+    _finalize(remote, 5, reclaim_stale=False)  # 旧代留给 collect 收
 
     deleted: list[str] = []
     real_delete = remote.delete
@@ -701,3 +707,178 @@ def test_read_only_remote_is_listed_but_never_deleted(state, tmp_path) -> None:
     assert not [item for item in report.deleted if item.location == REMOTE]
     assert (REMOTE, 1, REMOTE_READ_ONLY) in report.skipped
     assert (REMOTE, 2, COMMITTED) in report.skipped
+
+
+# --- 当前代看 GEN，不看落后的 L3 -----------------------------------------
+
+
+def test_in_flight_generation_is_kept_when_the_commit_lags(state, tmp_path) -> None:
+    """L3 仍指向旧代、新一代正在传：两代都不是残片。
+
+    L3 只在提交成功时才写，所以「已 acquire 但还没提交」的那一代，拿 L3 当当前代
+    就会被整段删掉 —— 写者随后 ``finalize_upload`` 只会拿到「对象缺失」，白传一遍；
+    GC 周期短于重传耗时时还会活锁。本地那一条对应 ``test_local_copy_...`` 用例。
+    """
+    local = tmp_path / "local"
+    remote = LocalStorage(tmp_path / "remote", conditional_writes=True)
+    _save(state, local, 5)
+    gen1 = ckpt.begin_upload(remote, step=5, ranks=[0])
+    _upload_generation(local, remote, 5, gen1)
+    _finalize(remote, 5)
+
+    _save(state, local, 5)  # 同 step 重存：本地目录换成新数据
+    gen2 = ckpt.begin_upload(remote, step=5, ranks=[0])
+    _upload_generation(local, remote, 5, gen2)  # 传完但还没提交 L3
+
+    report = collect(local, remote, rank=0, dry_run=False, keep_local=0)
+
+    assert not [item for item in report.deleted if item.location == REMOTE]
+    assert remote.list(f"step_5/{gen2.id}"), "在传的那一代不能被删"
+    assert remote.list(f"step_5/{gen1.id}"), "已提交的那一代更不能删"
+    assert report.steps_for(LOCAL) == (5,), "最新代已上传，本地是冗余"
+
+    # 提交之后它才成为「旧代」，这时才该回收
+    _finalize(remote, 5, reclaim_stale=False)
+    report = collect(local, remote, rank=0, dry_run=False, keep_local=0)
+    assert [
+        item.generation for item in report.deleted if item.location == REMOTE
+    ] == [gen1.id]
+    assert remote.list(f"step_5/{gen1.id}") == []
+    assert remote.list(f"step_5/{gen2.id}"), "当前代不动"
+
+
+def test_local_copy_of_the_new_attempt_is_not_treated_as_uploaded(
+    state, tmp_path
+) -> None:
+    """本 rank 在**旧代**传过，不代表刚写好的新数据已上传：本地留着。"""
+    local = tmp_path / "local"
+    remote = LocalStorage(tmp_path / "remote", conditional_writes=True)
+    _save(state, local, 5)
+    gen1 = ckpt.begin_upload(remote, step=5, ranks=[0])
+    _upload_generation(local, remote, 5, gen1)
+    _finalize(remote, 5)
+
+    _save(state, local, 5)  # 重存：本地目录换成新数据，还没上传
+    gen2 = ckpt.begin_upload(remote, step=5, ranks=[0])
+
+    report = collect(local, remote, rank=0, dry_run=False, keep_local=0)
+
+    assert (local / version_key(5)).is_dir(), "新数据还没传，本地是唯一副本"
+    assert (LOCAL, 5, NOT_UPLOADED) in report.skipped
+    assert not report.deleted, "旧代的 L2 不能证明这一代传完了"
+    assert remote.list(f"step_5/{gen1.id}"), f"{gen2.id} 还没提交，旧代仍在服务恢复"
+
+
+def test_missing_pointer_falls_back_to_the_newest_directory(state, tmp_path) -> None:
+    """GEN 被外部删掉：判据降级为「目录里序号最大的那一代」，不猜、不误删。"""
+    local = tmp_path / "local"
+    remote = LocalStorage(tmp_path / "remote", conditional_writes=True)
+    _save(state, local, 5)
+    gen1 = ckpt.begin_upload(remote, step=5, ranks=[0])
+    _upload_generation(local, remote, 5, gen1)
+    _finalize(remote, 5)
+    _save(state, local, 5)
+    gen2 = ckpt.begin_upload(remote, step=5, ranks=[0])
+    _upload_generation(local, remote, 5, gen2)
+    remote.delete("step_5/GEN")
+
+    report = collect(local, remote, rank=0, dry_run=False, keep_local=0)
+
+    assert not [item for item in report.deleted if item.location == REMOTE]
+    assert remote.list(f"step_5/{gen1.id}"), "L3 声明的代受保护"
+    assert remote.list(f"step_5/{gen2.id}"), "序号最大的代受保护"
+
+
+def test_fenced_generation_is_reclaimed_once_the_next_one_lands(state, tmp_path) -> None:
+    """GEN 已经推进到下一代：被 fence 的中间代才是确定的残片。"""
+    local = tmp_path / "local"
+    remote = LocalStorage(tmp_path / "remote", conditional_writes=True)
+    _save(state, local, 5)
+    gen1 = ckpt.begin_upload(remote, step=5, ranks=[0])
+    _upload_generation(local, remote, 5, gen1)
+    _finalize(remote, 5, reclaim_stale=False)
+
+    fenced = ckpt.begin_upload(remote, step=5, ranks=[0])
+    _upload_generation(local, remote, 5, fenced)  # 传完但被下一次 acquire 顶掉
+    current = ckpt.begin_upload(remote, step=5, ranks=[0])
+    _upload_generation(local, remote, 5, current)
+    _finalize(remote, 5, reclaim_stale=False)  # L3 跟到 gen3，前两代才是残片
+
+    report = collect(local, remote, rank=0, dry_run=False, keep_local=0)
+
+    assert [
+        item.generation for item in report.deleted if item.location == REMOTE
+    ] == [gen1.id, fenced.id]
+    assert remote.list(f"step_5/{gen1.id}") == []
+    assert remote.list(f"step_5/{fenced.id}") == []
+    assert remote.list(f"step_5/{current.id}"), "最新一次尝试不动"
+
+
+def test_finalize_reclaims_the_previous_generation(state, tmp_path) -> None:
+    """提交成功就顺手收掉同 step 旧代，不必等周期 collect()。"""
+    local = tmp_path / "local"
+    remote = LocalStorage(tmp_path / "remote", conditional_writes=True)
+    _save(state, local, 5)
+    gen1 = ckpt.begin_upload(remote, step=5, ranks=[0])
+    _upload_generation(local, remote, 5, gen1)
+
+    _save(state, local, 5)
+    gen2 = ckpt.begin_upload(remote, step=5, ranks=[0])
+    _upload_generation(local, remote, 5, gen2)
+    _finalize(remote, 5)  # 默认 reclaim_stale=True
+
+    assert remote.list(f"step_5/{gen1.id}") == [], "旧代已收，不需要 collect"
+    assert remote.list(f"step_5/{gen2.id}")
+
+
+def test_finalize_reclaim_never_touches_a_newer_generation(state, tmp_path) -> None:
+    """收尾只删序号严格更小的代：更新的一代可能已经在传。"""
+    local = tmp_path / "local"
+    remote = LocalStorage(tmp_path / "remote", conditional_writes=True)
+    _save(state, local, 5)
+    gen1 = ckpt.begin_upload(remote, step=5, ranks=[0])
+    _upload_generation(local, remote, 5, gen1)
+    gen2 = ckpt.begin_upload(remote, step=5, ranks=[0])
+    _upload_generation(local, remote, 5, gen2)
+    gen3 = ckpt.begin_upload(remote, step=5, ranks=[0])
+    _upload_generation(local, remote, 5, gen3)
+
+    ckpt.reclaim_stale_generations(remote, 5, keep=gen2.id)
+
+    assert remote.list(f"step_5/{gen1.id}") == []
+    assert remote.list(f"step_5/{gen2.id}")
+    assert remote.list(f"step_5/{gen3.id}"), "更新的一代绝不能被当成残片"
+
+
+def test_finalize_succeeds_even_when_reclaim_fails(state, tmp_path, monkeypatch) -> None:
+    """收尾删除失败不回滚提交：版本 COMMIT 已经写完，这一版就是可恢复的。"""
+    import storage.upload as upload_mod
+
+    local = tmp_path / "local"
+    remote = LocalStorage(tmp_path / "remote", conditional_writes=True)
+    _save(state, local, 5)
+    gen1 = ckpt.begin_upload(remote, step=5, ranks=[0])
+    _upload_generation(local, remote, 5, gen1)
+
+    _save(state, local, 5)
+    gen2 = ckpt.begin_upload(remote, step=5, ranks=[0])
+    _upload_generation(local, remote, 5, gen2)
+
+    def boom(*args, **kwargs):
+        raise StorageError("remote flaked during reclaim")
+
+    monkeypatch.setattr(upload_mod, "reclaim_stale_generations", boom)
+
+    commit = ckpt.finalize_upload(
+        remote, step=5, ranks=[0], generation=gen2, keep=None
+    )
+
+    assert commit.generation == gen2.id
+    assert remote.list(f"step_5/{gen2.id}"), "提交的这一代完好"
+    assert remote.list(f"step_5/{gen1.id}"), "删失败只留下残片，下次 collect 收敛"
+
+    monkeypatch.undo()
+    report = collect(local, remote, rank=0, dry_run=False, keep_local=0)
+    assert [
+        item.generation for item in report.deleted if item.location == REMOTE
+    ] == [gen1.id]

@@ -301,7 +301,7 @@ def test_committed_version_survives_failed_retry(
 
 
 def test_second_generation_takes_over_the_commit(storage: S3Storage, tmp_path) -> None:
-    """重存同一 step：新一代完整之后 L3 才指向它。"""
+    """重存同一 step：新一代完整之后 L3 才指向它，旧代随即被回收。"""
     first = tmp_path / "local-first"
     second = tmp_path / "local-second"
     save_one(first, value=1.0)
@@ -317,8 +317,29 @@ def test_second_generation_takes_over_the_commit(storage: S3Storage, tmp_path) -
     assert commit.generation == gen2.id
     assert read_commit(storage).generation == gen2.id
     assert commit_value(storage) == pytest.approx(2.0)
-    # 旧代的对象还在：它没有被覆盖，只是不再被 L3 引用（归 GC 收）
-    assert storage.list(generation_prefix(STEP, gen1))
+    # 旧代从来没被覆盖（CAS + 独立前缀保证），L3 一旦指向 gen2 它就是残片：
+    # finalize_upload 顺手收掉，不必等周期 collect()。
+    assert storage.list(generation_prefix(STEP, gen1)) == []
+
+
+def test_old_generation_survives_while_it_is_the_committed_one(
+    storage: S3Storage, tmp_path
+) -> None:
+    """新一代只传了一半就崩：已提交的 gen1 一个对象都不能少。"""
+    local = tmp_path / "local"
+    save_one(local, value=1.0)
+    gen1 = ckpt.begin_upload(storage, step=STEP, ranks=[0])
+    ckpt.upload_local(local, storage, step=STEP, rank=0, generation=gen1)
+    ckpt.finalize_upload(storage, step=STEP, ranks=[0], generation=gen1)
+
+    gen2 = ckpt.begin_upload(storage, step=STEP, ranks=[0])
+    storage.put_if_absent(data_key(STEP, 0, "__0_0.distcp", gen2), b"half-written")
+
+    before = storage.list(generation_prefix(STEP, gen1))
+    # 半途而废的 gen2 不会触发任何回收：提交没成，L3 仍指 gen1
+    assert commit_value(storage) == pytest.approx(1.0)
+    assert storage.list(generation_prefix(STEP, gen1)) == before
+    assert storage.list(generation_prefix(STEP, gen2)), "在传的那一代不能被当成残片"
 
 
 def test_data_object_is_never_overwritten(storage: S3Storage, tmp_path) -> None:

@@ -30,9 +30,19 @@
 ``rank_<r>/COMMIT``），再删数据，最后删空目录。判据只看提交点在不在，所以删到一半
 被打断，重跑一次收敛。
 
-除此之外还有一条**代际残片**判据（:data:`STALE_GENERATION`）：同一个 step 下不在
-当前代际里的 ``step_N/<gen>/`` 前缀只可能是被取代的尝试，直接删；没有版本 ``COMMIT``
-的 step 保留序号最大的一代（它可能就是正在传的那一次），其余按残片收掉。
+除此之外还有一条**代际残片**判据（:data:`STALE_GENERATION`）：同一个 step 下**序号
+严格早于「最新一次尝试」**的 ``step_N/<gen>/`` 前缀只可能是被取代的尝试，删。
+
+「最新一次尝试」不能只看版本 ``COMMIT``（L3）：L3 只在提交成功时才写，所以在
+「新一代已 acquire、正在传」到「提交成功」这整段时间里 L3 仍指向**旧代** —— 拿 L3 当
+当前代，就会把正在传的那一代当残片删掉，连带本地刚写好的数据（``uploaded`` 判据用的
+也是同一个代）。所以判据取 ``max(step_N/GEN 声明的代, 目录里序号最大的代)``：
+
+- GEN 指向新一代而它还只传了一半 ⇒ 那一代受保护，旧代（L3 声明的那个）照样受保护，
+  一个都不删；
+- 新一代提交成功后 L3 跟上，更早的代（包括被 fence 的中间代）才是残片；
+- GEN 读不出来（被外部删 / 坏 JSON）⇒ 降级为「目录里序号最大的那一代」，
+  宁可晚一代回收，也不误删正在写的那一代。
 
 上面这些判据**只删残片**，远端已提交的版本一个都不碰。对象存储侧的**有界保留**是另一
 条独立判据（:func:`plan_retention` / :func:`retain_remote_versions`）：版本 ``COMMIT``
@@ -50,7 +60,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Iterable, Mapping
 
-from commit.generation import GENERATION_FILE, Generation
+from commit.generation import GENERATION_FILE, Generation, pointer_key
 from commit.local import COMMIT_FILE, delete_version, version_key
 from storage.base import StorageBackend, StorageError
 from storage.local import LocalStorage
@@ -84,6 +94,9 @@ STALE_GENERATION = "stale_generation"
 
 RECOVERY_COPY = "recovery_copy"
 """本地保留的热恢复副本：远端已有这一代的版本 ``COMMIT``，本地不删、回退时直接读。"""
+
+_UNRESOLVED = object()
+"""判不出「最新一次尝试」的代际（坏目录名 / 既无 GEN 也无 L3）：一个代都不删。"""
 
 DEFAULT_KEEP_VERSIONS = 3
 """对象存储侧有界保留的默认窗口：只留最新的这么多代已提交版本。"""
@@ -149,6 +162,7 @@ def plan(
     rank: int,
     generations: Mapping[int, Iterable[str]] | None = None,
     current_generations: Mapping[int, str | None] | None = None,
+    pointer_generations: Mapping[int, str] | None = None,
     unknown_versions: Iterable[int] = (),
     keep_local: int = DEFAULT_KEEP_LOCAL_VERSIONS,
 ) -> GcPlan:
@@ -160,37 +174,107 @@ def plan(
     ``local_steps``:       本地 root 下存在 ``step_N/`` 目录的 step
     ``rank``:              本进程的 rank 号（本地判据只看自己的分片提交点）
     ``generations``:       ``step -> {generation}``：远端出现过的代际前缀
-    ``current_generations``: ``step -> 当前代际``（从 L3 读出来；v1 是 ``None``）
+    ``current_generations``: ``step -> 已提交代际``（从 L3 读出来；v1 是 ``None``）
+    ``pointer_generations``: ``step -> 最新一次尝试的代际``（从 ``step_N/GEN`` 读出来；
+                           读不出来就不放这个 step，判据降级到目录名）
     ``unknown_versions``:  读不出来的 L3 对应的 step：**一律保留**，不猜当前代
     ``keep_local``:        本地恢复层窗口：保留最近这么多个「远端已提交且本 rank 已上传」
                            的本地版本作为热副本（``0`` = 上传完即删，老行为）
 
     三条判据互不重叠：
 
-    1. 本地已上传 / 被更新版本越过 → 删本地目录（恢复层窗口内的除外）；
+    1. 本地已在最新一次尝试里上传 / 被更新版本越过 → 删本地目录（恢复层窗口内的除外）；
     2. 远端无 L3 且被更新版本越过 → 删整个 step 前缀；
-    3. 远端有 L3 但不是当前代际（或没有 L3 且不是最大代）→ 只删这一代前缀。
+    3. 远端有 L3，但代际序号严格早于「最新一次尝试」且不是 L3 声明的代 → 只删这一代。
+
+    「最新一次尝试」= ``max(GEN 声明的代, 目录里序号最大的代)``；两个都判不出来时
+    一个代都不删（:data:`STALE_GENERATION` 的降级）。
     """
     if keep_local < 0:
         raise ValueError(f"keep_local must be >= 0, got {keep_local}")
     known = frozenset(int(step) for step in versions)
     newest = max(known) if known else None
     current = {int(step): gen for step, gen in (current_generations or {}).items()}
+    pointer = {int(step): str(gen) for step, gen in (pointer_generations or {}).items()}
     unknown = frozenset(int(step) for step in unknown_versions)
     gens_of = {
         int(step): {str(gen) for gen in values}
         for step, values in (generations or {}).items()
     }
+    all_prefixes = {int(step) for step in prefixes}
+    local = {int(step) for step in local_steps}
+
+    _attempts: dict[int, object] = {}
+
+    def latest_attempt(step: int) -> object:
+        """这个 step 最新一次尝试的代际；判不出来时返回 :data:`_UNRESOLVED`。
+
+        取 ``max(GEN 声明的代, 目录里序号最大的代)``：GEN 是写权仲裁的线性化点，
+        L3 落后时它才是「正在传的那一代」。GEN 读不出来就只看目录名（降级）。
+        """
+        if step in _attempts:
+            return _attempts[step]
+        attempt: object = _UNRESOLVED
+        best: str | None = None
+        best_seq = -1
+        parseable = True
+        for generation in sorted(gens_of.get(step, set())):
+            seq = _generation_seq(generation, step=step)
+            if seq < 0:  # 认不出的目录名：不猜，一个代都不删
+                parseable = False
+                break
+            if seq > best_seq:
+                best, best_seq = generation, seq
+        if parseable:
+            pointer_generation = pointer.get(step)
+            if pointer_generation is not None:
+                seq = _generation_seq(pointer_generation, step=step)
+                if seq < 0:
+                    parseable = False
+                elif seq > best_seq:
+                    best, best_seq = pointer_generation, seq
+        if not parseable:
+            attempt = _UNRESOLVED
+        elif best is not None:
+            attempt = best
+        else:
+            # 没有代际前缀也没有 GEN：退回 L3 里声明的那个（v1 布局就是 ``None``），
+            # 这样 v1 的二元组 ``rank_commits`` 仍然能被认出来。
+            attempt = current.get(step)
+        _attempts[step] = attempt
+        return attempt
+
+    def stale_prefixes(step: int) -> list[str]:
+        """同一 step 下可删的代际前缀：序号严格早于最新一次尝试，且不是已提交代。"""
+        attempt = latest_attempt(step)
+        if not isinstance(attempt, str):
+            return []  # 判不出最新代（含 v1 布局、坏目录名）：一个都不删
+        limit = _generation_seq(attempt, step=step)
+        if limit < 0:
+            return []
+        committed = current.get(step)
+        doomed: list[str] = []
+        for generation in sorted(gens_of.get(step, set())):
+            if generation == attempt or generation == committed:
+                continue
+            seq = _generation_seq(generation, step=step)
+            if 0 <= seq < limit:
+                doomed.append(generation)
+        return doomed
+
     by_step: dict[int, set[int]] = {}
     for item in rank_commits:
         # 二元组是 v1 语义（没有代际），三元组带 generation。
         step, owner = int(item[0]), int(item[1])
         generation = item[2] if len(item) > 2 else None
-        # 只认**当前代**的分片提交点：别的代的 L2 不能证明这一版传完了。
-        if step in known and current.get(step) == generation:
-            by_step.setdefault(step, set()).add(owner)
-    all_prefixes = {int(step) for step in prefixes}
-    local = {int(step) for step in local_steps}
+        if step not in known:
+            continue
+        # 只认**最新一次尝试**的分片提交点：本地目录装的是那一次的产物，别的代的 L2
+        # 不能证明它已经传完。
+        attempt = latest_attempt(step)
+        if attempt is _UNRESOLVED or attempt != generation:
+            continue
+        by_step.setdefault(step, set()).add(owner)
 
     # 恢复层：远端可恢复（有 L3、且 L3 读得出来）+ 本 rank 已上传，取最近的几个。
     # 只有这两个条件同时成立时，本地这份才「不是唯一副本」，删了也不丢东西。
@@ -226,22 +310,20 @@ def plan(
             continue
         if step in known:
             kept.append((REMOTE, step, COMMITTED))
-            # 同一个 step 下不在当前代的代际前缀：被取代的尝试，整代删
-            for generation in sorted(gens):
-                if generation != current.get(step):
-                    candidates.append(
-                        GcCandidate(REMOTE, step, STALE_GENERATION, generation)
-                    )
+            # 同一个 step 下被取代的代际前缀：整代删。已提交的代（L3 声明的那个）
+            # 与最新一次尝试（GEN / 目录里序号最大的那个）永远不动。
+            for generation in stale_prefixes(step):
+                candidates.append(
+                    GcCandidate(REMOTE, step, STALE_GENERATION, generation)
+                )
             continue
         if gens:
-            # 还没有 L3：保留序号最大的一代（可能正在传），其余是残片
-            newest_gen = max(gens, key=lambda gen: _generation_seq(gen, step=step))
+            # 还没有 L3：保留最新一次尝试（可能正在传），其余是残片
             kept.append((REMOTE, step, NO_NEWER_VERSION))
-            for generation in sorted(gens):
-                if generation != newest_gen:
-                    candidates.append(
-                        GcCandidate(REMOTE, step, STALE_GENERATION, generation)
-                    )
+            for generation in stale_prefixes(step):
+                candidates.append(
+                    GcCandidate(REMOTE, step, STALE_GENERATION, generation)
+                )
             continue
         if superseded(step):
             candidates.append(GcCandidate(REMOTE, step, SUPERSEDED))
@@ -508,6 +590,26 @@ def _read_version_generation(remote: StorageBackend, step: int) -> object:
     return None if generation is None else str(generation)
 
 
+def _read_pointer_generation(remote: StorageBackend, step: int) -> str | None:
+    """读 ``step_N/GEN`` 声明的代际（最新一次尝试）。
+
+    读不出来（被外部删 / 坏 JSON / 远端抖动）就返回 ``None``：判据降级到「目录里
+    序号最大的那一代」，宁可晚一代回收，也不猜当前代。
+    """
+    try:
+        payload = remote.read(pointer_key(step))
+    except StorageError:
+        return None
+    try:
+        data = json.loads(payload)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    generation = data.get("generation")
+    return None if generation is None else str(generation)
+
+
 def collect(
     local_root: str | Path,
     remote: StorageBackend | None,
@@ -554,6 +656,7 @@ def collect(
 
     layout = _scan_remote(keys)
     current: dict[int, str | None] = {}
+    pointer: dict[int, str] = {}
     unknown: set[int] = set()
     for step in sorted(layout.versions):
         generation = _read_version_generation(remote, step)
@@ -561,6 +664,12 @@ def collect(
             unknown.add(step)
         else:
             current[step] = generation  # type: ignore[assignment]
+    for step in sorted(set(layout.generations) | layout.versions):
+        # GEN 是「正在传的那一代」的唯一线索：L3 只在提交成功时才写，拿它当当前代
+        # 会把在传的那一代当残片删掉。读不出来就不放，判据降级到目录名。
+        generation = _read_pointer_generation(remote, step)
+        if generation is not None:
+            pointer[step] = generation
     result = plan(
         versions=layout.versions - unknown,
         rank_commits=layout.rank_commits,
@@ -569,6 +678,7 @@ def collect(
         rank=rank,
         generations=layout.generations,
         current_generations=current,
+        pointer_generations=pointer,
         unknown_versions=unknown,
         keep_local=keep_local,
     )
@@ -708,6 +818,49 @@ def retain_remote_versions(
     )
 
 
+def reclaim_stale_generations(
+    remote: StorageBackend | None,
+    step: int,
+    *,
+    keep: str | Iterable[str] = (),
+) -> tuple[DeletedVersion, ...]:
+    """删掉 ``step_N/`` 下**严格早于** ``keep`` 里这些代的代际前缀。
+
+    这是 rank 0 提交成功之后的收尾（:func:`storage.upload.finalize_upload` 调）：L3
+    已经指向 ``keep``，所以同一 step 的更早尝试只可能是被 fence 的残片，不必等下一次
+    :func:`collect`。判据与 :func:`plan` 完全一致：
+
+    - 只删序号**严格小于** ``keep`` 中最大序号的代 —— 已经有人在传更新的一代时，
+      那一代不会被误删；
+    - 序号读不出来的目录名一概留着（不猜）。
+
+    返回每个被删代的记录（``reason="stale_generation"``）。远端不可达时抛
+    :class:`StorageError`，由调用方决定是否吞掉 —— 提交本身已经成立，这不是失败。
+    """
+    if remote is None:
+        return ()
+    keepers = {keep} if isinstance(keep, str) else {str(item) for item in keep}
+    seqs = [_generation_seq(generation, step=step) for generation in keepers]
+    limits = [seq for seq in seqs if seq >= 0]
+    if not limits:
+        return ()
+    limit = max(limits)
+    keys = remote.list(version_key(step))
+    layout = _scan_remote(keys)
+    doomed = [
+        generation
+        for generation in sorted(layout.generations.get(step, set()))
+        if generation not in keepers and 0 <= _generation_seq(generation, step=step) < limit
+    ]
+    deleted: list[DeletedVersion] = []
+    for generation in doomed:
+        count = _delete_remote_prefix(remote, step, keys, generation=generation)
+        deleted.append(
+            DeletedVersion(REMOTE, step, count, 0, STALE_GENERATION, generation)
+        )
+    return tuple(deleted)
+
+
 class GcWorker:
     """周期性回收的守护线程：**启动时先跑一次**，之后每 ``interval`` 秒一次。
 
@@ -825,5 +978,6 @@ __all__ = [
     "delete_local_version",
     "plan",
     "plan_retention",
+    "reclaim_stale_generations",
     "retain_remote_versions",
 ]
