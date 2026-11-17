@@ -50,12 +50,12 @@ for _candidate in (str(_REPO), str(_REPO / "tests")):
 import api as ckpt  # noqa: E402
 import s3_stub  # noqa: E402
 from async_ import Tensor, get_backend  # noqa: E402
-from commit.local import committed_steps  # noqa: E402
 from core import FormatError, PlanError  # noqa: E402
 from core.metadata import Device, numpy_dtype  # noqa: E402
 from core.region import split  # noqa: E402
 from planner.save_plan import ShardSource  # noqa: E402
 from storage.object import S3Config, S3Storage  # noqa: E402
+from storage.upload import committed_remote_steps  # noqa: E402
 
 DEVICE = "cuda:0"
 
@@ -528,7 +528,7 @@ def phase_gc(sc: Scenario) -> None:
     storage = sc.storage()
     try:
         # rank 0 在 finalize(step=15) 里已经裁过一次；这里只复核结果，不动手删。
-        versions = sorted(committed_steps(storage))
+        versions = committed_remote_steps(storage)
         window = sorted(STEPS)[-ckpt.DEFAULT_KEEP_VERSIONS :]
         print(f"    远端保留的已提交版本：{[f'step_{v}' for v in versions]}；保留窗口：{window}")
         assert versions == window, f"远端版本清单异常：{versions}，期望 {window}"
@@ -563,7 +563,7 @@ def phase_gc(sc: Scenario) -> None:
             if sc.root(rank).is_dir()
         }
         print(f"    幂等重跑无新增删除；本地剩余目录：{remaining}")
-        assert sorted(committed_steps(storage)) == window, "本地回收不该碰远端已提交版本"
+        assert committed_remote_steps(storage) == window, "本地回收不该碰远端已提交版本"
 
         # 回退：本地恢复了什么就直接用什么。单 rank 的本地版本是完整的一份，远端同一代
         # 又有版本 COMMIT ⇒ 零下载；多 rank 时每个本地 root 只有自己的分片，全局覆盖

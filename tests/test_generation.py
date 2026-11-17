@@ -18,12 +18,14 @@ import api as ckpt
 import s3_stub
 from async_ import Tensor, get_backend
 from commit.generation import (
+    CommittedState,
     FencedError,
     Generation,
-    GenerationPointer,
+    StepStatus,
     acquire_generation,
     next_seq,
-    pointer_key,
+    read_status,
+    status_key,
     verify_holder,
 )
 from core import ChecksumError, FormatError
@@ -33,10 +35,8 @@ from storage.base import WriteOutcome
 from storage.checksum import crc32c_hex
 from storage.object import S3Config, S3Storage
 from storage.upload import (
-    COMMIT_FILE,
     RankCommit,
     UploadCommit,
-    commit_key,
     data_key,
     generation_prefix,
     index_key,
@@ -102,7 +102,9 @@ def commit_value(storage: S3Storage, *, step: int = STEP) -> float:
 
 
 def read_commit(storage: S3Storage, *, step: int = STEP) -> UploadCommit:
-    return UploadCommit.loads(storage.read(commit_key(step)).decode("utf-8"))
+    status = read_status(storage, step)
+    assert status is not None and status.committed is not None
+    return UploadCommit.from_committed(status.committed)
 
 
 # --- 纯函数 -----------------------------------------------------------------
@@ -132,22 +134,29 @@ def test_next_seq_never_goes_backwards() -> None:
     assert next_seq(["step_9/COMMIT", "step_9/GEN"], current=0) == 1
 
 
-def test_pointer_roundtrip_keeps_state_and_ranks() -> None:
-    pointer = GenerationPointer(
-        step=2,
-        generation=Generation(step=2, seq=4, writer="deadbeef"),
+def test_status_roundtrip_keeps_active_and_committed() -> None:
+    active = Generation(step=2, seq=4, writer="deadbeef")
+    committed = CommittedState(
+        generation=Generation(step=2, seq=3, writer="cafe1234"),
         ranks=(0, 1, 2),
-        state="sealed",
+        layout={"tp": 3},
+    )
+    status = StepStatus(
+        step=2,
+        generation=active,
+        ranks=(0, 1, 2),
+        committed=committed,
         etag='"etag"',
     )
 
-    loaded = GenerationPointer.loads(pointer.dumps(), etag='"etag"')
+    loaded = StepStatus.loads(status.dumps(), etag='"etag"')
 
-    assert loaded.generation == pointer.generation
+    assert loaded.generation == active
     assert loaded.ranks == (0, 1, 2)
-    assert loaded.state == "sealed"
+    assert loaded.committed == committed
+    assert loaded.state == "open"
     assert loaded.etag == '"etag"'
-    assert loaded.dumps() == pointer.dumps()
+    assert loaded.dumps() == status.dumps()
 
 
 # --- acquire：CAS 线性化 ----------------------------------------------------
@@ -157,8 +166,10 @@ def test_acquire_creates_first_generation(storage: S3Storage) -> None:
     gen = acquire_generation(storage, STEP, ranks=(0,), writer="aaaaaaaa")
 
     assert gen.seq == 1
-    assert storage.read(pointer_key(STEP)) != b""
-    assert verify_holder(storage, gen).state == "open"
+    assert storage.read(status_key(STEP)) != b""
+    status = verify_holder(storage, gen)
+    assert status.state == "open"
+    assert status.committed is None
 
 
 def test_acquire_advances_seq_and_fences_the_old_one(storage: S3Storage) -> None:
@@ -235,22 +246,23 @@ def test_finalize_with_stale_generation_is_rejected(
     save_one(local)
     stale = ckpt.begin_upload(storage, step=STEP, ranks=[0])
     ckpt.upload_local(local, storage, step=STEP, rank=0, generation=stale)
-    ckpt.begin_upload(storage, step=STEP, ranks=[0])  # 新尝试接管 GEN
+    ckpt.begin_upload(storage, step=STEP, ranks=[0])  # 新尝试接管 STATUS
 
     with pytest.raises(FencedError, match="已被 fence"):
         ckpt.finalize_upload(storage, step=STEP, ranks=[0], generation=stale)
 
-    assert commit_key(STEP) not in set(storage.list(""))
+    status = read_status(storage, STEP)
+    assert status is not None and status.committed is None
 
 
 def test_finalize_rejects_rank_mismatch(storage: S3Storage, tmp_path) -> None:
-    """GEN 声明 ranks [0]，finalize 却传 [0, 1]：配置漂移，直接拒绝。"""
+    """STATUS 声明 ranks [0]，finalize 却传 [0, 1]：配置漂移，直接拒绝。"""
     local = tmp_path / "local"
     save_one(local)
     generation = ckpt.begin_upload(storage, step=STEP, ranks=[0])
     ckpt.upload_local(local, storage, step=STEP, rank=0, generation=generation)
 
-    with pytest.raises(FormatError, match="GEN 声明的 ranks"):
+    with pytest.raises(FormatError, match="STATUS 声明的 ranks"):
         ckpt.finalize_upload(storage, step=STEP, ranks=[0, 1])
 
 
@@ -278,7 +290,8 @@ def test_retry_does_not_mix_generations(storage: S3Storage, tmp_path) -> None:
     with pytest.raises(FencedError):
         # 旧代申请提交同样不行：它已经被 gen2 fence 掉了
         ckpt.finalize_upload(storage, step=STEP, ranks=[0, 1], generation=gen1)
-    assert commit_key(STEP) not in set(storage.list(""))
+    status = read_status(storage, STEP)
+    assert status is not None and status.committed is None
 
 
 def test_committed_version_survives_failed_retry(
@@ -354,25 +367,27 @@ def test_data_object_is_never_overwritten(storage: S3Storage, tmp_path) -> None:
     assert storage.read(index_key(STEP, 0, gen)) == before
 
 
-# --- 恢复端：L3 是唯一权威 ------------------------------------------------
+# --- 恢复端：STATUS.committed 是唯一权威 -----------------------------------
 
 
-def test_recovery_ignores_gen_pointer(storage: S3Storage, tmp_path) -> None:
+def test_deleting_status_makes_step_unrecoverable(storage: S3Storage, tmp_path) -> None:
+    """单点 STATUS 一旦被删，这一版立刻不可恢复（不再单独存在 L3 COMMIT）。"""
     local = tmp_path / "local"
     save_one(local, value=1.5)
     gen = ckpt.begin_upload(storage, step=STEP, ranks=[0])
     ckpt.upload_local(local, storage, step=STEP, rank=0, generation=gen)
     ckpt.finalize_upload(storage, step=STEP, ranks=[0], generation=gen)
 
-    storage.delete(pointer_key(STEP))
+    storage.delete(status_key(STEP))
 
-    assert commit_value(storage) == pytest.approx(1.5), "GEN 只是写路径的仲裁点"
+    with pytest.raises(FormatError, match="STATUS"):
+        ckpt.load_object(storage, step=STEP, device=DEVICE)
 
 
 def test_recovery_rejects_mismatched_rank_commit_generation(
     storage: S3Storage, tmp_path
 ) -> None:
-    """L3 声明 gen A、某 rank 的 L2 却声明 gen B：拒绝恢复，不吐半份数据。"""
+    """STATUS.committed 声明 gen A、某 rank 的 L2 却声明 gen B：拒绝恢复，不吐半份数据。"""
     local = tmp_path / "local"
     save_one(local, value=1.0)
     gen = ckpt.begin_upload(storage, step=STEP, ranks=[0])
@@ -395,60 +410,84 @@ def test_recovery_rejects_mismatched_rank_commit_generation(
         ckpt.load_object(storage, step=STEP, device=DEVICE)
 
 
-def test_recovery_rejects_rank_commit_from_old_layout(
-    storage: S3Storage, tmp_path
-) -> None:
-    """v1 的 L2（没有 generation）混进 v2 版本：同样拒绝。"""
+def test_rank_commit_rejects_legacy_v1_format(storage: S3Storage, tmp_path) -> None:
+    """放弃远端 v1 兼容：缺 generation / format_version=1 的 L2 直接拒绝。"""
     local = tmp_path / "local"
     save_one(local, value=1.0)
     gen = ckpt.begin_upload(storage, step=STEP, ranks=[0])
     ckpt.upload_local(local, storage, step=STEP, rank=0, generation=gen)
     ckpt.finalize_upload(storage, step=STEP, ranks=[0], generation=gen)
 
-    legacy = RankCommit(
-        step=STEP,
-        rank=0,
-        metadata_bytes=storage.head(index_key(STEP, 0, gen)).size,
-        format_version=1,
+    storage.write(
+        rank_commit_key(STEP, 0, gen),
+        '{"format_version": 1, "step": 1, "rank": 0, "metadata": {"bytes": 8}, "files": {}}'.encode(
+            "utf-8"
+        ),
     )
-    storage.write(rank_commit_key(STEP, 0, gen), legacy.dumps().encode("utf-8"))
 
-    with pytest.raises(FormatError, match="混了两次尝试"):
+    with pytest.raises(FormatError, match="format_version"):
         ckpt.load_object(storage, step=STEP, device=DEVICE)
 
 
-def test_legacy_v1_layout_still_restores(storage: S3Storage, tmp_path) -> None:
-    """没有代际层的老对象照常能读：向后兼容不是靠迁移，而是读侧认两套布局。"""
-    from commit.local import read_commit as read_local_commit
-    from storage.local import LocalStorage
+# --- 单点 CAS：消除跨 key 并发窗口 ------------------------------------------
 
+
+def test_stale_generation_cannot_commit_after_new_generation_acquires_status(
+    storage: S3Storage, tmp_path, monkeypatch
+) -> None:
+    """★ gen1 在 finalize 的 list 阶段停顿，期间 gen2 抢走 STATUS；gen1 提交必然 412。
+
+    在旧的双对象（GEN + COMMIT）模型下，这一步 gen1 仍能把 L3 写出来；单点 STATUS
+    下 acquire 已经改掉了 ETag，gen1 的 If-Match 在服务端原子层直接失败。
+    """
     local = tmp_path / "local"
-    save_one(local, value=3.0)
-    version = version_prefix(STEP)
-    local_backend = LocalStorage(local, direct_io=False)
-    committed = read_local_commit(local_backend, STEP)
-    assert committed is not None
+    save_one(local, value=1.0)
+    gen1 = ckpt.begin_upload(storage, step=STEP, ranks=[0])
+    ckpt.upload_local(local, storage, step=STEP, rank=0, generation=gen1)
 
-    metadata = local_backend.read(f"{version}/{META_FILE}")
-    storage.write(f"{version}/rank_0/{META_FILE}", metadata)
-    for name in committed.files:
-        storage.write(f"{version}/rank_0/{name}", local_backend.read(f"{version}/{name}"))
-    storage.write(
-        f"{version}/rank_0/{COMMIT_FILE}",
-        RankCommit(
-            step=STEP,
-            rank=0,
-            metadata_bytes=len(metadata),
-            files=dict(committed.files),
-            format_version=1,
-        ).dumps().encode("utf-8"),
-    )
-    storage.write(
-        f"{version}/{COMMIT_FILE}",
-        UploadCommit(step=STEP, ranks=(0,), format_version=1).dumps().encode("utf-8"),
-    )
+    real_list = storage.list
+    interleaved = {"done": False}
 
-    assert commit_value(storage) == pytest.approx(3.0)
+    def list_then_preempt(prefix: str = "") -> list[str]:
+        result = real_list(prefix)
+        if not interleaved["done"] and prefix == generation_prefix(STEP, gen1):
+            interleaved["done"] = True
+            # gen1 刚检查完前缀准备提交，gen2 此时抢走 STATUS 写权
+            ckpt.begin_upload(storage, step=STEP, ranks=[0])
+        return result
+
+    monkeypatch.setattr(storage, "list", list_then_preempt)
+
+    with pytest.raises(FencedError, match="已被接管"):
+        ckpt.finalize_upload(storage, step=STEP, ranks=[0], generation=gen1)
+
+    status = read_status(storage, STEP)
+    assert status is not None
+    assert status.committed is None
+    assert status.seq == 2
+
+
+def test_latest_remote_step_skips_uncommitted_status_and_fails_on_corrupt_status(
+    storage: S3Storage, tmp_path
+) -> None:
+    """只靠 STATUS 存在不算已提交：未提交的 step 2 被跳过，坏 JSON 则 fail-closed。"""
+    local1 = tmp_path / "local-1"
+    save_one(local1, step=1, value=1.0)
+    gen1 = ckpt.begin_upload(storage, step=1, ranks=[0])
+    ckpt.upload_local(local1, storage, step=1, rank=0, generation=gen1)
+    ckpt.finalize_upload(storage, step=1, ranks=[0], generation=gen1)
+
+    # step 2 开了代（写了 STATUS，committed=null），还没提交
+    ckpt.begin_upload(storage, step=2, ranks=[0])
+
+    loaded = ckpt.load_object(storage, device=DEVICE)
+    assert loaded.step == 1
+    assert float(loaded.tensors["w"].numpy()[0, 0]) == pytest.approx(1.0)
+
+    # 最新 step 的 STATUS 损坏：fail-closed，不能静默回退
+    storage.write(status_key(2), b"{broken-json")
+    with pytest.raises(FormatError, match="STATUS"):
+        ckpt.load_object(storage, device=DEVICE)
 
 
 # --- L2 的索引摘要 ----------------------------------------------------------

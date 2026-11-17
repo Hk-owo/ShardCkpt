@@ -343,7 +343,7 @@ def test_dry_run_only_plans_then_real_run_deletes(state, tmp_path) -> None:
     assert report.steps_for(LOCAL) == (1,)
     assert report.reclaimed_bytes > 0
     assert not (local / version_key(1)).exists()
-    assert (remote_root / version_key(1) / "COMMIT").is_file(), "远端已提交版本永不删"
+    assert (remote_root / version_key(1) / "STATUS").is_file(), "远端已提交版本永不删"
 
 
 def test_upload_incomplete_keeps_local(state, tmp_path) -> None:
@@ -494,7 +494,7 @@ def test_stale_remote_prefix_is_reclaimed_on_disk(state, tmp_path) -> None:
 
     assert report.steps_for(REMOTE) == (1,)
     assert not (remote_root / version_key(1)).exists()
-    assert (remote_root / version_key(2) / "COMMIT").is_file()
+    assert (remote_root / version_key(2) / "STATUS").is_file()
 
 
 # --- 周期线程 -------------------------------------------------------------
@@ -634,8 +634,8 @@ def test_collect_deletes_stale_generation_and_keeps_current(state, tmp_path) -> 
     assert (local / version_key(5)).is_dir()
 
 
-def test_gen_pointer_alone_never_makes_a_version_visible(tmp_path) -> None:
-    """只写了 GEN、没写数据：既不是版本，也不会被当成「正在传」删掉。"""
+def test_uncommitted_status_alone_never_makes_a_version_visible(tmp_path) -> None:
+    """只写了未提交的 STATUS（committed=null）、没写数据：既不是版本，也不删 STATUS。"""
     remote = LocalStorage(tmp_path / "remote", conditional_writes=True)
     generation = ckpt.begin_upload(remote, step=7, ranks=[0])
 
@@ -644,7 +644,7 @@ def test_gen_pointer_alone_never_makes_a_version_visible(tmp_path) -> None:
     assert 7 not in report.versions
     assert report.steps_for(REMOTE) == ()
     assert remote.list(f"step_7/{generation.id}") == []
-    assert remote.list("step_7/GEN"), "GEN 本身不是数据，留着让下次重试知道序号"
+    assert remote.list("step_7/STATUS"), "STATUS 本身不是数据，留着让下次重试知道序号"
 
 
 def test_stale_generation_delete_order_is_rank_commit_then_data(state, tmp_path) -> None:
@@ -769,8 +769,8 @@ def test_local_copy_of_the_new_attempt_is_not_treated_as_uploaded(
     assert remote.list(f"step_5/{gen1.id}"), f"{gen2.id} 还没提交，旧代仍在服务恢复"
 
 
-def test_missing_pointer_falls_back_to_the_newest_directory(state, tmp_path) -> None:
-    """GEN 被外部删掉：判据降级为「目录里序号最大的那一代」，不猜、不误删。"""
+def test_missing_status_falls_back_to_the_newest_directory(state, tmp_path) -> None:
+    """STATUS 被外部删掉：判据降级为「目录里序号最大的那一代」，正在传的那一代受保护。"""
     local = tmp_path / "local"
     remote = LocalStorage(tmp_path / "remote", conditional_writes=True)
     _save(state, local, 5)
@@ -780,13 +780,34 @@ def test_missing_pointer_falls_back_to_the_newest_directory(state, tmp_path) -> 
     _save(state, local, 5)
     gen2 = ckpt.begin_upload(remote, step=5, ranks=[0])
     _upload_generation(local, remote, 5, gen2)
-    remote.delete("step_5/GEN")
+    remote.delete("step_5/STATUS")
+
+    report = collect(local, remote, rank=0, dry_run=False, keep_local=0)
+
+    assert [
+        item.generation for item in report.deleted if item.location == REMOTE
+    ] == [gen1.id]
+    assert remote.list(f"step_5/{gen2.id}"), "序号最大的代受保护"
+
+
+def test_corrupted_status_keeps_everything(state, tmp_path) -> None:
+    """STATUS 坏 JSON（读不出来）：进入 unknown_versions，一个代都不删。"""
+    local = tmp_path / "local"
+    remote = LocalStorage(tmp_path / "remote", conditional_writes=True)
+    _save(state, local, 5)
+    gen1 = ckpt.begin_upload(remote, step=5, ranks=[0])
+    _upload_generation(local, remote, 5, gen1)
+    _finalize(remote, 5)
+    _save(state, local, 5)
+    gen2 = ckpt.begin_upload(remote, step=5, ranks=[0])
+    _upload_generation(local, remote, 5, gen2)
+    remote.write("step_5/STATUS", b"{corrupted")
 
     report = collect(local, remote, rank=0, dry_run=False, keep_local=0)
 
     assert not [item for item in report.deleted if item.location == REMOTE]
-    assert remote.list(f"step_5/{gen1.id}"), "L3 声明的代受保护"
-    assert remote.list(f"step_5/{gen2.id}"), "序号最大的代受保护"
+    assert remote.list(f"step_5/{gen1.id}")
+    assert remote.list(f"step_5/{gen2.id}")
 
 
 def test_fenced_generation_is_reclaimed_once_the_next_one_lands(state, tmp_path) -> None:

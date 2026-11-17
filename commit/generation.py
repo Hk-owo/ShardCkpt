@@ -1,32 +1,33 @@
-"""对象存储端的代际（generation）与 fence：一个 CAS 寄存器 + 三个检查点。
+"""对象存储端的代际（generation）与 fence：单对象 ``step_N/STATUS`` CAS 状态机。
 
 **代际**是「某个 step 的一次保存尝试」：``gen_0007-1f3a9c2b`` = 本 step 第 7 次
 尝试 + 写者 token。**fence token** 是 ``(step, seq)``，字典序可比 —— ``seq`` 由
-``step_N/GEN`` 这个 CAS 寄存器的成功顺序线性化，不看时钟、不靠租约。
+``step_N/STATUS`` 这个单点 CAS 寄存器的成功顺序线性化，不看时钟、不靠租约。
+
+把写权（``active``）与版本提交指针（``committed``）合进同一个 ``step_N/STATUS``
+对象后，``acquire`` 与 ``commit`` 共享同一份 ``ETag``：新代一抢走写权，旧代提交时的
+``If-Match`` 在服务端原子层必然 412 失败，**不存在跨 key 并发窗口**。
 
 四条不变量（``docs/generation.md`` 有完整规格与失败模式矩阵）：
 
 1. **物理隔离**：不同代的产物落在不同 key（``step_N/<gen>/rank_r/...``），
    重试永不改写已提交版本的对象；
-2. **L3 唯一权威**：恢复端只读 ``step_N/COMMIT`` 及其声明的 generation，
-   **不读 GEN** —— GEN 被删被改，已提交版本照常可恢复；
+2. **``committed`` 唯一权威**：恢复端只认 ``step_N/STATUS`` 的 ``committed`` 字段
+   及其声明的 generation，``committed == null`` 时哪怕 ``STATUS`` 存在也不可恢复；
+   重试新代失败时 ``committed`` 保持指向上一次已提交代不变；
 3. **fail-closed**：fence 检查「查不到 / 对不上 / 读失败」一律推定为落后，
    写者停止并抛 :class:`FencedError`，绝不降级为放行；
-4. **无租约**：没有心跳、TTL、mtime 阈值。``acquire`` 只把 GEN 往前推一格。
+4. **无租约**：没有心跳、TTL、mtime 阈值。``acquire`` 只把 ``active.seq`` 往前推一格。
 
 三个检查点（写路径）：
 
 ======  ========  =============================================  ============
 点      谁        动作                                           落后时
 ======  ========  =============================================  ============
-B       rank 0    ``acquire_generation``：CAS 推进 ``seq``        不写任何对象
-L2-pre  每个 rank ``verify_holder``：读 GEN 比对 generation      不写 L2
-L3-pre  rank 0    ``seal_generation`` + CAS 写 L3                不写 L3
+B       rank 0    ``acquire_generation``：CAS 推进 ``active``     不写任何对象
+L2-pre  每个 rank ``verify_holder``：读 STATUS 比对 ``active``    不写 L2
+L3      rank 0    ``commit_status``：单次 CAS 写入 ``committed``  不提交版本
 ======  ========  =============================================  ============
-
-``acquire`` 的 CAS 是**线性化点**：所有并发写者在这里排成一个全序，``seq`` 就是
-这个全序的编号。所以不存在「两个写者都以为自己赢了」的窗口 —— 这是它相对
-「覆盖写 + 回读自检」的关键差别。
 """
 
 from __future__ import annotations
@@ -35,28 +36,17 @@ import json
 import re
 import uuid
 from dataclasses import dataclass, field, replace
-from typing import Sequence
+from typing import Mapping, Sequence
 
 from commit.local import version_key
 from core import CheckpointError, FormatError
 from storage.base import ObjectNotFoundError, StorageBackend, WriteOutcome
 
-GENERATION_FILE = "GEN"
-"""本 step 当前代际指针（唯一共享写点）。"""
+STATUS_FILE = "STATUS"
+"""本 step 唯一共享状态对象（同时持有写权 ``active`` 与提交指针 ``committed``）。"""
 
-GENERATION_FORMAT_VERSION = 2
-"""GEN / L2 / L3 的格式版本。
-
-v1 是「只有 step、没有代际」的老布局，读侧仍接受（``generation=None`` 走旧 key
-布局）；写侧只写 v2。
-"""
-
-SUPPORTED_FORMAT_VERSIONS = frozenset({1, GENERATION_FORMAT_VERSION})
-
-OPEN = "open"
-SEALED = "sealed"
-COMMITTED = "committed"
-POINTER_STATES = frozenset({OPEN, SEALED, COMMITTED})
+STATUS_FORMAT_VERSION = 3
+"""``step_N/STATUS`` 的格式版本（单点 STATUS 状态机，不兼容旧双对象/v1 远端布局）。"""
 
 DEFAULT_ACQUIRE_RETRIES = 4
 """``acquire_generation`` 的 CAS 重试上限。
@@ -66,8 +56,6 @@ DEFAULT_ACQUIRE_RETRIES = 4
 """
 
 _GENERATION_RE = re.compile(r"^gen_(\d{4,})-([0-9a-z]{1,32})$")
-
-_WRITER_ALPHABET = "0123456789abcdef"
 
 
 class FencedError(CheckpointError):
@@ -126,57 +114,152 @@ def new_writer() -> str:
     return uuid.uuid4().hex[:8]
 
 
+def _validate_ranks(ranks: Sequence[int], *, label: str) -> tuple[int, ...]:
+    normalized = tuple(int(rank) for rank in ranks)
+    if not normalized:
+        raise FormatError(f"{label} must declare at least one rank")
+    if len(set(normalized)) != len(normalized):
+        raise FormatError(f"duplicate ranks in {label}: {normalized}")
+    if any(rank < 0 for rank in normalized):
+        raise FormatError(f"ranks in {label} must be >= 0, got {normalized}")
+    return normalized
+
+
 @dataclass(frozen=True, slots=True)
-class GenerationPointer:
-    """``step_N/GEN`` 的内容。
+class CommittedState:
+    """``step_N/STATUS`` 里已提交版本的权威指针。"""
 
-    ``etag`` 是**读出来时**服务端给的版本标识，不参与序列化：写回时要把它当作
-    ``If-Match`` 的值，所以它必须与「我读到的那个 GEN」严格对应。
-    """
-
-    step: int
     generation: Generation
     ranks: tuple[int, ...]
-    state: str = OPEN
-    format_version: int = GENERATION_FORMAT_VERSION
-    etag: str = field(default="", compare=False)
+    layout: Mapping[str, int] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "ranks", tuple(int(rank) for rank in self.ranks))
-        if self.format_version not in SUPPORTED_FORMAT_VERSIONS:
-            raise FormatError(
-                f"unsupported GEN format_version {self.format_version}, "
-                f"this build understands {sorted(SUPPORTED_FORMAT_VERSIONS)}"
-            )
-        if self.state not in POINTER_STATES:
-            raise FormatError(
-                f"unsupported GEN state {self.state!r}, expected one of "
-                f"{sorted(POINTER_STATES)}"
-            )
-        if not self.ranks:
-            raise FormatError("GEN must declare at least one rank")
-        if len(set(self.ranks)) != len(self.ranks):
-            raise FormatError(f"duplicate ranks in GEN: {self.ranks}")
-        if any(rank < 0 for rank in self.ranks):
-            raise FormatError(f"ranks must be >= 0, got {self.ranks}")
+        object.__setattr__(
+            self, "ranks", _validate_ranks(self.ranks, label="STATUS.committed")
+        )
+        object.__setattr__(
+            self,
+            "layout",
+            {str(k): int(v) for k, v in (self.layout or {}).items()},
+        )
+
+    @property
+    def step(self) -> int:
+        return self.generation.step
 
     @property
     def seq(self) -> int:
         return self.generation.seq
 
-    def with_state(self, state: str) -> "GenerationPointer":
-        return replace(self, state=state)
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "generation": self.generation.id,
+            "seq": self.generation.seq,
+            "ranks": list(self.ranks),
+            "layout": {key: int(value) for key, value in sorted(self.layout.items())},
+        }
+
+    @classmethod
+    def from_dict(cls, data: object, *, step: int) -> "CommittedState":
+        if not isinstance(data, dict):
+            raise FormatError(
+                f"STATUS.committed must be a JSON object, got {type(data).__name__}"
+            )
+        ranks = data.get("ranks")
+        if not isinstance(ranks, list):
+            raise FormatError("STATUS.committed 'ranks' must be a list")
+        layout = data.get("layout", {})
+        if not isinstance(layout, dict):
+            raise FormatError("STATUS.committed 'layout' must be an object")
+        try:
+            generation = Generation.parse(str(data["generation"]), step=step)
+            seq = int(data["seq"])
+            if generation.seq != seq:
+                raise FormatError(
+                    f"STATUS.committed generation {generation.id} 与 seq {seq} 不一致"
+                )
+            return cls(
+                generation=generation,
+                ranks=tuple(int(rank) for rank in ranks),
+                layout={str(k): int(v) for k, v in layout.items()},
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise FormatError(f"STATUS.committed is malformed: {exc}") from exc
+
+
+@dataclass(frozen=True, slots=True)
+class StepStatus:
+    """``step_N/STATUS`` 的内容（单对象 CAS 状态机）。
+
+    ``etag`` 是**读出来时**服务端给的版本标识，不参与序列化：写回时要把它当作
+    ``If-Match`` 的值，所以它必须与「我读到的那个 STATUS」严格对应。
+    """
+
+    step: int
+    generation: Generation
+    ranks: tuple[int, ...]
+    committed: CommittedState | None = None
+    format_version: int = STATUS_FORMAT_VERSION
+    etag: str = field(default="", compare=False)
+
+    def __post_init__(self) -> None:
+        if self.format_version != STATUS_FORMAT_VERSION:
+            raise FormatError(
+                f"unsupported STATUS format_version {self.format_version}, "
+                f"this build understands {STATUS_FORMAT_VERSION}"
+            )
+        if self.step < 0:
+            raise FormatError(f"STATUS step must be >= 0, got {self.step}")
+        if self.generation.step != self.step:
+            raise FormatError(
+                f"STATUS active generation {self.generation.id} belongs to step "
+                f"{self.generation.step}, expected {self.step}"
+            )
+        object.__setattr__(
+            self, "ranks", _validate_ranks(self.ranks, label="STATUS.active")
+        )
+        if self.committed is not None:
+            if self.committed.step != self.step:
+                raise FormatError(
+                    f"STATUS committed generation belongs to step "
+                    f"{self.committed.step}, expected {self.step}"
+                )
+            if self.committed.seq > self.generation.seq:
+                raise FormatError(
+                    f"STATUS committed seq {self.committed.seq} exceeds active seq "
+                    f"{self.generation.seq}"
+                )
+
+    @property
+    def seq(self) -> int:
+        return self.generation.seq
+
+    @property
+    def is_committed(self) -> bool:
+        return self.committed is not None
+
+    @property
+    def state(self) -> str:
+        """只读诊断标签：当前代是否已提交（不用于写锁）。"""
+        if self.committed is not None and self.committed.generation.id == self.generation.id:
+            return "committed"
+        return "open"
+
+    def with_committed(self, committed: CommittedState) -> "StepStatus":
+        return replace(self, committed=committed)
 
     def dumps(self) -> str:
         return json.dumps(
             {
                 "format_version": self.format_version,
                 "step": self.step,
-                "generation": self.generation.id,
-                "seq": self.generation.seq,
-                "writer": self.generation.writer,
-                "ranks": list(self.ranks),
-                "state": self.state,
+                "active": {
+                    "generation": self.generation.id,
+                    "seq": self.generation.seq,
+                    "writer": self.generation.writer,
+                    "ranks": list(self.ranks),
+                },
+                "committed": None if self.committed is None else self.committed.to_dict(),
             },
             indent=2,
             sort_keys=True,
@@ -184,41 +267,55 @@ class GenerationPointer:
         )
 
     @classmethod
-    def loads(cls, text: str, *, etag: str = "") -> "GenerationPointer":
+    def loads(cls, text: str, *, etag: str = "") -> "StepStatus":
         try:
             data = json.loads(text)
         except json.JSONDecodeError as exc:
-            raise FormatError(f"GEN is not valid JSON: {exc}") from exc
+            raise FormatError(f"STATUS is not valid JSON: {exc}") from exc
         if not isinstance(data, dict):
-            raise FormatError(f"GEN must be a JSON object, got {type(data).__name__}")
-        ranks = data.get("ranks")
+            raise FormatError(f"STATUS must be a JSON object, got {type(data).__name__}")
+        active = data.get("active")
+        if not isinstance(active, dict):
+            raise FormatError("STATUS missing 'active' object")
+        ranks = active.get("ranks")
         if not isinstance(ranks, list):
-            raise FormatError("GEN 'ranks' must be a list")
+            raise FormatError("STATUS.active 'ranks' must be a list")
+        raw_committed = data.get("committed")
         try:
             step = int(data["step"])
-            generation = Generation.parse(str(data["generation"]), step=step)
+            generation = Generation.parse(str(active["generation"]), step=step)
+            seq = int(active["seq"])
+            if generation.seq != seq:
+                raise FormatError(
+                    f"STATUS.active generation {generation.id} 与 seq {seq} 不一致"
+                )
+            committed = (
+                None
+                if raw_committed is None
+                else CommittedState.from_dict(raw_committed, step=step)
+            )
             return cls(
                 step=step,
                 generation=generation,
                 ranks=tuple(int(rank) for rank in ranks),
-                state=str(data.get("state", OPEN)),
-                format_version=int(data.get("format_version", GENERATION_FORMAT_VERSION)),
+                committed=committed,
+                format_version=int(data["format_version"]),
                 etag=etag,
             )
         except (KeyError, TypeError, ValueError) as exc:
-            raise FormatError(f"GEN is malformed: {exc}") from exc
+            raise FormatError(f"STATUS is malformed: {exc}") from exc
 
 
-def pointer_key(step: int) -> str:
-    """``step_42/GEN``。"""
-    return f"{version_key(step)}/{GENERATION_FILE}"
+def status_key(step: int) -> str:
+    """``step_42/STATUS``。"""
+    return f"{version_key(step)}/{STATUS_FILE}"
 
 
 def next_seq(keys: Sequence[str], *, current: int = 0) -> int:
     """下一个序号：``max(现有 gen 前缀的 seq, current) + 1``。
 
-    **纯函数**。同时看 ``list`` 结果和 GEN 里的 ``seq``：GEN 被外部删掉时，已有
-    代目录仍能把序号顶住，``seq`` 不会回退 —— 而 ``seq`` 一旦回退，L3 的 fence
+    **纯函数**。同时看 ``list`` 结果和 STATUS 里的 ``seq``：STATUS 被外部删掉时，
+    已有代目录仍能把序号顶住，``seq`` 不会回退 —— 而 ``seq`` 一旦回退，fence
     比较就失效了。
     """
     best = int(current)
@@ -230,50 +327,48 @@ def next_seq(keys: Sequence[str], *, current: int = 0) -> int:
     return best + 1
 
 
-def read_pointer(storage: StorageBackend, step: int) -> GenerationPointer | None:
-    """读 GEN；不存在返回 ``None``（不是「拿着旧代继续」，调用方必须自己决定）。"""
+def read_status(storage: StorageBackend, step: int) -> StepStatus | None:
+    """读 ``step_N/STATUS``；不存在返回 ``None``（不是「拿着旧代继续」，由调用方裁决）。"""
+    key = status_key(step)
     try:
-        payload = storage.read(pointer_key(step))
+        payload = storage.read(key)
     except ObjectNotFoundError:
         return None
-    etag = _etag_of(storage, pointer_key(step))
-    return GenerationPointer.loads(payload.decode("utf-8"), etag=etag)
+    etag = _etag_of(storage, key)
+    return StepStatus.loads(payload.decode("utf-8"), etag=etag)
 
 
 def _etag_of(storage: StorageBackend, key: str) -> str:
     head = getattr(storage, "head", None)
-    if not callable(head):  # pragma: no cover - 只有非条件后端才会走到
-        raise FencedError(
-            f"{key}: 存储后端不提供 head()，无法用 ETag 做 CAS（写路径要求 "
-            "S3Storage 的 conditional_writes=require）"
-        )
+    if not callable(head):  # pragma: no cover - 只读兜底；写路径在 write_status 里拒绝无 ETag
+        return ""
     meta = head(key)
     return "" if meta is None else meta.etag
 
 
-def write_pointer(
+def write_status(
     storage: StorageBackend,
-    pointer: GenerationPointer,
+    status: StepStatus,
     *,
     if_absent: bool = False,
 ) -> WriteOutcome:
-    """写 GEN：``if_absent`` 走 create-exclusive，否则用 ``pointer.etag`` 做 CAS。"""
+    """写 ``step_N/STATUS``：``if_absent`` 走 create-exclusive，否则用 ``status.etag`` 做 CAS。"""
     put_if_absent = getattr(storage, "put_if_absent", None)
     put_if_match = getattr(storage, "put_if_match", None)
     if not callable(put_if_absent) or not callable(put_if_match):  # pragma: no cover
         raise FencedError(
-            f"{pointer_key(pointer.step)}: 存储后端没有条件写能力；"
+            f"{status_key(status.step)}: 存储后端没有条件写能力；"
             "写路径要求 S3Storage 的 conditional_writes=require"
         )
-    payload = pointer.dumps().encode("utf-8")
-    key = pointer_key(pointer.step)
+    payload = status.dumps().encode("utf-8")
+    key = status_key(status.step)
     if if_absent:
         return put_if_absent(key, payload)
-    if not pointer.etag:
+    if not status.etag:
         raise FencedError(
-            f"{key}: 没有读到 GEN 的 ETag，无法做 CAS（并发写者可能刚创建/删除了它）"
+            f"{key}: 没有读到 STATUS 的 ETag，无法做 CAS（并发写者可能刚创建/删除了它）"
         )
-    return put_if_match(key, payload, pointer.etag)
+    return put_if_match(key, payload, status.etag)
 
 
 def acquire_generation(
@@ -286,9 +381,9 @@ def acquire_generation(
 ) -> Generation:
     """CAS 抢这个 step 的写权，返回**只属于我**的一代。
 
-    ``seq = next_seq(list(step_N), current=现有 GEN.seq)``：既看 GEN 也看已有代目录，
-    所以 GEN 被删掉时序号也不会回退。之后 ``If-None-Match``（首代）或
-    ``If-Match``（后继代）推进它 —— 失败就重读重试，超限抛 :class:`FencedError`。
+    ``seq = next_seq(list(step_N), current=现有 STATUS.seq)``：既看 STATUS 也看已有
+    代目录，所以 STATUS 被删掉时序号也不会回退。抢写权只更新 ``active``，**原样
+    保留**已有的 ``committed`` 指针，重试半途失败不会影响上一次已提交版本。
     """
     if retries < 1:
         raise ValueError(f"retries must be >= 1, got {retries}")
@@ -298,19 +393,21 @@ def acquire_generation(
         raise ValueError("acquire_generation 需要至少一个 rank")
 
     outcome: WriteOutcome | None = None
-    seen: GenerationPointer | None = None
     for _ in range(retries):
-        seen = read_pointer(storage, step)
-        seq = next_seq(storage.list(version_key(step)), current=seen.seq if seen else 0)
+        seen = read_status(storage, step)
+        current_seq = (
+            max(seen.seq, seen.committed.seq if seen.committed else 0) if seen else 0
+        )
+        seq = next_seq(storage.list(version_key(step)), current=current_seq)
         candidate = Generation(step=step, seq=seq, writer=token)
-        pointer = GenerationPointer(
+        status = StepStatus(
             step=step,
             generation=candidate,
             ranks=expected,
-            state=OPEN,
+            committed=None if seen is None else seen.committed,
             etag="" if seen is None else seen.etag,
         )
-        outcome = write_pointer(storage, pointer, if_absent=seen is None)
+        outcome = write_status(storage, status, if_absent=seen is None)
         if outcome.written:
             return candidate
     raise FencedError(
@@ -320,65 +417,57 @@ def acquire_generation(
     )
 
 
-def verify_holder(storage: StorageBackend, generation: Generation) -> GenerationPointer:
-    """读证明：``generation`` 是否仍是这个 step 的当前代际。
+def verify_holder(storage: StorageBackend, generation: Generation) -> StepStatus:
+    """读证明：``generation`` 是否仍是这个 step 的 ``active`` 代际。
 
-    这是 L2-pre 与 L3-pre 共用的判据。落后就抛 :class:`FencedError` —— 调用方
-    因此**不会**写自己的分片提交点，这一代永远凑不齐，也不会被 rank 0 提升。
+    落后就抛 :class:`FencedError` —— 调用方因此**不会**写自己的分片提交点，这一代
+    永远凑不齐，也不会提交成功。
     """
-    pointer = read_pointer(storage, generation.step)
-    if pointer is None:
+    status = read_status(storage, generation.step)
+    if status is None:
         raise FencedError(
-            f"{pointer_key(generation.step)}: GEN 不存在，{generation.id} 不再持有写权"
+            f"{status_key(generation.step)}: STATUS 不存在，{generation.id} 不再持有写权"
         )
-    if pointer.generation.id != generation.id:
+    if status.generation.id != generation.id:
         raise FencedError(
-            f"step {generation.step}: 当前代际是 {pointer.generation.id}"
-            f"（state={pointer.state}），{generation.id} 已被 fence"
+            f"step {generation.step}: 当前代际是 {status.generation.id}"
+            f"（{status.state}），{generation.id} 已被 fence"
         )
-    return pointer
+    return status
 
 
-def seal_generation(
-    storage: StorageBackend, generation: Generation, *, ranks: Sequence[int]
-) -> GenerationPointer:
-    """CAS 把 GEN 推到 ``sealed``：这一代不再接受新写者，准备提交。
+def commit_status(
+    storage: StorageBackend,
+    status: StepStatus,
+    committed: CommittedState,
+) -> CommittedState:
+    """单点 CAS 提交：用 ``status.etag`` 原子更新 ``STATUS.committed``。
 
-    幂等：已经 sealed / committed 且 generation 相同就直接返回（rank 0 崩在写 L3
-    之前、重跑 finalize 时会走这条）。
+    因为 ``acquire_generation`` 与 ``commit_status`` 写的是同一个对象，只要新代在
+    期间抢走了写权，``status.etag`` 就已过期，服务端必然返回 412，不可能出现
+    「旧代在并发窗口后偷跑提交」的问题。
     """
-    pointer = verify_holder(storage, generation)
-    if pointer.state in (SEALED, COMMITTED):
-        return pointer
-    expected = tuple(int(rank) for rank in ranks)
-    if pointer.ranks != expected:
-        raise FormatError(
-            f"step {generation.step}: GEN 声明 ranks {pointer.ranks}，"
-            f"finalize 传入 {expected}"
-        )
-    outcome = write_pointer(storage, pointer.with_state(SEALED))
-    if outcome is not WriteOutcome.SWAPPED:
-        raise FencedError(
-            f"step {generation.step}: seal GEN 的 CAS 失败（{outcome.value}），"
-            f"{generation.id} 在 seal 期间被接管"
-        )
-    return pointer.with_state(SEALED)
+    outcome = write_status(storage, status.with_committed(committed))
+    if outcome is WriteOutcome.SWAPPED:
+        return committed
 
+    latest = read_status(storage, status.step)
+    if (
+        latest is not None
+        and latest.committed is not None
+        and latest.committed.generation.id == committed.generation.id
+    ):
+        if latest.committed.ranks != committed.ranks:
+            raise FormatError(
+                f"step {status.step}: 已提交的 STATUS 声明 ranks "
+                f"{latest.committed.ranks}，本次传入 {committed.ranks}"
+            )
+        return latest.committed
 
-def mark_committed(
-    storage: StorageBackend, generation: Generation
-) -> GenerationPointer | None:
-    """尽力把 GEN 推到 ``committed``（纯诊断，失败不影响提交成立）。"""
-    try:
-        pointer = read_pointer(storage, generation.step)
-        if pointer is None or pointer.generation.id != generation.id:
-            return None
-        if pointer.state == COMMITTED:
-            return pointer
-        outcome = write_pointer(storage, pointer.with_state(COMMITTED))
-        return pointer.with_state(COMMITTED) if outcome.written else None
-    except Exception:  # pragma: no cover - 诊断状态不参与正确性
-        return None
+    raise FencedError(
+        f"step {status.step}: commit STATUS 的 CAS 失败（{outcome.value}），"
+        f"{committed.generation.id} 已被接管"
+    )
 
 
 def resolve_generation(
@@ -390,20 +479,19 @@ def resolve_generation(
 ) -> Generation:
     """把「没显式给代际」的调用收敛到一个确定的代际。
 
-    - GEN 已存在：返回它的 generation（**单 rank 便利路径**）。多 rank 场景必须
-      显式 ``begin_upload``：复用别人开的代会把两次尝试的分片混在一起，这正是
-      代际要防的那个 bug。
-    - GEN 不存在：直接 :func:`acquire_generation` 开第一代。
+    - STATUS 已存在：返回它的 active generation（**单 rank 便利路径**）。多 rank
+      场景必须显式 ``begin_upload``：复用别人开的代会把两次尝试的分片混在一起。
+    - STATUS 不存在：直接 :func:`acquire_generation` 开第一代。
     """
-    pointer = read_pointer(storage, step)
-    if pointer is not None:
+    status = read_status(storage, step)
+    if status is not None:
         expected = tuple(int(rank) for rank in ranks) if ranks is not None else None
-        if expected is not None and pointer.ranks != expected:
+        if expected is not None and status.ranks != expected:
             raise FormatError(
-                f"step {step}: GEN 声明的 ranks {pointer.ranks} 与传入的 {expected} 不一致；"
-                f"多 rank 场景请先调 begin_upload() 分配代际（当前代际 {pointer.generation.id}）"
+                f"step {step}: STATUS 声明的 ranks {status.ranks} 与传入的 {expected} 不一致；"
+                f"多 rank 场景请先调 begin_upload() 分配代际（当前代际 {status.generation.id}）"
             )
-        return pointer.generation
+        return status.generation
     return acquire_generation(storage, step, ranks=ranks or (0,), writer=writer)
 
 
@@ -423,26 +511,21 @@ def as_generation(spec: "Generation | str | None", *, step: int) -> "Generation 
 
 
 __all__ = [
-    "COMMITTED",
+    "CommittedState",
     "DEFAULT_ACQUIRE_RETRIES",
     "FencedError",
-    "GENERATION_FILE",
-    "GENERATION_FORMAT_VERSION",
     "Generation",
-    "GenerationPointer",
-    "OPEN",
-    "POINTER_STATES",
-    "SEALED",
-    "SUPPORTED_FORMAT_VERSIONS",
+    "STATUS_FILE",
+    "STATUS_FORMAT_VERSION",
+    "StepStatus",
     "acquire_generation",
     "as_generation",
-    "mark_committed",
+    "commit_status",
     "new_writer",
     "next_seq",
-    "pointer_key",
-    "read_pointer",
+    "read_status",
     "resolve_generation",
-    "seal_generation",
+    "status_key",
     "verify_holder",
-    "write_pointer",
+    "write_status",
 ]

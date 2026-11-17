@@ -659,22 +659,24 @@ def finalize_upload(
     keep: int | None = DEFAULT_KEEP_VERSIONS,
     reclaim_stale: bool = True,
 ) -> UploadCommit:
-    """rank 0 的提交动作：``list`` 本代前缀确认全部 rank 都传完了，再 CAS 写 ``COMMIT``。
+    """rank 0 的提交动作：``list`` 本代前缀确认全部 rank 都传完了，再单点 CAS 更新 ``STATUS.committed``。
 
     它**不读**任何 rank 的索引，也不汇总分片：齐全性由每个 rank 的 ``rank_<i>/COMMIT``
     证明，分片怎么拼由各 rank 的 ``.metadata`` 在恢复端合并时证明。判据只看提交点在
     不在，所以这一步可以幂等重跑（rank 0 崩了，重启补一次即可）。
 
-    **fence**：先用 CAS 把 GEN 推到 ``sealed``，再用 CAS 写版本 ``COMMIT``。已经提交过
-    更高 ``seq`` 的版本会让本次提交直接 :class:`FencedError` —— 旧代接管不了 L3。
+    **fence**：``begin_upload`` 与本步共享同一个 ``step_N/STATUS`` 对象和同一份
+    ``ETag``。新代一旦抢走写权，旧代提交时的 ``If-Match`` 必然 412 失败并抛
+    :class:`FencedError`，不存在跨 key 并发窗口。
 
-    **提交完成即做有界保留**：版本 ``COMMIT`` 落盘之后，rank 0 接着只留最新 ``keep``
-    代（默认 3 代），从最旧的一代开始删 —— 先删版本 ``COMMIT``，再删分片提交点与数据。
-    ``keep=None`` 关掉自动裁剪；要看/单跑这一步用 :func:`retain_remote_versions`。
+    **提交完成即做有界保留**：``STATUS.committed`` 落盘之后，rank 0 接着只留最新
+    ``keep`` 代（默认 3 代），从最旧的一代开始删 —— 先删 ``step_N/STATUS``，再删分片
+    提交点与数据。``keep=None`` 关掉自动裁剪；要看/单跑这一步用
+    :func:`retain_remote_versions`。
 
-    **同 step 旧代顺带回收**：``COMMIT`` 落盘之后还会删掉**序号更早**的代际前缀
-    （:func:`commit.gc.reclaim_stale_generations`），不必等周期 ``gc_local()``；更新的
-    一代永远不动。``reclaim_stale=False`` 关掉这一步。
+    **同 step 旧代顺带回收**：``STATUS.committed`` 落盘之后还会删掉**序号更早**的
+    代际前缀（:func:`commit.gc.reclaim_stale_generations`），不必等周期
+    ``gc_local()``；更新的一代永远不动。``reclaim_stale=False`` 关掉这一步。
     """
     return _finalize_upload(
         storage,

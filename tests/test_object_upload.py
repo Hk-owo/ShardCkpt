@@ -23,11 +23,12 @@ import api as ckpt
 import s3_stub
 import sim
 from async_ import Tensor, get_backend
+from commit.generation import read_status, status_key
 from core import CheckpointError, ChecksumError, FormatError
 from core.metadata import CPU
 from storage.base import ObjectNotFoundError, StorageError
 from storage.object import S3Config, S3Storage
-from storage.upload import commit_key, data_key, index_key, rank_commit_key, version_prefix
+from storage.upload import data_key, index_key, rank_commit_key, version_prefix
 
 DEVICE = "cuda:0"
 STEP = 1
@@ -146,9 +147,10 @@ def test_ranks_upload_independently_and_rank0_only_lists(
         assert index_key(STEP, rank, generation) in keys
         assert rank_commit_key(STEP, rank, generation) in keys
         assert f"{version_prefix(STEP)}/{generation}/rank_{rank}/__{rank}_0.distcp" in keys
-    assert commit_key(STEP) not in keys, "commit 之前这一版对恢复端不可见"
+    pre = read_status(storage, STEP)
+    assert pre is not None and pre.committed is None, "commit 之前这一版对恢复端不可见"
 
-    # rank 0 的提交动作：只允许 list（前缀查询）与 PUT，不允许读任何 rank 的索引
+    # rank 0 的提交动作：只允许 list（前缀查询）与读/CAS STATUS，不允许读任何 rank 的索引
     s3_server.store.requests.clear()
     commit = ckpt.finalize_upload(storage, step=STEP, ranks=list(range(tp)), layout={"tp": tp})
 
@@ -161,7 +163,9 @@ def test_ranks_upload_independently_and_rank0_only_lists(
 
     assert commit.ranks == tuple(range(tp))
     assert commit.layout == {"tp": tp}
-    assert commit_key(STEP) in keys_of(storage, version_prefix(STEP))
+    assert status_key(STEP) in keys_of(storage, version_prefix(STEP))
+    post = read_status(storage, STEP)
+    assert post is not None and post.committed is not None
     assert "latest" not in keys_of(storage, ""), "不再写 latest 指针"
 
 
@@ -223,8 +227,9 @@ def test_finalize_upload_is_rerunnable(state, tmp_path, storage, s3_config) -> N
     saved = state.step_once()
     upload_ranks(saved, tp=2, local_root=tmp_path / "local", s3_config=s3_config, step=STEP)
 
-    # 第一次「崩了」：rank 0 还没来得及写版本 COMMIT
-    assert commit_key(STEP) not in keys_of(storage, version_prefix(STEP))
+    # 第一次「崩了」：rank 0 还没来得及写入 STATUS.committed
+    pre = read_status(storage, STEP)
+    assert pre is not None and pre.committed is None
 
     first = ckpt.finalize_upload(storage, step=STEP, ranks=[0, 1], layout={"tp": 2})
     second = ckpt.finalize_upload(storage, step=STEP, ranks=[0, 1], layout={"tp": 2})
@@ -253,8 +258,9 @@ def test_finalize_rejects_missing_rank(state, tmp_path, storage, s3_config) -> N
     with pytest.raises(FormatError, match="not all uploaded"):
         ckpt.finalize_upload(storage, step=STEP, ranks=[0, 1], layout={"tp": 2})
 
-    assert commit_key(STEP) not in keys_of(storage, version_prefix(STEP))
-    with pytest.raises(FormatError, match="COMMIT missing"):
+    status = read_status(storage, STEP)
+    assert status is not None and status.committed is None
+    with pytest.raises(FormatError, match="STATUS missing or uncommitted"):
         ckpt.load_object(storage, step=STEP, device=DEVICE)
 
 
@@ -269,7 +275,8 @@ def test_finalize_rejects_half_uploaded_rank(state, tmp_path, storage, s3_config
     with pytest.raises(FormatError, match="not all uploaded"):
         ckpt.finalize_upload(storage, step=STEP, ranks=[0, 1], layout={"tp": 2})
 
-    assert commit_key(STEP) not in keys_of(storage, version_prefix(STEP))
+    status = read_status(storage, STEP)
+    assert status is not None and status.committed is None
 
 
 def test_finalize_rejects_stray_rank_prefix(state, tmp_path, storage, s3_config) -> None:

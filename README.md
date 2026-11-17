@@ -30,7 +30,7 @@ ShardCkpt/
 │   └── upload.py       上传闭环 + 恢复（代际前缀 / 三检查点 / 混代拒绝 / 本地热副本优先）
 ├── commit/           提交协议、版本目录、代际与 fence、垃圾回收
 │   ├── local.py        .metadata → COMMIT，版本扫描与删除
-│   ├── generation.py   代际（gen_0007-xxx）与 GEN 寄存器：CAS 抢写权、读证明、seal
+│   ├── generation.py   代际（gen_0007-xxx）与单点 STATUS：CAS 抢写权、读证明、原子提交
 │   └── gc.py           回收判据（纯函数）+ 执行器 + 周期线程 + 对象存储侧有界保留
 ├── dist/             通信抽象：`all_reduce(MAX)` 已落地（含同进程 ThreadedCollective），
 │                     gather / broadcast 仍只有 docstring
@@ -122,9 +122,9 @@ data = api.load("/ckpt", device="cuda:0")           # 本地版本目录自动�
 | `targets_for_layout()` | `planner/targets.py` | 新布局 → 本 rank 的目标区域（`tp=1` 时整读） |
 | `load_local()` | `api.py` | 本地层读闭环：COMMIT → 读取计划 → 按块 IO → 块 CRC-32C → H2D |
 | `begin_upload()` | `commit/generation.py` / `api.py` | 开一代（CAS 抢写权）并用一次 `all_reduce(MAX)` 广播；多 rank 必须先调它 |
-| `upload_local()` / `finalize_upload()` | `storage/upload.py` | 对象存储上传：每 rank 独立上传（`If-None-Match`）+ rank 0 `seal` 后 CAS 写 `COMMIT`，写完即做有界保留 |
-| `load_object()` | `storage/upload.py` | 对象存储恢复：COMMIT → 合并索引 → 整文件下载 → 本地读闭环 |
-| `load_checkpoint()` | `api.py` / `storage/upload.py` | 恢复入口：本地热副本优先（远端有同代 `COMMIT` ⇒ 零下载），否则回落 `load_object()` |
+| `upload_local()` / `finalize_upload()` | `storage/upload.py` | 对象存储上传：每 rank 独立上传（`If-None-Match`）+ rank 0 单点 CAS 更新 `STATUS.committed`，写完即做有界保留 |
+| `load_object()` | `storage/upload.py` | 对象存储恢复：STATUS → 合并索引 → 整文件下载 → 本地读闭环 |
+| `load_checkpoint()` | `api.py` / `storage/upload.py` | 恢复入口：本地热副本优先（远端 `STATUS.committed` 非空 ⇒ 零下载），否则回落 `load_object()` |
 | `RankCommit` | `storage/upload.py` | 分片提交点：`step_N/<gen>/rank_i/COMMIT`，证明本 rank 传完了（带本 rank `.metadata` 的字节数与 CRC-32C） |
 | `Generation` / `FencedError` | `commit/generation.py` | 代际身份与「你已被取代」的裁决错误 |
 | `S3Storage` 条件写 | `storage/object.py` | `put_if_absent` / `put_if_match` / `head` / `write_file` / `probe_conditional_writes` |
@@ -420,28 +420,29 @@ report.amplification                                    # 读放大（Range GET 
   `rank_i/COMMIT` 声明的 generation 与版本 `COMMIT` 一致 —— 混代在读第一个字节之前
   就被拒。**多 rank 必须先 `begin_upload()`**：两个 rank 各自自动开代会落到不同的
   代际下，那一版永远凑不齐
-- **fence**：`step_42/GEN` 是全 step 唯一的共享写点，只能 `If-None-Match` / `If-Match`
-  修改。写者写 L2 之前读一次 GEN 证明自己仍是当前代；rank 0 提交前 CAS 把 GEN 推到
-  `sealed`，再 CAS 写版本 `COMMIT` —— 落后的写者写不了 L2，旧代提交不了 L3
-- **已提交版本不会被重试破坏**：新一代只有在自己完整之后才能换掉 `COMMIT`；它写到
-  一半崩掉，恢复端读到的仍是旧代，字节不变
-- **三层提交点**：本地 `step_N/COMMIT` 管「本 rank 写完了，可以传」；
-  `rank_i/COMMIT` 管「本 rank 传完了，本地可以回收（最新一代留作热副本）」；版本
-  `COMMIT` 管「这一版齐了，可以恢复」。每一层只放开一个动作（见「垃圾回收」一节）
+- **fence**：`step_42/STATUS` 是全 step 唯一的共享状态对象（`If-None-Match` / `If-Match`），
+  同时持有写权（`active`）与已提交指针（`committed`）。写者写 L2 之前读一次 `STATUS`
+  证明自己仍是当前 `active`；rank 0 提交时用同一份 `ETag` 单次 `If-Match` CAS 写入
+  `committed`，新代一旦抢走写权旧代必然 412 失败，不存在跨 key 并发窗口
+- **已提交版本不会被重试破坏**：`acquire` 只推进 `active`、原样保留 `committed`；
+  新一代写到一半崩掉，恢复端读到的仍是旧代，字节不变
+- **提交层次**：本地 `step_N/COMMIT` 管「本 rank 写完了，可以传」；`rank_i/COMMIT`（L2）
+  管「本 rank 传完了，本地可以回收（最新一代留作热副本）」；`step_N/STATUS.committed`
+  管「这一版齐了，可以恢复」。每一层只放开一个动作（见「垃圾回收」一节）
 - **rank 0 不读别人的索引**：`finalize_upload` 只有 `list` 和 `PUT`，`tests/`
   里用 `s3_server.store.requests` 断言这一点。齐全性由每个 rank 的分片提交点证明 ——
   「对象真的在」比「索引拼起来完整」更强，代价也不随 rank 数增长
-- **提交点顺序**：`rank_i/COMMIT` 是每个 rank 的最后一步；版本 `COMMIT` 在全部
-  分片提交点齐了之后写。少任何一个都让 `finalize_upload` 失败且不写 `COMMIT`，
-  这一版对恢复端不可见；反过来它是**幂等可重跑**的，rank 0 崩在最后一步，重启
-  补调一次就能把这一版补成可恢复（重跑不产生任何写入）
-- **恢复端才做全局校验**：`open_object_version` 按 `COMMIT` 的 generation 与 rank
-  清单读各 rank 的 `.metadata`，先按每个 rank 的 L2 比对字节数与 CRC-32C（不符即
+- **提交点顺序**：`rank_i/COMMIT` 是每个 rank 的最后一步；`STATUS.committed` 在全部
+  分片提交点齐了之后由单次 CAS 写入。少任何一个都让 `finalize_upload` 失败且不写
+  `committed`，这一版对恢复端不可见；反过来它是**幂等可重跑**的，rank 0 崩在最后
+  一步，重启补调一次就能把这一版补成可恢复（重跑不产生任何写入）
+- **恢复端才做全局校验**：`open_object_version` 按 `STATUS.committed` 的 generation 与
+  rank 清单读各 rank 的 `.metadata`，先按每个 rank 的 L2 比对字节数与 CRC-32C（不符即
   `ChecksumError`），再把分片 `file` 加上 `rank_<i>/` 前缀后合并，最后 `validate()`
   查覆盖与重叠。缺任何一个 rank 的索引都在读数据之前报错
-- **提交完成即有界保留**：`COMMIT` 写完，同一个 rank 0 接着只留最新 `keep` 代
-  （默认 `DEFAULT_KEEP_VERSIONS = 3`），从最旧的一代开始删 —— **先删它的版本
-  `COMMIT`，再删 `GEN`、分片提交点与数据**。提交点一消失这一版立刻不可恢复
+- **提交完成即有界保留**：`STATUS.committed` 写完，同一个 rank 0 接着只留最新 `keep`
+  代（默认 `DEFAULT_KEEP_VERSIONS = 3`），从最旧的一代开始删 —— **先删它的 `STATUS`，
+  再删分片提交点与数据**。`STATUS` 一消失这一版立刻不可恢复且残留写者立即被 fence
 - 字节级完整性仍在上传边界：`S3Storage` 的 PUT 带对象级校验和，服务端独立重算比对
 
 规格、失败模式矩阵、端点能力探针与版本下界见
@@ -618,30 +619,31 @@ ckpt.close_default_pool()   # 训练结束/显存紧张时显式释放常驻块
 | 远端 | `step_N/`（整个前缀） | 没有版本 `COMMIT`、没有代际前缀，且有 `M > N` 的版本 `COMMIT` | `superseded`：半途上传的残片 |
 | 远端 | `step_N/<gen>/`（单代） | 这一代既不是版本 `COMMIT` 声明的代，序号也**严格小于「最新一次尝试」** | `stale_generation`：被取代的尝试 |
 
-「最新一次尝试」= `max(step_N/GEN 声明的代, 目录里序号最大的代)`，**不是**版本
-`COMMIT` 声明的代：版本 `COMMIT` 只在提交成功时才写，拿它当当前代会在「新一代已
-acquire、正在传」的整个窗口里把正在传的那一代（连带本地刚写好的数据）删掉。`GEN` 读
-不出来时降级为「目录里序号最大的那一代」—— 宁可晚一代回收，也不误删正在写的那一代。
-本地 `uploaded` 判据同理：只认**最新一次尝试**里本 rank 的分片提交点。
+「最新一次尝试」= `max(STATUS.active 声明的代, 目录里序号最大的代)`，**不是**
+`STATUS.committed` 声明的代：新一代已 acquire、正在传期间 `committed` 仍指向旧代
+（或为 `null`），拿它当当前代会把正在传的那一代删掉。`STATUS` 读不出来（坏 JSON）时
+整 step 记入 `unknown_versions` 一个代都不删 —— 宁可晚一代回收，也不误删正在写的
+那一代。本地 `uploaded` 判据同理：只认**最新一次尝试**里本 rank 的分片提交点。
 
 只读端点（`conditional_writes="off"`）能列不能删：远端候选一律记
-`remote_read_only` 跳过，本地判据照常（远端状态仍然看得到）。版本 `COMMIT` 读不出来
+`remote_read_only` 跳过，本地判据照常（远端状态仍然看得到）。`STATUS` 读不出来
 （坏 JSON / 被外部删）时**一个代都不删** —— 不猜当前代。
 
 **保留的一律是「最新且未完成」**：本地最新且没有自己的分片提交点 → 可能正在写；
-远端最新且没有版本提交点 → 可能正在传，也可能 rank 0 崩在最后一步（重跑
+远端最新且 `committed == null` → 可能正在传，也可能 rank 0 崩在最后一步（重跑
 `finalize_upload` 就能补成可恢复）。回收延迟上界是一个 checkpoint 间隔。
 
-对象存储侧单独做**有界保留**（`plan_retention` / `retain_remote_versions`）：只认
-「带版本 `COMMIT` 的 step」，排序后留最新 `keep` 代，从最旧的一代开始删，**先删这一代
-的版本 `COMMIT`，再删 `GEN`、分片提交点与数据**（代际目录随之整段消失）。删到一半被打断也不会留下「看着像完整版本」的
-前缀 —— 下次 `collect` 会把它的剩余部分当 `superseded` 残片收掉。
+对象存储侧单独做**有界保留**（`plan_retention` / `retain_remote_versions`）：读
+`step_N/STATUS` 过滤出 `committed != null` 的 step，排序后留最新 `keep` 代，从最旧的
+一代开始删，**先删这一代的 `STATUS`，再删分片提交点与数据**（代际目录随之整段消失）。
+删到一半被打断也不会留下「看着像完整版本」的前缀 —— 下次 `collect` 会把它的剩余部分
+当 `superseded` 残片收掉。
 
 ```python
 import api as ckpt
 from commit.gc import GcWorker
 
-# 提交完成（rank 0）：seal GEN → 写版本 COMMIT → 清同 step 旧代 → 裁剪到最近 3 代
+# 提交完成（rank 0）：单点 CAS 写 STATUS.committed → 清同 step 旧代 → 裁剪到最近 3 代
 ckpt.finalize_upload(s3, step=42, ranks=range(8), generation=gen, keep=3)
 # 只想关掉其中一条：keep=None 关裁剪，reclaim_stale=False 把旧代留给 gc_local
 ckpt.finalize_upload(s3, step=42, ranks=range(8), generation=gen, keep=None, reclaim_stale=False)
@@ -676,8 +678,8 @@ with GcWorker("/ckpt/rank_0", s3, rank=0, interval=60.0) as worker:
 - **不需要问「写入者是否还活着」**：兄弟 rank 正在写的目录一定是最新 step，两条判据
   都不命中。这也是本地 root 必须**按 rank 独立**的原因 —— 本地判据删的是整个
   `step_N/` 目录，只有目录里全是本 rank 的文件时这句话才成立
-- **删除顺序与写入镜像**：整版先删 `COMMIT`（禁恢复）→ `GEN`（让残留写者立刻被
-  fence）→ `rank_*/COMMIT` → 数据；单代只删 `L2 → 数据`。最后移空目录。判据只看提交点
+- **删除顺序与写入镜像**：整版先删 `STATUS`（禁恢复 + 立刻 fence 残留写者）→
+  `rank_*/COMMIT` → 数据；单代只删 `L2 → 数据`。最后移空目录。判据只看提交点
   在不在，所以删到一半被打断、重跑一次就收敛
 - **远端不可达就什么都不删**：两条判据都依赖远端状态，「查不到」不能当成「可以删」，
   原因记在 `GcReport.aborted` / `RetentionReport.aborted`，周期线程继续跑

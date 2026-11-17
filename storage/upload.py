@@ -83,21 +83,22 @@ from commit.gc import (
     retain_remote_versions,
 )
 from commit.generation import (
-    GENERATION_FORMAT_VERSION,
-    SUPPORTED_FORMAT_VERSIONS,
+    STATUS_FILE,
+    STATUS_FORMAT_VERSION,
+    CommittedState,
     FencedError,
     Generation,
     as_generation,
-    mark_committed,
+    commit_status,
+    read_status,
     resolve_generation,
-    seal_generation,
+    status_key,
     verify_holder,
 )
 from commit.local import (
     COMMIT_FILE,
     CommitRecord,
     check_crc32c,
-    latest_step,
     read_commit,
     write_commit,
     write_metadata,
@@ -118,11 +119,8 @@ from storage.local import LocalStorage
 from storage.local_load import LoadReport, load_local
 from storage.recover import recover_version
 
-COMMIT_FORMAT_VERSION = 2
-"""v2 起用 ``step_N/<gen>/`` 布局，且 L2 的 ``.metadata`` 记 CRC-32C。
-
-读侧仍接受 v1（``generation=None``、没有 ``metadata.crc32c``，跳过校验）。
-"""
+RANK_COMMIT_FORMAT_VERSION = 2
+"""L2 ``rank_r/COMMIT`` 的格式版本（必须带 ``generation`` / ``seq`` 与 ``metadata.crc32c``）。"""
 
 DEFAULT_BUDGET_BYTES = 8 << 20
 
@@ -134,44 +132,28 @@ def version_prefix(step: int) -> str:
     return f"step_{step}"
 
 
-def generation_prefix(
-    step: int, generation: "Generation | str | None" = None
-) -> str:
-    """``step_42/gen_0003-1f3a9c2b``；``generation=None`` 是 v1 老布局。"""
-    base = version_prefix(step)
-    if generation is None:
-        return base
+def generation_prefix(step: int, generation: "Generation | str") -> str:
+    """``step_42/gen_0003-1f3a9c2b``。"""
     gid = generation.id if isinstance(generation, Generation) else str(generation)
-    return f"{base}/{gid}"
+    if not gid:
+        raise FormatError("generation prefix must not be empty")
+    return f"{version_prefix(step)}/{gid}"
 
 
-def rank_prefix(
-    step: int, rank: int, generation: "Generation | str | None" = None
-) -> str:
+def rank_prefix(step: int, rank: int, generation: "Generation | str") -> str:
     return f"{generation_prefix(step, generation)}/rank_{rank}"
 
 
-def data_key(
-    step: int, rank: int, file: str, generation: "Generation | str | None" = None
-) -> str:
+def data_key(step: int, rank: int, file: str, generation: "Generation | str") -> str:
     return f"{rank_prefix(step, rank, generation)}/{file}"
 
 
-def index_key(
-    step: int, rank: int, generation: "Generation | str | None" = None
-) -> str:
+def index_key(step: int, rank: int, generation: "Generation | str") -> str:
     return f"{rank_prefix(step, rank, generation)}/{META_FILE}"
 
 
-def rank_commit_key(
-    step: int, rank: int, generation: "Generation | str | None" = None
-) -> str:
+def rank_commit_key(step: int, rank: int, generation: "Generation | str") -> str:
     return f"{rank_prefix(step, rank, generation)}/{COMMIT_FILE}"
-
-
-def commit_key(step: int) -> str:
-    """版本提交点（L3）**不在代际前缀里**：它是唯一权威，重存时被 CAS 换掉。"""
-    return f"{version_prefix(step)}/{COMMIT_FILE}"
 
 
 # --- 提交记录 ---------------------------------------------------------------
@@ -179,31 +161,26 @@ def commit_key(step: int) -> str:
 
 @dataclass(frozen=True)
 class UploadCommit:
-    """rank 0 写的版本提交点（L3）。
+    """rank 0 提交后的版本视图（来自 ``step_N/STATUS`` 的 ``committed`` 字段）。
 
     它不记录文件清单：rank 0 没有 gather 任何人的索引 —— 「齐不齐」由每个 rank 的
     :class:`RankCommit` 证明，「分片怎么拼」由各 rank 自己的 ``.metadata`` 证明。
-
-    ``generation`` + ``seq`` 是这一版属于哪一代的**唯一权威**：恢复端只按它组装，
-    不读 GEN（GEN 被删被改，已提交版本照样可恢复）。``etag`` 只在读出来时填，
-    是下一次 CAS 的 ``If-Match`` 值，不参与序列化。
     """
 
     step: int
     ranks: tuple[int, ...]
     layout: Mapping[str, int] = field(default_factory=dict)
-    generation: str | None = None
+    generation: str = ""
     seq: int = 0
-    format_version: int = COMMIT_FORMAT_VERSION
-    etag: str = field(default="", compare=False)
+    format_version: int = STATUS_FORMAT_VERSION
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "ranks", tuple(int(rank) for rank in self.ranks))
         object.__setattr__(self, "layout", dict(self.layout or {}))
-        if self.format_version not in SUPPORTED_FORMAT_VERSIONS:
+        if self.format_version != STATUS_FORMAT_VERSION:
             raise FormatError(
                 f"unsupported upload COMMIT format_version {self.format_version}, "
-                f"this build understands {sorted(SUPPORTED_FORMAT_VERSIONS)}"
+                f"this build understands {STATUS_FORMAT_VERSION}"
             )
         if self.step < 0:
             raise FormatError(f"step must be >= 0, got {self.step}")
@@ -213,29 +190,40 @@ class UploadCommit:
             raise FormatError(f"duplicate ranks in COMMIT: {self.ranks}")
         if any(rank < 0 for rank in self.ranks):
             raise FormatError(f"ranks must be >= 0, got {self.ranks}")
-        if self.generation is not None:
-            parsed = Generation.parse(self.generation, step=self.step)
-            if parsed.seq != self.seq:
-                raise FormatError(
-                    f"COMMIT 的 generation {self.generation} 与 seq {self.seq} 不一致"
-                )
-        elif self.seq:
-            raise FormatError(f"COMMIT 没有 generation 却带 seq={self.seq}（v1 布局没有代际）")
-
-    def dumps(self) -> str:
-        data: dict[str, object] = {
-            "format_version": self.format_version,
-            "step": self.step,
-            "ranks": list(self.ranks),
-            "layout": {key: int(value) for key, value in sorted(self.layout.items())},
-        }
-        if self.generation is not None:
-            data["generation"] = self.generation
-            data["seq"] = self.seq
-        return json.dumps(data, indent=2, sort_keys=True, ensure_ascii=False)
+        parsed = Generation.parse(self.generation, step=self.step)
+        if parsed.seq != self.seq:
+            raise FormatError(
+                f"COMMIT 的 generation {self.generation} 与 seq {self.seq} 不一致"
+            )
 
     @classmethod
-    def loads(cls, text: str, *, etag: str = "") -> "UploadCommit":
+    def from_committed(cls, committed: CommittedState) -> "UploadCommit":
+        return cls(
+            step=committed.step,
+            ranks=committed.ranks,
+            layout=dict(committed.layout),
+            generation=committed.generation.id,
+            seq=committed.seq,
+            format_version=STATUS_FORMAT_VERSION,
+        )
+
+    def dumps(self) -> str:
+        return json.dumps(
+            {
+                "format_version": self.format_version,
+                "step": self.step,
+                "ranks": list(self.ranks),
+                "layout": {key: int(value) for key, value in sorted(self.layout.items())},
+                "generation": self.generation,
+                "seq": self.seq,
+            },
+            indent=2,
+            sort_keys=True,
+            ensure_ascii=False,
+        )
+
+    @classmethod
+    def loads(cls, text: str) -> "UploadCommit":
         try:
             data = json.loads(text)
         except json.JSONDecodeError as exc:
@@ -248,18 +236,14 @@ class UploadCommit:
         layout = data.get("layout", {})
         if not isinstance(layout, dict):
             raise FormatError("COMMIT 'layout' must be an object")
-        generation = data.get("generation")
-        if generation is not None:
-            generation = str(generation)
         try:
             return cls(
                 step=int(data["step"]),
                 ranks=tuple(int(rank) for rank in ranks),
                 layout={str(key): int(value) for key, value in layout.items()},
-                generation=generation,
-                seq=int(data.get("seq", 0)),
-                format_version=int(data.get("format_version", COMMIT_FORMAT_VERSION)),
-                etag=etag,
+                generation=str(data["generation"]),
+                seq=int(data["seq"]),
+                format_version=int(data["format_version"]),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise FormatError(f"COMMIT is malformed: {exc}") from exc
@@ -267,25 +251,14 @@ class UploadCommit:
 
 @dataclass(frozen=True)
 class RankCommit:
-    """一个 rank 的分片提交点（L2）：``step_42/rank_3/COMMIT``。
+    """一个 rank 的分片提交点（L2）：``step_42/<gen>/rank_3/COMMIT``。
 
     它只证明「这个 rank 的数据对象与 ``.metadata`` 都已落盘」，**不声明完整性** ——
-    该读哪些 rank 由 :class:`UploadCommit` 决定，所以这里不记 ``ranks`` / ``layout``，
+    该读哪些 rank 由 ``STATUS.committed`` 决定，所以这里不记 ``ranks`` / ``layout``，
     避免两份数据漂移。
 
-    两个用途：
-
-    1. 取代原来只写 ``{"step", "rank"}`` 的 ``DONE``：远端第一次有了每个 rank 自己的
-       文件清单，``cat step_42/rank_3/COMMIT`` 就能知道这个分片传了什么，排查残片/
-       半传时不用再逐个 head 对象；
-    2. **驱动本地回收**：本 rank 的 L2 一出现，本地的 ``step_N/`` 就可以删了，
-       不必等最慢的 rank，也不必等 rank 0 写完 L3。
-
     ``metadata_crc32c`` 是**本 rank** 那份 ``.metadata`` 的字节级摘要，算法与 L1 的
-    ``COMMIT`` 一致（CRC-32C，8 位小写十六进制）。恢复端的合并索引是 N 份 ``.metadata``
-    拼出来的，任何一份被改坏都会让「分片怎么拼」出错，而这在合并后的
-    ``CheckpointIndex.validate()`` 里看不出来（结构自洽、指向别处的索引照样通过）。
-    v1 老布局没有这个字段（``None``）：读侧跳过校验，写侧总是写。
+    ``COMMIT`` 一致（CRC-32C，8 位小写十六进制）。
     """
 
     step: int
@@ -295,14 +268,14 @@ class RankCommit:
     files: Mapping[str, int] = field(default_factory=dict)
     generation: str | None = None
     seq: int = 0
-    format_version: int = COMMIT_FORMAT_VERSION
+    format_version: int = RANK_COMMIT_FORMAT_VERSION
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "files", {str(k): int(v) for k, v in self.files.items()})
-        if self.format_version not in SUPPORTED_FORMAT_VERSIONS:
+        if self.format_version != RANK_COMMIT_FORMAT_VERSION:
             raise FormatError(
                 f"unsupported rank COMMIT format_version {self.format_version}, "
-                f"this build understands {sorted(SUPPORTED_FORMAT_VERSIONS)}"
+                f"this build understands {RANK_COMMIT_FORMAT_VERSION}"
             )
         if self.step < 0:
             raise FormatError(f"step must be >= 0, got {self.step}")
@@ -311,33 +284,31 @@ class RankCommit:
         if self.metadata_bytes < 0:
             raise FormatError(f"metadata bytes must be >= 0, got {self.metadata_bytes}")
         if self.metadata_crc32c is None:
-            if self.format_version >= GENERATION_FORMAT_VERSION:
-                raise FormatError(
-                    "rank COMMIT v2 must record 'metadata.crc32c' (index checksum)"
-                )
-        else:
-            check_crc32c(self.metadata_crc32c, "rank COMMIT metadata.crc32c")
-        if self.generation is not None:
-            parsed = Generation.parse(self.generation, step=self.step)
-            if parsed.seq != self.seq:
-                raise FormatError(
-                    f"rank COMMIT 的 generation {self.generation} 与 seq {self.seq} 不一致"
-                )
+            raise FormatError(
+                "rank COMMIT must record 'metadata.crc32c' (index checksum)"
+            )
+        check_crc32c(self.metadata_crc32c, "rank COMMIT metadata.crc32c")
+        if self.generation is None:
+            raise FormatError("rank COMMIT must record 'generation'")
+        parsed = Generation.parse(self.generation, step=self.step)
+        if parsed.seq != self.seq:
+            raise FormatError(
+                f"rank COMMIT 的 generation {self.generation} 与 seq {self.seq} 不一致"
+            )
 
     def dumps(self) -> str:
-        metadata: dict[str, object] = {"bytes": self.metadata_bytes}
-        if self.metadata_crc32c is not None:
-            metadata["crc32c"] = self.metadata_crc32c
         data: dict[str, object] = {
             "format_version": self.format_version,
             "step": self.step,
             "rank": self.rank,
-            "metadata": metadata,
+            "metadata": {
+                "bytes": self.metadata_bytes,
+                "crc32c": self.metadata_crc32c,
+            },
             "files": {name: int(size) for name, size in sorted(self.files.items())},
+            "generation": self.generation,
+            "seq": self.seq,
         }
-        if self.generation is not None:
-            data["generation"] = self.generation
-            data["seq"] = self.seq
         return json.dumps(data, indent=2, sort_keys=True, ensure_ascii=False)
 
     @classmethod
@@ -369,7 +340,7 @@ class RankCommit:
                 files={str(name): int(size) for name, size in files.items()},
                 generation=None if generation is None else str(generation),
                 seq=int(data.get("seq", 0)),
-                format_version=int(data.get("format_version", COMMIT_FORMAT_VERSION)),
+                format_version=int(data.get("format_version", RANK_COMMIT_FORMAT_VERSION)),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise FormatError(f"rank COMMIT is malformed: {exc}") from exc
@@ -503,57 +474,43 @@ def upload_rank(
 # --- rank 0：只 list 前缀，不读别人的索引 ----------------------------------
 
 
-def _read_upload_commit(storage: StorageBackend, step: int) -> UploadCommit | None:
-    """读 L3（带 ETag）；不存在返回 ``None``。"""
-    key = commit_key(step)
-    try:
-        payload = storage.read(key)
-    except ObjectNotFoundError:
-        return None
-    etag = ""
-    head = getattr(storage, "head", None)
-    if callable(head):
-        meta = head(key)
-        if meta is not None:
-            etag = meta.etag
-    return UploadCommit.loads(payload.decode("utf-8"), etag=etag)
+def _status_steps(storage: StorageBackend) -> list[int]:
+    steps: set[int] = set()
+    for key in storage.list(""):
+        parts = key.split("/")
+        if len(parts) != 2 or parts[1] != STATUS_FILE:
+            continue
+        name = parts[0]
+        if not name.startswith("step_"):
+            continue
+        try:
+            steps.add(int(name[len("step_") :]))
+        except ValueError:
+            continue
+    return sorted(steps)
 
 
-def _write_upload_commit(
-    storage: StorageBackend,
-    commit: UploadCommit,
-    *,
-    existing: UploadCommit | None,
-) -> UploadCommit:
-    """用 CAS 写 L3：首写 ``If-None-Match``，重存 ``If-Match``。
+def committed_remote_steps(storage: StorageBackend) -> list[int]:
+    """扫描远端所有 ``STATUS.committed`` 非空的 step，按升序返回。"""
+    committed: list[int] = []
+    for step in _status_steps(storage):
+        status = read_status(storage, step)
+        if status is not None and status.committed is not None:
+            committed.append(step)
+    return committed
 
-    这是 L3 的 fence：两个不同 ``seq`` 的 finalize 并发时，只有一个能换掉 L3；
-    输的那个若发现 L3 的 ``seq`` 更大，立刻 ``FencedError``，不会把 COMMIT 指回
-    自己那一代。
+
+def latest_remote_step(storage: StorageBackend) -> int | None:
+    """远端最新的已提交版本：扫描 ``step_N/STATUS``，从大到小找首个 ``committed`` 非空者。
+
+    与本地层 :func:`commit.local.latest_step` 不同，远端正在传或半途失败的 step
+    也会有 ``STATUS``（只是 ``committed == null``），不能只靠文件名判别。
     """
-    conditional = _as_conditional(storage, what=f"finalize_upload(step={commit.step})")
-    key = commit_key(commit.step)
-    payload = commit.dumps().encode("utf-8")
-    current = existing
-    for _ in range(2):
-        if current is None:
-            outcome = conditional.put_if_absent(key, payload)
-        else:
-            if not current.etag:
-                raise StorageError(f"{key}: 读到的 L3 没有 ETag，无法用 If-Match 重存")
-            outcome = conditional.put_if_match(key, payload, current.etag)
-        if outcome.written:
-            return commit
-        reread = _read_upload_commit(storage, commit.step)
-        if reread is not None and reread.seq > commit.seq:
-            raise FencedError(
-                f"step {commit.step}: L3 已被 seq={reread.seq}"
-                f"（{reread.generation}）提交，{commit.generation} 已被 fence"
-            )
-        current = reread
-    raise FencedError(
-        f"step {commit.step}: L3 的 CAS 连续失败，{commit.generation} 放弃提交"
-    )
+    for step in reversed(_status_steps(storage)):
+        status = read_status(storage, step)
+        if status is not None and status.committed is not None:
+            return step
+    return None
 
 
 def finalize_upload(
@@ -566,60 +523,62 @@ def finalize_upload(
     keep: int | None = DEFAULT_KEEP_VERSIONS,
     reclaim_stale: bool = True,
 ) -> UploadCommit:
-    """rank 0 的提交动作：``list`` 本代前缀，确认每个 rank 都传完了，再 CAS 写 ``COMMIT``。
+    """rank 0 的提交动作：``list`` 本代前缀确认每个 rank 都传完了，再单点 CAS 更新 ``STATUS.committed``。
 
     ``ranks`` 是**期望的写者清单**（训练配置里的 world size），由 rank 0 自己知道，
     不需要从别处汇总。任何缺 ``.metadata`` / ``rank_<rank>/COMMIT`` 的 rank 都会让
-    这一步失败，失败时不写版本 ``COMMIT``，因此这一版对恢复端不可见。
+    这一步失败，失败时不写入 ``STATUS.committed``，因此这一版对恢复端不可见。
 
-    **代际与 fence**：先 ``seal_generation`` 用 CAS 把 GEN 推到 ``sealed``（这一代
-    不再接受新写者），再用 CAS 写 L3。已经提交过的更高 ``seq`` 会让本次提交直接
-    ``FencedError`` —— 旧代永远接管不了 L3。
+    **代际与 fence**：``acquire_generation`` 与 ``commit_status`` 共享同一个
+    ``step_N/STATUS`` 对象与同一份 ``ETag``。先读 ``STATUS`` 确认本代仍是
+    ``active`` 且没被更高 ``seq`` 覆盖，检查本代前缀齐全后，用 ``If-Match`` 单次
+    CAS 写入 ``committed`` —— 新代一旦在期间抢走写权，``ETag`` 就已变化，服务端
+    原子返回 412，不存在跨 key 并发窗口。
 
-    **幂等可重跑**：判据只看每个 rank 的分片提交点在不在。rank 0 崩在写完
-    ``COMMIT`` 之前时，重启后再调一次（或运维当 CLI 调）就能把这一版补成可恢复的；
-    L3 的 ``seq`` 与本次代际相同时直接返回，**不产生额外写入**。
+    **幂等可重跑**：``STATUS.committed`` 已指向本代时直接返回，**不产生额外写入**。
 
-    **有界保留**：``COMMIT`` 落盘之后，同一个 rank 0 立刻做一次对象存储侧的保留 ——
-    只留最新 ``keep`` 代版本（默认 :data:`commit.gc.DEFAULT_KEEP_VERSIONS`，即 3 代），
-    从最旧的一代开始删，先删版本 ``COMMIT`` 再删其余数据。``keep=None`` 关掉这一步
-    （交给运维手工调 :func:`commit.gc.retain_remote_versions`）。
-
-    **同 step 旧代**：``COMMIT`` 落盘之后顺手删掉**序号更早**的代际前缀
-    （:func:`commit.gc.reclaim_stale_generations`）—— L3 已经指向本代，更早的尝试
-    只可能是被 fence 的残片。不必等周期 ``collect()`` 才回收，也就不会出现「只有
-    ``finalize_upload`` 在跑、同 step 旧代一直留着」的漏洞。``reclaim_stale=False``
-    关掉这一步。更新的一代（``seq`` 更大）永远不动 —— 那一代可能已经在传。
-
-    保留 / 清代的失败（远端抖动、删到一半）**不影响这次提交**：版本 ``COMMIT`` 已经
-    写完了，这一版就是可恢复的；残留的旧代会在下一次提交或 ``collect()`` 时收掉。
+    **有界保留 & 同 step 旧代**：提交成功后立刻保留最新 ``keep`` 代已提交版本，并顺手
+    收掉本 step 下序号严格更早的代际前缀；收尾失败不影响本次提交。
     """
+    _as_conditional(storage, what=f"finalize_upload(step={step})")
     expected = tuple(int(rank) for rank in ranks)
     gen = as_generation(generation, step=step)
     if gen is None:
         gen = resolve_generation(storage, step, ranks=expected)
 
-    existing = _read_upload_commit(storage, step)
-    if existing is not None:
-        if existing.seq > gen.seq:
+    status = read_status(storage, step)
+    if status is None:
+        raise FencedError(
+            f"{status_key(step)}: STATUS 不存在，{gen.id} 不再持有写权"
+        )
+    if status.committed is not None:
+        if status.committed.seq > gen.seq:
             raise FencedError(
-                f"step {step}: L3 已被 seq={existing.seq}（{existing.generation}）提交，"
-                f"{gen.id} 已被 fence"
+                f"step {step}: STATUS 已被 seq={status.committed.seq}"
+                f"（{status.committed.generation.id}）提交，{gen.id} 已被 fence"
             )
-        if existing.seq == gen.seq:
-            if existing.generation != gen.id:
+        if status.committed.seq == gen.seq:
+            if status.committed.generation.id != gen.id:
                 raise FencedError(
-                    f"step {step}: L3 声明的 seq={existing.seq} 属于 "
-                    f"{existing.generation}，不是 {gen.id}（同序号不同写者）"
+                    f"step {step}: STATUS 声明已提交 seq={status.committed.seq} 属于 "
+                    f"{status.committed.generation.id}，不是 {gen.id}（同序号不同写者）"
                 )
-            if tuple(existing.ranks) != expected:
+            if status.committed.ranks != expected:
                 raise FormatError(
-                    f"step {step}: 已提交的 L3 声明 ranks {existing.ranks}，"
+                    f"step {step}: 已提交的 STATUS 声明 ranks {status.committed.ranks}，"
                     f"本次传入 {expected}"
                 )
-            return existing
+            return UploadCommit.from_committed(status.committed)
 
-    seal_generation(storage, gen, ranks=expected)
+    if status.generation.id != gen.id:
+        raise FencedError(
+            f"step {step}: 当前代际是 {status.generation.id}（{status.state}），"
+            f"{gen.id} 已被 fence"
+        )
+    if status.ranks != expected:
+        raise FormatError(
+            f"step {step}: STATUS 声明 ranks {status.ranks}，finalize 传入 {expected}"
+        )
 
     prefix = generation_prefix(step, gen)
     keys = set(storage.list(prefix))
@@ -644,20 +603,17 @@ def finalize_upload(
     if strays:
         raise FormatError(
             f"step {step}: unexpected rank prefix(es) {strays} under {prefix}; "
-            f"COMMIT declares ranks {expected}"
+            f"STATUS declares ranks {expected}"
         )
 
-    commit = UploadCommit(
-        step=step,
-        ranks=expected,
-        layout=dict(layout or {}),
-        generation=gen.id,
-        seq=gen.seq,
+    committed = commit_status(
+        storage,
+        status,
+        CommittedState(generation=gen, ranks=expected, layout=dict(layout or {})),
     )
-    commit = _write_upload_commit(storage, commit, existing=existing)
-    mark_committed(storage, gen)
+    commit = UploadCommit.from_committed(committed)
     if reclaim_stale:
-        # L3 已经指向本代：同一个 step 下序号更早的前缀只可能是被 fence 的残片，
+        # STATUS.committed 已经指向本代：同一个 step 下序号更早的前缀只可能是被 fence 的残片，
         # 顺手收掉，不必等周期 collect()。只删 seq 严格更小的代 —— 更新的一代
         # 可能已经在传。失败不能反过来把提交判成失败。
         try:
@@ -698,13 +654,12 @@ class ObjectVersion:
     key: str
     index: CheckpointIndex
     commit: UploadCommit
-    generation: str | None = None
-    """这一版属于哪一代；``None`` 是 v1 老布局（``step_N/rank_r/`` 直下）。"""
+    generation: str
+    """这一版属于哪一代。"""
 
     def file_key(self, name: str) -> str:
         """索引里的 ``file`` 是「版本目录内、带 rank 前缀」的名字。"""
-        base = self.key if self.generation is None else f"{self.key}/{self.generation}"
-        return f"{base}/{name}"
+        return f"{self.key}/{self.generation}/{name}"
 
     def read_blobs(self) -> dict[str, bytes]:
         return {
@@ -716,27 +671,27 @@ class ObjectVersion:
 def open_object_version(
     storage: StorageBackend, step: int | None = None
 ) -> ObjectVersion:
-    """恢复端的第一道门：读 ``COMMIT`` → 核对 rank 前缀 → 合并 per-rank 索引。
+    """恢复端的第一道门：读 ``STATUS.committed`` → 核对 rank 前缀 → 合并 per-rank 索引。
 
-    ``step=None`` 取「所有带 ``COMMIT`` 的版本里最大的 step」，与本地层的
-    :func:`commit.local.latest_step` 是同一套语义、同一份实现。
+    ``step=None`` 取「所有 ``STATUS.committed`` 非空的版本里最大的 step」。
     """
-    target = step if step is not None else latest_step(storage)
+    target = step if step is not None else latest_remote_step(storage)
     if target is None:
         raise FormatError(
             f"no committed checkpoint found under {storage!r}: "
-            "只有带 COMMIT 的版本才算可恢复"
+            "只有 STATUS.committed 非空的版本才算可恢复"
         )
 
     key = version_prefix(target)
-    try:
-        payload = storage.read(commit_key(target))
-    except ObjectNotFoundError:
-        raise FormatError(f"{key}: COMMIT missing, this version is not recoverable") from None
-    commit = UploadCommit.loads(payload.decode("utf-8"))
+    status = read_status(storage, target)
+    if status is None or status.committed is None:
+        raise FormatError(
+            f"{key}: STATUS missing or uncommitted, this version is not recoverable"
+        )
+    commit = UploadCommit.from_committed(status.committed)
     if commit.step != target:
         raise FormatError(
-            f"{key}: COMMIT declares step {commit.step}, but it was read as step {target}"
+            f"{key}: STATUS declares step {commit.step}, but it was read as step {target}"
         )
 
     base = generation_prefix(target, commit.generation)
@@ -748,13 +703,13 @@ def open_object_version(
     )
     if missing:
         raise FormatError(
-            f"{key}: COMMIT declares ranks {commit.ranks}, "
+            f"{key}: STATUS declares ranks {commit.ranks}, "
             f"but these index objects are missing: {missing}"
         )
 
-    # L2 的分片提交点在这里既是「诊断证据」也是**混代检测点**：它不在而 L3 声明了
-    # 这个 rank，说明对象被外部删过；它在但声明的 generation 与 L3 不一致，说明这一版
-    # 是两次尝试各传一半拼出来的 —— 两种都在读第一个字节之前报出来。
+    # L2 的分片提交点在这里既是「诊断证据」也是**混代检测点**：它不在而 STATUS 声明了
+    # 这个 rank，说明对象被外部删过；它在但声明的 generation 与 STATUS.committed 不一致，
+    # 说明这一版是两次尝试各传一半拼出来的 —— 两种都在读第一个字节之前报出来。
     not_committed = sorted(
         rank
         for rank in commit.ranks
@@ -762,7 +717,7 @@ def open_object_version(
     )
     if not_committed:
         raise FormatError(
-            f"{key}: COMMIT declares ranks {commit.ranks}, but rank(s) {not_committed} "
+            f"{key}: STATUS declares ranks {commit.ranks}, but rank(s) {not_committed} "
             f"have no per-rank COMMIT (分片提交点缺失，远端对象可能被删过)"
         )
     index_payloads: dict[int, bytes] = {}
@@ -777,27 +732,26 @@ def open_object_version(
         if rank_commit.generation != commit.generation:
             raise FormatError(
                 f"{base}: rank {rank} 的分片提交点声明 generation "
-                f"{rank_commit.generation!r}，版本 COMMIT 声明 {commit.generation!r} —— "
+                f"{rank_commit.generation!r}，STATUS.committed 声明 {commit.generation!r} —— "
                 "这一版混了两次尝试的分片，拒绝恢复"
             )
 
         # 合并索引是 N 份 ``.metadata`` 拼出来的：任何一份被改坏都会让「分片怎么拼」
         # 出错，而合并后的 ``validate()`` 看不出结构自洽的篡改 —— 长度 + CRC-32C 才是
-        # 逐 rank 的字节级凭据（v1 老布局没有摘要，只能靠结构校验）。
+        # 逐 rank 的字节级凭据。
         rank_index_payload = storage.read(index_key(target, rank, commit.generation))
-        # 长度只在 L2 真记了字节数时校验：v1 的 L2 可能根本没记（缺省 0）
-        if rank_commit.metadata_bytes and len(rank_index_payload) != rank_commit.metadata_bytes:
+        if len(rank_index_payload) != rank_commit.metadata_bytes:
             raise FormatError(
                 f"{base}/rank_{rank}/{META_FILE}: {len(rank_index_payload)} bytes, "
                 f"rank COMMIT records {rank_commit.metadata_bytes}"
             )
-        if rank_commit.metadata_crc32c is not None:
-            actual = crc32c_hex(rank_index_payload)
-            if actual != rank_commit.metadata_crc32c:
-                raise ChecksumError(
-                    f"{base}/rank_{rank}/{META_FILE}: crc32c {actual}, rank COMMIT "
-                    f"records {rank_commit.metadata_crc32c}（分片索引与提交点不符）"
-                )
+        assert rank_commit.metadata_crc32c is not None
+        actual = crc32c_hex(rank_index_payload)
+        if actual != rank_commit.metadata_crc32c:
+            raise ChecksumError(
+                f"{base}/rank_{rank}/{META_FILE}: crc32c {actual}, rank COMMIT "
+                f"records {rank_commit.metadata_crc32c}（分片索引与提交点不符）"
+            )
         index_payloads[rank] = rank_index_payload
 
     shards: dict[str, list[ShardMeta]] = {}
@@ -1024,7 +978,7 @@ def check_local_copy(
     if local_root is None or remote is None:
         return LocalCopyCheck(step, False, NO_LOCAL_COPY)
 
-    target = step if step is not None else latest_step(remote)
+    target = step if step is not None else latest_remote_step(remote)
     if target is None:
         # 远端一个已提交版本都没有：调用方的下一步（下载）会给出同样的错误。
         return LocalCopyCheck(None, False, REMOTE_NOT_COMMITTED)
@@ -1032,10 +986,8 @@ def check_local_copy(
     local = LocalStorage(local_root, direct_io=False)
     if read_commit(local, target) is None:
         return LocalCopyCheck(target, False, NO_LOCAL_COPY)
-    # 远端 L3 是 UploadCommit 格式（记 ranks），不用 CommitRecord 解析，只确认存在。
-    try:
-        remote.read(commit_key(target))
-    except ObjectNotFoundError:
+    status = read_status(remote, target)
+    if status is None or status.committed is None:
         return LocalCopyCheck(target, False, REMOTE_NOT_COMMITTED)
 
     try:
@@ -1187,6 +1139,7 @@ __all__ = [
     "ObjectLoadReport",
     "ObjectVersion",
     "PARTIAL_LOCAL_COPY",
+    "RANK_COMMIT_FORMAT_VERSION",
     "RankCommit",
     "REMOTE_NOT_COMMITTED",
     "REUSABLE",
@@ -1194,15 +1147,18 @@ __all__ = [
     "SOURCE_OBJECT",
     "UploadCommit",
     "check_local_copy",
-    "commit_key",
+    "committed_remote_steps",
     "data_key",
     "finalize_upload",
+    "generation_prefix",
     "index_key",
+    "latest_remote_step",
     "load_checkpoint_version",
     "load_object_version",
     "open_object_version",
     "rank_commit_key",
     "rank_prefix",
+    "status_key",
     "upload_rank",
     "version_prefix",
 ]

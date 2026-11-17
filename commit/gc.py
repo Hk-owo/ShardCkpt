@@ -54,14 +54,20 @@
 from __future__ import annotations
 
 import contextlib
-import json
 import threading
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Iterable, Mapping
 
-from commit.generation import GENERATION_FILE, Generation, pointer_key
+from commit.generation import (
+    STATUS_FILE,
+    Generation,
+    StepStatus,
+    read_status,
+    status_key,
+)
 from commit.local import COMMIT_FILE, delete_version, version_key
+from core import FormatError
 from storage.base import StorageBackend, StorageError
 from storage.local import LocalStorage
 
@@ -439,12 +445,11 @@ def _scan_local(root: Path) -> set[int]:
 class RemoteLayout:
     """一次 ``list("")`` 解析出的远端结构（纯数据，执行器与判据共用）。"""
 
-    versions: set[int]
-    """有版本 ``COMMIT``（L3）的 step。"""
+    status_steps: set[int]
+    """存在 ``step_N/STATUS`` 的 step（是否已提交还要看 ``STATUS.committed``）。"""
 
-    rank_commits: set[tuple[int, int, str | None]]
-    """``(step, rank, generation)``：有分片 ``COMMIT``（L2）的组合；v1 布局的
-    ``generation`` 是 ``None``。"""
+    rank_commits: set[tuple[int, int, str]]
+    """``(step, rank, generation)``：有分片 ``COMMIT``（L2）的组合。"""
 
     generations: dict[int, set[str]] = field(default_factory=dict)
     """``step -> {generation}``：远端出现过的代际前缀。"""
@@ -454,17 +459,15 @@ class RemoteLayout:
 
 
 def _scan_remote(keys: Iterable[str]) -> RemoteLayout:
-    """从一次 ``list("")`` 的结果里解析出四层信息。
+    """从一次 ``list("")`` 的结果里解析出远端结构。
 
-    - ``step_N/COMMIT``：版本提交点（L3）；
+    - ``step_N/STATUS``：本 step 的单点状态对象（写权 + 提交指针）；
     - ``step_N/<gen>/rank_r/COMMIT``：某一代的分片提交点（L2）；
     - ``step_N/<gen>/...``：代际前缀；
     - 其余 ``step_N/...``：只用来确认前缀存在。
-
-    v1 老布局（``step_N/rank_r/COMMIT``，没有 gen 层）仍然认，``generation=None``。
     """
-    versions: set[int] = set()
-    rank_commits: set[tuple[int, int, str | None]] = set()
+    status_steps: set[int] = set()
+    rank_commits: set[tuple[int, int, str]] = set()
     generations: dict[int, set[str]] = {}
     prefixes: set[int] = set()
     for key in keys:
@@ -476,8 +479,8 @@ def _scan_remote(keys: Iterable[str]) -> RemoteLayout:
         except ValueError:
             continue
         prefixes.add(step)
-        if len(parts) == 2 and parts[1] == COMMIT_FILE:
-            versions.add(step)
+        if len(parts) == 2 and parts[1] == STATUS_FILE:
+            status_steps.add(step)
         elif len(parts) == 4 and parts[2].startswith("rank_") and parts[3] == COMMIT_FILE:
             generation = parts[1]
             try:
@@ -486,16 +489,10 @@ def _scan_remote(keys: Iterable[str]) -> RemoteLayout:
                 continue
             rank_commits.add((step, rank, generation))
             generations.setdefault(step, set()).add(generation)
-        elif len(parts) >= 3:
-            if parts[1].startswith("gen_"):
-                generations.setdefault(step, set()).add(parts[1])
-            elif len(parts) == 3 and parts[1].startswith("rank_") and parts[2] == COMMIT_FILE:
-                try:
-                    rank_commits.add((step, int(parts[1][len("rank_") :]), None))
-                except ValueError:
-                    continue
+        elif len(parts) >= 3 and parts[1].startswith("gen_"):
+            generations.setdefault(step, set()).add(parts[1])
     return RemoteLayout(
-        versions=versions,
+        status_steps=status_steps,
         rank_commits=rank_commits,
         generations=generations,
         prefixes=prefixes,
@@ -519,12 +516,11 @@ def _delete_remote_prefix(
 ) -> int:
     """删远端 ``step_N/``（或其中一代 ``step_N/<gen>/``），顺序与写入镜像。
 
-    **整版**：先删**版本提交点** ``step_N/COMMIT``（L3）—— 它一消失这一版立刻不可恢复、
-    也不会再被当成「已提交版本」；再删 ``GEN``（让残留写者下一轮检查立即被 fence）；
-    再删各 ``rank_r/COMMIT``（L2）；最后才是数据对象。
+    **整版**：先删 ``step_N/STATUS`` —— 它一消失这一版立刻不可恢复、也立刻
+    fence 掉残留写者；再删各 ``rank_r/COMMIT``（L2）；最后才是数据对象。
 
-    **单代**：这一代没有 L3 可删，先删它的 L2，再删数据 —— 删到一半被打断也不会留下
-    「看着像这一代传完了」的前缀，重跑一次收敛。
+    **单代**：先删它的 L2，再删数据 —— 删到一半被打断也不会留下「看着像这一代
+    传完了」的前缀，重跑一次收敛。
     """
     root = version_key(step)
     prefix = f"{root}/{generation}/" if generation else f"{root}/"
@@ -535,16 +531,14 @@ def _delete_remote_prefix(
     if generation:
         ordered = sorted(rank_commits) + [key for key in mine if key not in rank_commits]
     else:
-        version_commit = f"{root}/{COMMIT_FILE}"
-        marker = f"{root}/{GENERATION_FILE}"
-        markers = {marker} & set(mine)
+        status_obj = status_key(step)
         rest = [
             key
             for key in mine
-            if key != version_commit and key not in rank_commits and key not in markers
+            if key != status_obj and key not in rank_commits
         ]
-        ordered = ([version_commit] if version_commit in mine else [])
-        ordered += sorted(markers) + sorted(rank_commits) + rest
+        ordered = ([status_obj] if status_obj in mine else [])
+        ordered += sorted(rank_commits) + rest
     for key in ordered:
         remote.delete(key)
     _prune_remote_dirs(remote, step, generation=generation)
@@ -570,44 +564,17 @@ def _prune_remote_dirs(
         directory.rmdir()
 
 
-_UNKNOWN_VERSION = object()
-"""L3 读不出来（被删 / 坏 JSON / 远端抖动）时的哨兵：这一 step 一律保留。"""
+_UNKNOWN_STATUS = object()
+"""STATUS 读不出来（被删 / 坏 JSON / 远端抖动）时的哨兵：这一 step 一律保留。"""
 
 
-def _read_version_generation(remote: StorageBackend, step: int) -> object:
-    """读 L3 里声明的代际；``None`` 表示 v1 老布局，哨兵表示读不出来。"""
+def _read_step_status(remote: StorageBackend, step: int) -> object:
+    """读 ``step_N/STATUS``；读不出来或格式坏返回哨兵（fail-closed，不误删）。"""
     try:
-        payload = remote.read(f"{version_key(step)}/{COMMIT_FILE}")
-    except StorageError:
-        return _UNKNOWN_VERSION
-    try:
-        data = json.loads(payload)
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return _UNKNOWN_VERSION
-    if not isinstance(data, dict):
-        return _UNKNOWN_VERSION
-    generation = data.get("generation")
-    return None if generation is None else str(generation)
-
-
-def _read_pointer_generation(remote: StorageBackend, step: int) -> str | None:
-    """读 ``step_N/GEN`` 声明的代际（最新一次尝试）。
-
-    读不出来（被外部删 / 坏 JSON / 远端抖动）就返回 ``None``：判据降级到「目录里
-    序号最大的那一代」，宁可晚一代回收，也不猜当前代。
-    """
-    try:
-        payload = remote.read(pointer_key(step))
-    except StorageError:
-        return None
-    try:
-        data = json.loads(payload)
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return None
-    if not isinstance(data, dict):
-        return None
-    generation = data.get("generation")
-    return None if generation is None else str(generation)
+        status = read_status(remote, step)
+    except (StorageError, FormatError, UnicodeDecodeError):
+        return _UNKNOWN_STATUS
+    return _UNKNOWN_STATUS if status is None else status
 
 
 def collect(
@@ -655,23 +622,22 @@ def collect(
         )
 
     layout = _scan_remote(keys)
+    versions: set[int] = set()
     current: dict[int, str | None] = {}
     pointer: dict[int, str] = {}
     unknown: set[int] = set()
-    for step in sorted(layout.versions):
-        generation = _read_version_generation(remote, step)
-        if generation is _UNKNOWN_VERSION:
+    for step in sorted(layout.status_steps):
+        status = _read_step_status(remote, step)
+        if status is _UNKNOWN_STATUS:
             unknown.add(step)
-        else:
-            current[step] = generation  # type: ignore[assignment]
-    for step in sorted(set(layout.generations) | layout.versions):
-        # GEN 是「正在传的那一代」的唯一线索：L3 只在提交成功时才写，拿它当当前代
-        # 会把在传的那一代当残片删掉。读不出来就不放，判据降级到目录名。
-        generation = _read_pointer_generation(remote, step)
-        if generation is not None:
-            pointer[step] = generation
+            continue
+        assert isinstance(status, StepStatus)
+        pointer[step] = status.generation.id
+        if status.committed is not None:
+            versions.add(step)
+            current[step] = status.committed.generation.id
     result = plan(
-        versions=layout.versions - unknown,
+        versions=versions,
         rank_commits=layout.rank_commits,
         prefixes=layout.prefixes,
         local_steps=_scan_local(root),
@@ -794,8 +760,23 @@ def retain_remote_versions(
         )
 
     layout = _scan_remote(keys)
-    doomed = plan_retention(versions=layout.versions, keep=keep)
-    kept = tuple(sorted(layout.versions - set(doomed)))
+    committed_versions: set[int] = set()
+    for step in sorted(layout.status_steps):
+        status = _read_step_status(remote, step)
+        if status is _UNKNOWN_STATUS:
+            return RetentionReport(
+                keep=keep,
+                dry_run=dry_run,
+                planned=(),
+                deleted=(),
+                kept=(),
+                aborted=f"step_{step}: unreadable STATUS",
+            )
+        assert isinstance(status, StepStatus)
+        if status.committed is not None:
+            committed_versions.add(step)
+    doomed = plan_retention(versions=committed_versions, keep=keep)
+    kept = tuple(sorted(committed_versions - set(doomed)))
 
     deleted: list[DeletedVersion] = []
     aborted: str | None = None

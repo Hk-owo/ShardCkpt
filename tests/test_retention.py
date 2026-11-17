@@ -21,9 +21,10 @@ from commit.gc import (
     plan_retention,
     retain_remote_versions,
 )
+from commit.generation import read_status, status_key
 from storage.base import StorageBackend, StorageError
 from storage.object import S3Config, S3Storage
-from storage.upload import UploadCommit, commit_key, version_prefix
+from storage.upload import version_prefix
 
 DEVICE = "cuda:0"
 
@@ -77,12 +78,15 @@ def _commit_steps(state, tmp_path, storage, steps, *, keep=DEFAULT_KEEP_VERSIONS
 
 
 def _versions(storage: StorageBackend) -> list[int]:
-    """远端带版本 ``COMMIT`` 的 step（升序）。"""
-    return sorted(
-        int(key.split("/")[0][len("step_") :])
-        for key in storage.list("")
-        if key.count("/") == 1 and key.endswith("/COMMIT")
-    )
+    """远端 ``STATUS.committed`` 非空的 step（升序）。"""
+    found: list[int] = []
+    for key in storage.list(""):
+        if key.count("/") == 1 and key.endswith("/STATUS"):
+            step = int(key.split("/")[0][len("step_") :])
+            status = read_status(storage, step)
+            if status is not None and status.committed is not None:
+                found.append(step)
+    return sorted(found)
 
 
 class _RecordingRemote(StorageBackend):
@@ -160,7 +164,7 @@ def test_each_commit_keeps_the_latest_three(state, tmp_path, storage) -> None:
 
     assert _versions(storage) == [2, 3, 4]
     assert storage.list(version_prefix(1)) == [], "最旧的一代连数据一起删"
-    assert commit_key(2) in storage.list(version_prefix(2))
+    assert status_key(2) in storage.list(version_prefix(2))
 
     with pytest.raises(ckpt.FormatError):
         ckpt.load_object(storage, step=1, device=DEVICE)
@@ -168,11 +172,12 @@ def test_each_commit_keeps_the_latest_three(state, tmp_path, storage) -> None:
     assert ckpt.load_object(storage, device=DEVICE).step == 4
 
 
-def test_oldest_version_commit_goes_before_its_data(state, tmp_path, storage) -> None:
-    """删除顺序与写入镜像：版本 COMMIT → 分片 COMMIT → 数据。"""
+def test_oldest_version_status_goes_before_its_data(state, tmp_path, storage) -> None:
+    """删除顺序与写入镜像：step_N/STATUS → 分片 COMMIT → 数据。"""
     _commit_steps(state, tmp_path, storage, (1, 2, 3, 4), keep=None)
-    generation = UploadCommit.loads(storage.read(commit_key(1)).decode()).generation
-    assert generation is not None
+    status = read_status(storage, 1)
+    assert status is not None and status.committed is not None
+    generation = status.committed.generation.id
 
     recording = _RecordingRemote(storage)
     report = retain_remote_versions(recording, keep=3)
@@ -182,13 +187,10 @@ def test_oldest_version_commit_goes_before_its_data(state, tmp_path, storage) ->
     assert report.deleted[0].location == REMOTE
 
     old = [key for key in recording.deleted if key.startswith(f"{version_prefix(1)}/")]
-    assert old[0] == commit_key(1), "先删这一版的版本 COMMIT"
+    assert old[0] == status_key(1), "先删这一版的 STATUS"
     rank_commit = f"{version_prefix(1)}/{generation}/rank_0/COMMIT"
     data = f"{version_prefix(1)}/{generation}/rank_0/__0_0.distcp"
     assert old.index(rank_commit) < old.index(data), "分片提交点排在数据之前"
-    assert old.index(f"{version_prefix(1)}/GEN") < old.index(rank_commit), (
-        "版本 COMMIT → GEN → 分片提交点 → 数据"
-    )
 
 
 def test_retention_dry_run_only_plans(state, tmp_path, storage) -> None:
