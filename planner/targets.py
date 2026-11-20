@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from typing import Mapping
 
-from core import PlanError
+from core import InvalidTargetError
 from core.index import CheckpointIndex
 from planner.load_plan import TargetTensor
 
@@ -41,7 +41,7 @@ def targets_for_layout(
     dims = dict(shard_dims or {})
     unknown = sorted(set(dims) - set(checkpoint.tensors))
     if unknown:
-        raise PlanError(
+        raise InvalidTargetError(
             f"shard_dims references tensors that are not in the checkpoint: {unknown}"
         )
 
@@ -53,7 +53,7 @@ def targets_for_layout(
             targets.append(TargetTensor.whole(fqn, meta.global_shape, meta.dtype))
             continue
         if dim < 0 or dim >= len(meta.global_shape):
-            raise PlanError(
+            raise InvalidTargetError(
                 f"{fqn}: shard dim {dim} out of range for global shape {meta.global_shape}"
             )
         targets.append(

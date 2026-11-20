@@ -191,7 +191,8 @@ def load_local(
                                 raise ChecksumError(
                                     f"{unit.label}: crc32c {actual} != index "
                                     f"{expected} ({unit.file}@{unit.byte_offset + offset}"
-                                    f"+{length})"
+                                    f"+{length})",
+                                    file=unit.file,
                                 )
                             verified_blocks += 1
                             verified_bytes += length
@@ -238,7 +239,7 @@ def load_local(
         device=device_spec,
         engine=resolved_engine,
         tensors=tensors,
-        blobs=version.read_blobs(),
+        blobs=version.read_blobs(verify_crc=verify_crc),
         index=version.index,
         requests=requests,
         windows=windows,

@@ -270,7 +270,7 @@ report = ckpt.load_checkpoint(s3, local_root="/ckpt/rank_0", step=42, device="cu
 # report.source == "local" 或 "object"，report.download_bytes 对应 0 或下载字节数
 ```
 
-> 详细协议、失败模式矩阵与探针规格见 [`docs/generation.md`](docs/generation.md)。
+> 详细协议、失败模式矩阵与探针规格见 [`docs/implemented/generation.md`](docs/implemented/generation.md)。
 
 ---
 
@@ -313,7 +313,7 @@ with GcWorker("/ckpt/rank_0", s3, rank=0, interval=60.0) as worker:
     ...  # 可观测 worker.reports / worker.last_error
 ```
 
-> 详细规格见 [`docs/gc.md`](docs/gc.md)。待补全功能：「每 M 步永久归档一份」与 `save_async` 失败重传队列。
+> 详细规格见 [`docs/implemented/gc.md`](docs/implemented/gc.md)。待补全功能：「每 M 步永久归档一份」与 `save_async` 失败重传队列。
 
 ---
 
@@ -392,7 +392,7 @@ SNAPSHOTTING ──d2h_done()──> PERSISTING ──persist_ok()──> COMMIT
 - **三项关键语义**：
   1. `SNAPSHOTTING` 失败进入 `DROPPED`（未触碰存储，无需清理目录），写盘后失败进 `ABORTED`；
   2. buffer 仅在 `COMMITTED` / `ABORTED` / `DROPPED` 三个终态精确归还一次；
-  3. **跨 rank 一致门闸**：多 rank 场景下 `trigger()` 将各 rank 的在途代数与池状态通过 [`dist/`](dist/__init__.py) 执行一次 `all_reduce(MAX)` 得出统一裁决（`START` / `SKIP` / `FORCE_WAIT`）。详细规格见 [`docs/gate.md`](docs/gate.md)；异步后台进程设计见 [`docs/save_async.md`](docs/save_async.md)。
+  3. **跨 rank 一致门闸**：多 rank 场景下 `trigger()` 将各 rank 的在途代数与池状态通过 [`dist/`](dist/__init__.py) 执行一次 `all_reduce(MAX)` 得出统一裁决（`START` / `SKIP` / `FORCE_WAIT`）。详细规格见 [`docs/implemented/gate.md`](docs/implemented/gate.md)；异步后台进程设计见 [`docs/planned/save_async.md`](docs/planned/save_async.md)。
 
 ---
 
@@ -453,9 +453,11 @@ TMPDIR=$PWD/build/tmp ctest --test-dir build --output-on-failure
 
 | 文档 | 内容 |
 |---|---|
-| [`docs/generation.md`](docs/generation.md) | S3 单点 `STATUS` 代际隔离、fence 协议与失败模式矩阵 |
-| [`docs/gc.md`](docs/gc.md) | 本地与远端 GC 判据、安全删除顺序与有界保留规格 |
-| [`docs/gate.md`](docs/gate.md) | 跨 rank 一致门闸设计与实现偏差 |
-| [`docs/save_async.md`](docs/save_async.md) | 异步保存进程分离设计规格（未实现） |
+| [`docs/README.md`](docs/README.md) | 设计与计划文档目录总览（按实现状态分类） |
+| [`docs/implemented/generation.md`](docs/implemented/generation.md) | S3 单点 `STATUS` 代际隔离、fence 协议与失败模式矩阵（已实现） |
+| [`docs/implemented/gc.md`](docs/implemented/gc.md) | 本地与远端 GC 判据、安全删除顺序与有界保留规格（已实现） |
+| [`docs/implemented/gate.md`](docs/implemented/gate.md) | 跨 rank 一致门闸设计与实现偏差（已实现） |
+| [`docs/planned/recovery_and_coordination.md`](docs/planned/recovery_and_coordination.md) | 崩溃恢复补全与提交协调监控统一实施计划（方案已定） |
+| [`docs/planned/save_async.md`](docs/planned/save_async.md) | 异步保存进程分离设计规格（未实现） |
 | [`tests/sim/README.md`](tests/sim/README.md) | 仿真测试方案、覆盖矩阵与待补全清单 |
 | [`tests/fixtures/README.md`](tests/fixtures/README.md) | 确定性测试数据集生成器用法（`make_data.py`） |

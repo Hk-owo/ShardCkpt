@@ -113,6 +113,9 @@ class _RecordingRemote(StorageBackend):
     def read(self, key: str) -> bytes:
         return self.inner.read(key)
 
+    def read_with_meta(self, key: str):
+        return self.inner.read_with_meta(key)
+
     def read_range(self, key: str, offset: int, length: int) -> bytes:
         return self.inner.read_range(key, offset, length)
 

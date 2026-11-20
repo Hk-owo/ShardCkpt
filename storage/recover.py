@@ -20,10 +20,42 @@ from pathlib import Path
 
 from commit.local import CommitRecord, latest_step, read_commit, version_key
 from core import ChecksumError, FormatError
-from core.index import META_FILE, CheckpointIndex
+from core.index import META_FILE, BlobMeta, CheckpointIndex
 from storage.base import ObjectNotFoundError, StorageBackend
 from storage.checksum import crc32c_hex
 from storage.local import DEFAULT_ALIGNMENT, LocalStorage
+
+
+def verify_blob_crc32c(name: str, payload: bytes, blob: BlobMeta) -> None:
+    """小状态强制分块 CRC-32C 校验（R10）：不做无 CRC 旧数据兼容。"""
+    if blob.crc_chunk_bytes is None or not blob.crc32c_chunks:
+        raise FormatError(
+            f"blob {name!r}: missing crc_chunk_bytes/crc32c_chunks "
+            f"({blob.file}@{blob.byte_offset}+{blob.length})"
+        )
+    if blob.crc_chunk_bytes <= 0:
+        raise FormatError(f"blob {name!r}: crc_chunk_bytes must be > 0, got {blob.crc_chunk_bytes}")
+    expected_blocks = -(-blob.length // blob.crc_chunk_bytes)
+    if len(blob.crc32c_chunks) != expected_blocks:
+        raise FormatError(
+            f"blob {name!r}: expected {expected_blocks} CRC blocks, got {len(blob.crc32c_chunks)}"
+        )
+    if len(payload) != blob.length:
+        raise FormatError(
+            f"blob {name!r}: read {len(payload)} bytes, index records {blob.length}"
+        )
+    chunk = blob.crc_chunk_bytes
+    view = memoryview(payload)
+    for block_idx, expected_crc in enumerate(blob.crc32c_chunks):
+        start = block_idx * chunk
+        end = min((block_idx + 1) * chunk, blob.length)
+        actual = crc32c_hex(view[start:end])
+        if actual != expected_crc:
+            raise ChecksumError(
+                f"blob {name!r}: crc32c {actual} != index {expected_crc} "
+                f"({blob.file}@{blob.byte_offset + start}+{end - start})",
+                file=blob.file,
+            )
 
 
 @dataclass(frozen=True)
@@ -51,12 +83,17 @@ class RecoveredVersion:
         """小状态：名字 -> 字节数（已序列化的原始字节）。"""
         return {name: blob.length for name, blob in sorted(self.index.blobs.items())}
 
-    def read_blobs(self) -> dict[str, bytes]:
-        """把全部小状态读回来（体积很小，走一次 ``read_range`` 一条）。"""
-        return {
-            name: self.storage.read_range(self.file_key(blob.file), blob.byte_offset, blob.length)
-            for name, blob in sorted(self.index.blobs.items())
-        }
+    def read_blobs(self, *, verify_crc: bool = True) -> dict[str, bytes]:
+        """把全部小状态读回来；开启 ``verify_crc`` 时强制分块校验 CRC-32C（R10）。"""
+        blobs: dict[str, bytes] = {}
+        for name, blob in sorted(self.index.blobs.items()):
+            payload = self.storage.read_range(
+                self.file_key(blob.file), blob.byte_offset, blob.length
+            )
+            if verify_crc:
+                verify_blob_crc32c(name, payload, blob)
+            blobs[name] = payload
+        return blobs
 
 
 def recover_version(storage: StorageBackend, step: int | None = None) -> RecoveredVersion:
@@ -161,4 +198,4 @@ def _check_data_files(
             )
 
 
-__all__ = ["RecoveredVersion", "open_version", "recover_version"]
+__all__ = ["RecoveredVersion", "open_version", "recover_version", "verify_blob_crc32c"]

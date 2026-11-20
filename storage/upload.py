@@ -68,13 +68,20 @@ key 布局（相对存储配置里的 prefix）::
 
 from __future__ import annotations
 
+import fcntl
 import json
+import logging
+import os
 import shutil
 import tempfile
-from concurrent.futures import ThreadPoolExecutor
+import threading
+import time
+import uuid
+import warnings
+from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 from async_ import Tensor
 from commit.gc import (
@@ -99,30 +106,59 @@ from commit.local import (
     COMMIT_FILE,
     CommitRecord,
     check_crc32c,
+    delete_local_generation,
     read_commit,
+    read_local_generation,
+    version_key,
     write_commit,
+    write_local_generation,
     write_metadata,
 )
-from core import ChecksumError, FormatError, PlanError
+from core import CheckpointError, ChecksumError, FormatError, InvalidTargetError, PlanError
 from core.index import META_FILE, BlobMeta, CheckpointIndex, ShardMeta, TensorMeta
 from core.metadata import Device
+from dist import Collective, CollectiveError, SingleRankCollective
 from planner.load_plan import build_load_plan
 from planner.targets import targets_for_layout
 from storage.base import (
     ConditionalBackend,
+    ConditionalWritesDisabled,
     ObjectNotFoundError,
     StorageBackend,
     StorageError,
+    UnsupportedConditionalWrites,
+    is_retryable_storage_error,
+    run_scope,
+    validate_run_id,
 )
 from storage.checksum import crc32c_hex
 from storage.local import LocalStorage
 from storage.local_load import LoadReport, load_local
-from storage.recover import recover_version
+from storage.recover import recover_version, verify_blob_crc32c
+
+logger = logging.getLogger(__name__)
 
 RANK_COMMIT_FORMAT_VERSION = 2
 """L2 ``rank_r/COMMIT`` 的格式版本（必须带 ``generation`` / ``seq`` 与 ``metadata.crc32c``）。"""
 
 DEFAULT_BUDGET_BYTES = 8 << 20
+DEFAULT_DOWNLOAD_RETRIES = 3
+DEFAULT_DOWNLOAD_BACKOFF = 0.05
+
+STAGING_DIR_PREFIX = "shardckpt-"
+STAGING_LOCK_FILE = ".shardckpt.lock"
+
+LOAD_OK = 0
+LOAD_VERSION_CORRUPT = 1
+LOAD_FATAL = 2
+
+
+def local_run_root(root: str | Path, run_id: str | None) -> Path:
+    """把本地根路径按轮次隔离到 ``<root>/<run_id>``（``run_id=None`` 时不变）。"""
+    base = Path(root)
+    if run_id is None:
+        return base
+    return base / validate_run_id(run_id)
 
 
 # --- key 布局 ---------------------------------------------------------------
@@ -398,43 +434,60 @@ def upload_rank(
     *,
     rank: int,
     generation: "Generation | str | None" = None,
+    run_id: str | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> int:
-    """把本地 ``step_<step>`` 版本里属于本 rank 的产物上传到对象存储。
+    """把本地 ``step_<step>`` 里**本 rank** 的产物上传到对象存储，返回上传字节数。
 
-    返回上传的字节数（数据 + 索引 + 提交记录）。顺序：数据文件 → ``.metadata`` →
-    ``rank_<rank>/COMMIT``；提交记录落盘之前，rank 0 的 ``finalize_upload`` 不会认为
-    这个 rank 完成，本地回收也不会动这一版。
+    每个 rank 只写自己那一代的前缀（``step_42/gen_x/rank_<i>/``），先数据文件、
+    再索引、最后 ``rank_<i>/COMMIT``；三个都落盘才算这个 rank 完成。这个提交点
+    同时也是「本地 ``step_<step>/`` 可以删了」的证据。
 
     所有 key 都落在 ``step_<step>/<generation>/rank_<rank>/`` 下，写入用
     ``If-None-Match: *``（同代同 key 不会被静默覆盖）。**写 L2 之前**做一次 fence
     检查：若自己已不是当前代际，直接 ``FencedError`` 且不写 L2 —— 这一代因此永远
     凑不齐，rank 0 不会把它提升为版本。
     """
-    local = LocalStorage(root, direct_io=False)
+    scoped_storage = run_scope(storage, run_id)
+    local = LocalStorage(local_run_root(root, run_id), direct_io=False)
     key = version_prefix(step)
     if read_commit(local, step) is None:
         raise FormatError(
             f"{key}: 本地版本没有 COMMIT，先 save_local() 提交再上传"
         )
 
-    conditional = _as_conditional(storage, what=f"upload_rank(step={step}, rank={rank})")
+    conditional = _as_conditional(
+        scoped_storage, what=f"upload_rank(step={step}, rank={rank})"
+    )
     gen = as_generation(generation, step=step)
     if gen is None:
         # 单 rank 便利路径：GEN 已有就复用它，否则开第一代。多 rank 必须先
         # begin_upload() 分配，否则两次尝试的分片会混在同一代里。
-        gen = resolve_generation(storage, step, ranks=(rank,))
+        gen = resolve_generation(scoped_storage, step, ranks=(rank,))
 
     index = CheckpointIndex.loads(local.read(f"{key}/{META_FILE}").decode("utf-8"))
     index.validate(complete=False)  # 单 rank 只做局部自检，全局覆盖在恢复端
 
     # L2-pre：花带宽之前先证明我还持有这一代
-    verify_holder(storage, gen)
+    verify_holder(scoped_storage, gen)
+    # R6：同步确保本地版本目录记下当前代际标记，热副本恢复时做纯本地比对
+    existing_marker = read_local_generation(local, step)
+    if (
+        existing_marker is None
+        or existing_marker.generation != gen.id
+        or existing_marker.run_id != run_id
+    ):
+        write_local_generation(local, step, gen.id, run_id=run_id)
 
-    files = sorted({shard.file for meta in index.tensors.values() for shard in meta.shards})
-    files += sorted({blob.file for blob in index.blobs.values()})
+    files = sorted(
+        {shard.file for meta in index.tensors.values() for shard in meta.shards}
+        | {blob.file for blob in index.blobs.values()}
+    )
     uploaded = 0
     sizes: dict[str, int] = {}
     for file in files:
+        if cancel_event is not None and cancel_event.is_set():
+            raise FencedError(f"step {step} ({gen.id}): 上传已被协调层作废取消")
         # 本地索引里的 ``file`` 是「版本目录内的文件名」，对象 key 里加上代际与 rank
         # 前缀，这样同 step 的不同尝试、以及各 rank 的产物互不覆盖。
         object_name = data_key(step, rank, file, gen)
@@ -446,12 +499,18 @@ def upload_rank(
         sizes[file] = expected
         uploaded += expected
 
+    if cancel_event is not None and cancel_event.is_set():
+        raise FencedError(f"step {step} ({gen.id}): 上传已被协调层作废取消")
+
     metadata = local.read(f"{key}/{META_FILE}")
     object_name = index_key(step, rank, gen)
     outcome = conditional.put_if_absent(object_name, metadata)
     if not outcome.written:
         _reuse_uploaded_object(conditional, object_name, len(metadata))
     uploaded += len(metadata)
+
+    if cancel_event is not None and cancel_event.is_set():
+        raise FencedError(f"step {step} ({gen.id}): 上传已被协调层作废取消")
 
     record = RankCommit(
         step=step,
@@ -490,27 +549,134 @@ def _status_steps(storage: StorageBackend) -> list[int]:
     return sorted(steps)
 
 
-def committed_remote_steps(storage: StorageBackend) -> list[int]:
-    """扫描远端所有 ``STATUS.committed`` 非空的 step，按升序返回。"""
-    committed: list[int] = []
-    for step in _status_steps(storage):
-        status = read_status(storage, step)
+def list_remote_candidates(
+    storage: StorageBackend,
+    *,
+    skip_corrupt_status: bool = False,
+) -> tuple[list[tuple[int, str]], tuple[tuple[int, str], ...]]:
+    """按 step 从大到小列举远端已提交的 ``(step, generation_id)`` 候选列表。
+
+    ``skip_corrupt_status=False``（默认严格模式）：遇到无法解析的 ``STATUS`` 直接抛错；
+    ``skip_corrupt_status=True``：打告警并跳过损坏的 ``STATUS``，把跳过原因记进第二个返回值。
+    """
+    candidates: list[tuple[int, str]] = []
+    skipped: list[tuple[int, str]] = []
+    for step in reversed(_status_steps(storage)):
+        try:
+            status = read_status(storage, step)
+        except (FormatError, UnicodeDecodeError) as exc:
+            if not skip_corrupt_status:
+                raise
+            msg = f"step_{step}: 跳过损坏的 STATUS（{exc}）"
+            logger.warning(msg)
+            warnings.warn(msg, RuntimeWarning, stacklevel=2)
+            skipped.append((step, f"corrupt STATUS: {exc}"))
+            continue
         if status is not None and status.committed is not None:
-            committed.append(step)
-    return committed
+            candidates.append((step, status.committed.generation.id))
+    return candidates, tuple(skipped)
 
 
-def latest_remote_step(storage: StorageBackend) -> int | None:
+def committed_remote_steps(
+    storage: StorageBackend, *, skip_corrupt_status: bool = False
+) -> list[int]:
+    """扫描远端所有 ``STATUS.committed`` 非空的 step，按升序返回。"""
+    candidates, _ = list_remote_candidates(
+        storage, skip_corrupt_status=skip_corrupt_status
+    )
+    return sorted(step for step, _ in candidates)
+
+
+def latest_remote_step(
+    storage: StorageBackend, *, skip_corrupt_status: bool = False
+) -> int | None:
     """远端最新的已提交版本：扫描 ``step_N/STATUS``，从大到小找首个 ``committed`` 非空者。
 
     与本地层 :func:`commit.local.latest_step` 不同，远端正在传或半途失败的 step
     也会有 ``STATUS``（只是 ``committed == null``），不能只靠文件名判别。
     """
-    for step in reversed(_status_steps(storage)):
-        status = read_status(storage, step)
-        if status is not None and status.committed is not None:
-            return step
-    return None
+    candidates, _ = list_remote_candidates(
+        storage, skip_corrupt_status=skip_corrupt_status
+    )
+    return candidates[0][0] if candidates else None
+
+
+def promote_remote_tails(
+    storage: StorageBackend,
+    *,
+    keep: int | None = DEFAULT_KEEP_VERSIONS,
+    reclaim_stale: bool = True,
+    run_id: str | None = None,
+) -> list[UploadCommit]:
+    """C4 / R16b：重启时仅提升「远端最新一代分片已齐、仅缺总提交点」的尾巴。
+
+    只由 rank 0 在恢复选版前调用；只检查当前轮次下不早于最新已提交 step 的未提交
+    ``STATUS.active`` 代际。分片不齐或无 ``STATUS`` 的残片一律不救，交由 GC 清理。
+    """
+    scoped = run_scope(storage, run_id)
+    if not getattr(scoped, "supports_conditional_writes", False):
+        return []
+
+    steps = _status_steps(scoped)
+    if not steps:
+        return []
+
+    latest_committed: int | None = None
+    statuses: dict[int, Any] = {}
+    for step in reversed(steps):
+        try:
+            status = read_status(scoped, step)
+        except (FormatError, UnicodeDecodeError):
+            continue
+        if status is None:
+            continue
+        statuses[step] = status
+        if latest_committed is None and status.committed is not None:
+            latest_committed = step
+
+    promoted: list[UploadCommit] = []
+    for step in sorted(statuses):
+        if latest_committed is not None and step < latest_committed:
+            continue
+        status = statuses[step]
+        if (
+            status.committed is not None
+            and status.committed.generation.id == status.generation.id
+        ):
+            continue
+        gen = status.generation
+        prefix = generation_prefix(step, gen)
+        keys = set(scoped.list(prefix))
+        missing = [
+            key
+            for rank in status.ranks
+            for key in (index_key(step, rank, gen), rank_commit_key(step, rank, gen))
+            if key not in keys
+        ]
+        if missing:
+            continue
+        strays = [
+            key
+            for key in keys
+            if key.startswith(f"{prefix}/rank_")
+            and _rank_of(key, prefix) not in status.ranks
+        ]
+        if strays:
+            continue
+        try:
+            promoted.append(
+                finalize_upload(
+                    scoped,
+                    step,
+                    ranks=status.ranks,
+                    generation=gen,
+                    keep=keep,
+                    reclaim_stale=reclaim_stale,
+                )
+            )
+        except (FormatError, FencedError):
+            continue
+    return promoted
 
 
 def finalize_upload(
@@ -522,6 +688,7 @@ def finalize_upload(
     layout: Mapping[str, int] | None = None,
     keep: int | None = DEFAULT_KEEP_VERSIONS,
     reclaim_stale: bool = True,
+    run_id: str | None = None,
 ) -> UploadCommit:
     """rank 0 的提交动作：``list`` 本代前缀确认每个 rank 都传完了，再单点 CAS 更新 ``STATUS.committed``。
 
@@ -540,6 +707,7 @@ def finalize_upload(
     **有界保留 & 同 step 旧代**：提交成功后立刻保留最新 ``keep`` 代已提交版本，并顺手
     收掉本 step 下序号严格更早的代际前缀；收尾失败不影响本次提交。
     """
+    storage = run_scope(storage, run_id)
     _as_conditional(storage, what=f"finalize_upload(step={step})")
     expected = tuple(int(rank) for rank in ranks)
     gen = as_generation(generation, step=step)
@@ -656,34 +824,52 @@ class ObjectVersion:
     commit: UploadCommit
     generation: str
     """这一版属于哪一代。"""
+    file_sizes: Mapping[str, int] = field(default_factory=dict)
+    """各 rank 分片提交点声明的 ``rank_<r>/<file> -> 预期字节数``（R1）。"""
 
     def file_key(self, name: str) -> str:
         """索引里的 ``file`` 是「版本目录内、带 rank 前缀」的名字。"""
         return f"{self.key}/{self.generation}/{name}"
 
-    def read_blobs(self) -> dict[str, bytes]:
-        return {
-            name: self.storage.read_range(self.file_key(blob.file), blob.byte_offset, blob.length)
-            for name, blob in sorted(self.index.blobs.items())
-        }
+    def read_blobs(self, *, verify_crc: bool = True) -> dict[str, bytes]:
+        blobs: dict[str, bytes] = {}
+        for name, blob in sorted(self.index.blobs.items()):
+            payload = self.storage.read_range(
+                self.file_key(blob.file), blob.byte_offset, blob.length
+            )
+            if verify_crc:
+                verify_blob_crc32c(name, payload, blob)
+            blobs[name] = payload
+        return blobs
 
 
 def open_object_version(
-    storage: StorageBackend, step: int | None = None
+    storage: StorageBackend,
+    step: int | None = None,
+    *,
+    expected_generation: str | None = None,
+    skip_corrupt_status: bool = False,
+    run_id: str | None = None,
 ) -> ObjectVersion:
     """恢复端的第一道门：读 ``STATUS.committed`` → 核对 rank 前缀 → 合并 per-rank 索引。
 
     ``step=None`` 取「所有 ``STATUS.committed`` 非空的版本里最大的 step」。
     """
-    target = step if step is not None else latest_remote_step(storage)
+    scoped = run_scope(storage, run_id)
+    # 精确指定 step 时绝不跳过坏 STATUS（R8）
+    target = (
+        step
+        if step is not None
+        else latest_remote_step(scoped, skip_corrupt_status=skip_corrupt_status)
+    )
     if target is None:
         raise FormatError(
-            f"no committed checkpoint found under {storage!r}: "
+            f"no committed checkpoint found under {scoped!r}: "
             "只有 STATUS.committed 非空的版本才算可恢复"
         )
 
     key = version_prefix(target)
-    status = read_status(storage, target)
+    status = read_status(scoped, target)
     if status is None or status.committed is None:
         raise FormatError(
             f"{key}: STATUS missing or uncommitted, this version is not recoverable"
@@ -693,9 +879,14 @@ def open_object_version(
         raise FormatError(
             f"{key}: STATUS declares step {commit.step}, but it was read as step {target}"
         )
+    if expected_generation is not None and commit.generation != expected_generation:
+        raise FormatError(
+            f"{key}: STATUS committed generation is {commit.generation!r}, "
+            f"expected locked generation {expected_generation!r}"
+        )
 
     base = generation_prefix(target, commit.generation)
-    keys = set(storage.list(base))
+    keys = set(scoped.list(base))
     missing = sorted(
         index_key(target, rank, commit.generation)
         for rank in commit.ranks
@@ -721,10 +912,16 @@ def open_object_version(
             f"have no per-rank COMMIT (分片提交点缺失，远端对象可能被删过)"
         )
     index_payloads: dict[int, bytes] = {}
+    expected_file_sizes: dict[str, int] = {}
     for rank in commit.ranks:
         rank_commit = RankCommit.loads(
-            storage.read(rank_commit_key(target, rank, commit.generation)).decode("utf-8")
+            scoped.read(rank_commit_key(target, rank, commit.generation)).decode("utf-8")
         )
+        # R11：补齐 step 断言，形成 (step, rank, generation) 三坐标完整门禁
+        if rank_commit.step != target:
+            raise FormatError(
+                f"{base}/rank_{rank}/COMMIT 声明 step {rank_commit.step}，期望 {target}"
+            )
         if rank_commit.rank != rank:
             raise FormatError(
                 f"{base}/rank_{rank}/COMMIT 声明 rank {rank_commit.rank}，路径与内容不一致"
@@ -739,7 +936,7 @@ def open_object_version(
         # 合并索引是 N 份 ``.metadata`` 拼出来的：任何一份被改坏都会让「分片怎么拼」
         # 出错，而合并后的 ``validate()`` 看不出结构自洽的篡改 —— 长度 + CRC-32C 才是
         # 逐 rank 的字节级凭据。
-        rank_index_payload = storage.read(index_key(target, rank, commit.generation))
+        rank_index_payload = scoped.read(index_key(target, rank, commit.generation))
         if len(rank_index_payload) != rank_commit.metadata_bytes:
             raise FormatError(
                 f"{base}/rank_{rank}/{META_FILE}: {len(rank_index_payload)} bytes, "
@@ -750,23 +947,35 @@ def open_object_version(
         if actual != rank_commit.metadata_crc32c:
             raise ChecksumError(
                 f"{base}/rank_{rank}/{META_FILE}: crc32c {actual}, rank COMMIT "
-                f"records {rank_commit.metadata_crc32c}（分片索引与提交点不符）"
+                f"records {rank_commit.metadata_crc32c}（分片索引与提交点不符）",
+                file=f"rank_{rank}/{META_FILE}",
             )
         index_payloads[rank] = rank_index_payload
+        for fname, fsize in rank_commit.files.items():
+            expected_file_sizes[f"rank_{rank}/{fname}"] = int(fsize)
 
     shards: dict[str, list[ShardMeta]] = {}
     metas: dict[str, TensorMeta] = {}
     blobs: dict[str, BlobMeta] = {}
     for rank in commit.ranks:
         rank_index = CheckpointIndex.loads(index_payloads[rank].decode("utf-8"))
+        # R11：分片索引声明的 step 也必须严格等于目标 step
+        if rank_index.step != target:
+            raise FormatError(
+                f"{base}/rank_{rank}/{META_FILE} 声明 step {rank_index.step}，期望 {target}"
+            )
         for name, meta in rank_index.tensors.items():
             metas.setdefault(name, meta)
             shards.setdefault(name, []).extend(
                 replace(shard, file=f"rank_{rank}/{shard.file}") for shard in meta.shards
             )
         for name, blob in rank_index.blobs.items():
-            # 同名小状态每个 rank 都会写一份（内容相同），只留第一份
-            blobs.setdefault(name, replace(blob, file=f"rank_{rank}/{blob.file}"))
+            # R11：不同 rank 声明同名小状态属于归属冲突，显式报错而不是静默覆盖
+            if name in blobs:
+                raise FormatError(
+                    f"{key}: 同名小状态 {name!r} 被多个 rank 声明（rank {rank} 冲突）"
+                )
+            blobs[name] = replace(blob, file=f"rank_{rank}/{blob.file}")
 
     index = CheckpointIndex(
         tensors={
@@ -781,15 +990,23 @@ def open_object_version(
         step=target,
         saved_layout=dict(commit.layout),
     )
+    # R1：合并索引引用的每个文件都必须在对应 rank 的 COMMIT.files 清单内
+    referenced = _version_files(index)
+    missing_from_manifest = sorted(set(referenced) - set(expected_file_sizes))
+    if missing_from_manifest:
+        raise FormatError(
+            f"{key}: rank COMMIT files 清单缺少索引引用的文件：{missing_from_manifest}"
+        )
     # 全局覆盖校验在这里做：此时才看得到所有 rank 的分片
     index.validate()
     return ObjectVersion(
-        storage=storage,
+        storage=scoped,
         step=target,
         key=key,
         index=index,
         commit=commit,
         generation=commit.generation,
+        file_sizes={name: expected_file_sizes[name] for name in referenced},
     )
 
 
@@ -800,6 +1017,9 @@ SOURCE_LOCAL = "local"
 
 SOURCE_OBJECT = "object"
 """恢复来源：从对象存储整份下载到临时目录。"""
+
+GENERATION_MISMATCH = "generation_mismatch"
+"""本地热副本的代际标记与集群锁定的目标代际不一致。"""
 
 
 @dataclass(frozen=True)
@@ -827,10 +1047,266 @@ class ObjectLoadReport:
     unverified_bytes: int = 0
     source: str = SOURCE_OBJECT
     """数据从哪来：``"local"``（本地热副本，零下载）或 ``"object"``（下载）。"""
+    redownloaded: tuple[str, ...] = ()
+    """下载后本地按块校验失败、触发定向重下 1 次恢复的文件清单（R3）。"""
+    skipped_versions: tuple[tuple[int, str], ...] = ()
+    """因损坏/坏 STATUS 而被跳过的候选版本 ``(step, reason)``（R8/R9）。"""
+    local_fallback_reason: str | None = None
+    """本地热副本未命中或损坏而回退远端下载的原因（R5/R6）。"""
+    generation: str | None = None
+    """本次恢复实际使用的代际标识。"""
+    run_id: str | None = None
+    """本次恢复实际读取的轮次标识（R14）。"""
 
     @property
     def amplification(self) -> float:
         return self.read_bytes / self.copied_bytes if self.copied_bytes else 0.0
+
+
+# --- R4：暂存目录文件锁与残留清理 -------------------------------------------
+
+
+def _acquire_staging_dir(local_staging_dir: str | Path | None) -> tuple[Path, int]:
+    """创建暂存目录并持有 OS 级排他文件锁（R4）。
+
+    先在同父目录以 ``.creating-`` 前缀建目录并抢占 ``flock(LOCK_EX | LOCK_NB)``，
+    再原子重命名为 ``shardckpt-*`` —— 任何时候都不会出现无锁的 ``shardckpt-*``。
+    """
+    parent = (
+        Path(local_staging_dir)
+        if local_staging_dir is not None
+        else Path(tempfile.gettempdir())
+    )
+    parent.mkdir(parents=True, exist_ok=True)
+    cleanup_stale_staging_dirs(parent)
+
+    creating = Path(
+        tempfile.mkdtemp(prefix=f".creating-{STAGING_DIR_PREFIX}", dir=str(parent))
+    )
+    lock_fd = -1
+    try:
+        lock_path = creating / STAGING_LOCK_FILE
+        lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        os.write(lock_fd, f"{os.getpid()}\n".encode("ascii"))
+        final_dir = creating.with_name(creating.name[len(".creating-") :])
+        os.replace(creating, final_dir)
+        return final_dir, lock_fd
+    except BaseException:
+        if lock_fd >= 0:
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
+        shutil.rmtree(creating, ignore_errors=True)
+        raise
+
+
+def _release_staging_dir(path: Path, lock_fd: int) -> None:
+    """删除暂存目录并释放 OS 文件锁。"""
+    try:
+        shutil.rmtree(path, ignore_errors=True)
+    finally:
+        try:
+            os.close(lock_fd)
+        except OSError:
+            pass
+
+
+def cleanup_stale_staging_dirs(*roots: str | Path | None) -> tuple[Path, ...]:
+    """扫描历史 ``shardckpt-*`` 暂存目录，非阻塞抢锁清理已死进程的残留（R4）。
+
+    只清理同时满足「带 ``shardckpt-`` 前缀 + 存在 ``.shardckpt.lock`` + 非阻塞
+    ``flock`` 成功」的目录；兄弟 rank 仍在使用的目录抢不到锁会自动跳过。
+    """
+    cleaned: list[Path] = []
+    seen_roots: set[Path] = set()
+    for root in roots:
+        if root is None:
+            continue
+        parent = Path(root)
+        try:
+            resolved = parent.resolve()
+        except OSError:
+            resolved = parent
+        if resolved in seen_roots or not parent.is_dir():
+            continue
+        seen_roots.add(resolved)
+        try:
+            children = list(parent.iterdir())
+        except OSError:
+            continue
+        for child in children:
+            if not child.is_dir() or not child.name.startswith(STAGING_DIR_PREFIX):
+                continue
+            lock_path = child / STAGING_LOCK_FILE
+            try:
+                fd = os.open(lock_path, os.O_RDONLY)
+            except OSError:
+                # 系统临时目录里若没有专属锁文件，绝不越界删除
+                continue
+            try:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError:
+                    # 兄弟 rank 正在持有排他锁，跳过
+                    continue
+                shutil.rmtree(child, ignore_errors=True)
+                cleaned.append(child)
+            finally:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+    return tuple(cleaned)
+
+
+def _delete_corrupt_local_dir(local_root: Path, step: int) -> None:
+    """清理损坏的本地热副本目录（R5）：先删 COMMIT 再清数据。"""
+    from commit.gc import delete_local_version
+
+    try:
+        delete_local_version(local_root, step)
+    except OSError:
+        shutil.rmtree(local_root / version_key(step), ignore_errors=True)
+
+
+# --- 单版本远程下载（含 R1 大小核对 + R2 重试 + R3 定向重下 + R4 锁目录） ----
+
+
+def _load_remote_version(
+    storage: StorageBackend,
+    *,
+    step: int | None = None,
+    expected_generation: str | None = None,
+    device: "str | Device" = "cpu",
+    tp: int = 1,
+    tp_rank: int = 0,
+    shard_dims: Mapping[str, int] | None = None,
+    budget_bytes: int = DEFAULT_BUDGET_BYTES,
+    column_strategy: str = "whole",
+    verify_crc: bool = True,
+    crc_padding: str = "block",
+    crc_padding_ratio: float = 0.125,
+    io_concurrency: int = 1,
+    local_staging_dir: str | Path | None = None,
+    skip_corrupt_status: bool = False,
+    download_retries: int = DEFAULT_DOWNLOAD_RETRIES,
+    download_backoff: float = DEFAULT_DOWNLOAD_BACKOFF,
+    run_id: str | None = None,
+) -> ObjectLoadReport:
+    if io_concurrency < 1:
+        raise ValueError(f"io_concurrency must be >= 1, got {io_concurrency}")
+    if download_retries < 0:
+        raise ValueError(f"download_retries must be >= 0, got {download_retries}")
+
+    version = open_object_version(
+        storage,
+        step,
+        expected_generation=expected_generation,
+        skip_corrupt_status=skip_corrupt_status,
+        run_id=run_id,
+    )
+
+    staging_root, lock_fd = _acquire_staging_dir(local_staging_dir)
+    try:
+        version_dir = staging_root / version_prefix(version.step)
+        version_dir.mkdir(parents=True, exist_ok=True)
+        files = _version_files(version.index)
+        sizes = _download_files(
+            version.storage,
+            version,
+            files,
+            version_dir,
+            io_concurrency=io_concurrency,
+            retries=download_retries,
+            backoff=download_backoff,
+        )
+
+        # R1：临时本地 COMMIT 使用各 rank 分片提交点声明的预期大小
+        expected_files = {
+            name: version.file_sizes.get(name, sizes[name]) for name in files
+        }
+        local = LocalStorage(staging_root)
+        metadata = write_metadata(local, version.step, version.index)
+        write_commit(
+            local,
+            CommitRecord.of_metadata(
+                step=version.step,
+                metadata=metadata,
+                files=expected_files,
+            ),
+        )
+
+        redownloaded: list[str] = []
+        while True:
+            try:
+                report: LoadReport = load_local(
+                    staging_root,
+                    step=version.step,
+                    device=device,
+                    tp=tp,
+                    tp_rank=tp_rank,
+                    shard_dims=shard_dims,
+                    verify_crc=verify_crc,
+                    crc_padding=crc_padding,
+                    crc_padding_ratio=crc_padding_ratio,
+                    budget_bytes=budget_bytes,
+                    column_strategy=column_strategy,
+                )
+                break
+            except ChecksumError as exc:
+                # R3：本地按块校验失败时定向重下出错文件 1 次；仍坏则定性远端版本损坏
+                corrupt_file = _identify_corrupt_file(exc, files)
+                if corrupt_file is None or corrupt_file in redownloaded:
+                    raise
+                redownloaded.append(corrupt_file)
+                _download_single_file(
+                    version.storage,
+                    version,
+                    corrupt_file,
+                    version_dir / corrupt_file,
+                    expected_size=version.file_sizes.get(corrupt_file),
+                    retries=download_retries,
+                    backoff=download_backoff,
+                )
+
+        return ObjectLoadReport(
+            step=report.step,
+            device=report.device,
+            tensors=report.tensors,
+            blobs=report.blobs,
+            index=report.index,
+            requests=report.requests,
+            windows=report.windows,
+            read_bytes=report.read_bytes,
+            copied_bytes=report.copied_bytes,
+            h2d_bytes=report.h2d_bytes,
+            download_bytes=sum(expected_files.values()),
+            local_staging=str(staging_root),
+            crc_verified=report.crc_verified,
+            verified_blocks=report.verified_blocks,
+            io_requests=report.io_requests,
+            unverified=report.unverified,
+            unverified_bytes=report.unverified_bytes,
+            source=SOURCE_OBJECT,
+            redownloaded=tuple(redownloaded),
+            generation=version.generation,
+            run_id=run_id,
+        )
+    finally:
+        _release_staging_dir(staging_root, lock_fd)
+
+
+def _identify_corrupt_file(exc: ChecksumError, files: Sequence[str]) -> str | None:
+    candidate = getattr(exc, "file", None)
+    if isinstance(candidate, str) and candidate in files:
+        return candidate
+    message = str(exc)
+    for name in files:
+        if name in message:
+            return name
+    return None
 
 
 def load_object_version(
@@ -848,78 +1324,48 @@ def load_object_version(
     crc_padding_ratio: float = 0.125,
     io_concurrency: int = 1,
     local_staging_dir: str | Path | None = None,
+    skip_corrupt_status: bool = False,
+    allow_fallback: bool = False,
+    collective: Collective | None = None,
+    world_size: int | None = None,
+    download_retries: int = DEFAULT_DOWNLOAD_RETRIES,
+    download_backoff: float = DEFAULT_DOWNLOAD_BACKOFF,
+    run_id: str | None = None,
+    source_run_id: str | None = None,
+    promote_tails: bool = False,
 ) -> ObjectLoadReport:
     """从对象存储恢复：整文件下载到本地临时目录，再走本地读闭环。
 
     下载用 :meth:`StorageBackend.download` 流式写盘，不把整个数据文件读进内存；
-    下载完写合并后的 ``.metadata`` 与本地 ``COMMIT``，然后调用
-    :func:`storage.local_load.load_local` 按索引里的 CRC 块校验。
-
-    对象存储侧只负责「发回来的 = 存的」（整对象 GET 带 ``ChecksumMode=ENABLED``），
-    本地 ``load_local`` 负责「存的 = 当初写的」。
+    下载完核对各 rank 分片提交点预期大小并写合并后的 ``.metadata`` 与本地 ``COMMIT``，
+    然后调用 :func:`storage.local_load.load_local` 按索引里的 CRC 块校验。
     """
-    version = open_object_version(storage, step)
-    if io_concurrency < 1:
-        raise ValueError(f"io_concurrency must be >= 1, got {io_concurrency}")
-
-    staging_root = tempfile.mkdtemp(prefix="shardckpt-", dir=local_staging_dir)
-    try:
-        version_dir = Path(staging_root) / version_prefix(version.step)
-        version_dir.mkdir(parents=True, exist_ok=True)
-        files = _version_files(version.index)
-        sizes = _download_files(
-            storage,
-            version,
-            files,
-            version_dir,
-            io_concurrency=io_concurrency,
-        )
-
-        local = LocalStorage(staging_root)
-        metadata = write_metadata(local, version.step, version.index)
-        write_commit(
-            local,
-            CommitRecord.of_metadata(
-                step=version.step,
-                metadata=metadata,
-                files=sizes,
-            ),
-        )
-
-        report: LoadReport = load_local(
-            staging_root,
-            step=version.step,
-            device=device,
-            tp=tp,
-            tp_rank=tp_rank,
-            shard_dims=shard_dims,
-            verify_crc=verify_crc,
-            crc_padding=crc_padding,
-            crc_padding_ratio=crc_padding_ratio,
-            budget_bytes=budget_bytes,
-            column_strategy=column_strategy,
-        )
-        return ObjectLoadReport(
-            step=report.step,
-            device=report.device,
-            tensors=report.tensors,
-            blobs=report.blobs,
-            index=report.index,
-            requests=report.requests,
-            windows=report.windows,
-            read_bytes=report.read_bytes,
-            copied_bytes=report.copied_bytes,
-            h2d_bytes=report.h2d_bytes,
-            download_bytes=sum(sizes.values()),
-            local_staging=staging_root,
-            crc_verified=report.crc_verified,
-            verified_blocks=report.verified_blocks,
-            io_requests=report.io_requests,
-            unverified=report.unverified,
-            unverified_bytes=report.unverified_bytes,
-        )
-    finally:
-        shutil.rmtree(staging_root, ignore_errors=True)
+    return load_checkpoint_version(
+        storage,
+        local_root=None,
+        step=step,
+        device=device,
+        tp=tp,
+        tp_rank=tp_rank,
+        shard_dims=shard_dims,
+        budget_bytes=budget_bytes,
+        column_strategy=column_strategy,
+        verify_crc=verify_crc,
+        crc_padding=crc_padding,
+        crc_padding_ratio=crc_padding_ratio,
+        io_concurrency=io_concurrency,
+        local_staging_dir=local_staging_dir,
+        prefer_local=False,
+        skip_corrupt_status=skip_corrupt_status,
+        allow_fallback=allow_fallback,
+        collective=collective,
+        world_size=world_size,
+        download_retries=download_retries,
+        download_backoff=download_backoff,
+        run_id=run_id,
+        source_run_id=source_run_id,
+        promote_tails=promote_tails,
+    )
 
 
 # --- 恢复：本地热副本优先，缺了再下载 --------------------------------------
@@ -944,6 +1390,7 @@ class LocalCopyCheck:
     step: int | None
     usable: bool
     reason: str
+    corrupted: bool = False
 
     def __bool__(self) -> bool:
         return self.usable
@@ -958,44 +1405,66 @@ def check_local_copy(
     tp_rank: int = 0,
     shard_dims: Mapping[str, int] | None = None,
     column_strategy: str = "whole",
+    target_generation: str | None = None,
+    skip_corrupt_status: bool = False,
+    run_id: str | None = None,
 ) -> LocalCopyCheck:
     """判断本地是否留着一份「可以直接读」的热副本。
 
-    两个条件缺一不可：
-
-    1. **远端有这一代（同一 step）的版本 ``COMMIT``（L3）**：本地这份不是唯一副本，
-       读它是安全的，删了也能重下；
-    2. **本地 ``step_N/`` 带 ``COMMIT`` 且索引覆盖请求的布局**：多 rank 时每个 rank
-       的本地目录只有自己的分片，覆盖不全就必须回落下载。
-
-    这只是**判定**，不读数据、不校验 CRC。CRC 是 :func:`storage.local_load.load_local`
-    在读的时候做的 —— 本地介质真坏了应该报 :class:`core.ChecksumError`，而不是悄悄
-    重下掩盖问题；要强制走下载传 ``prefer_local=False``。
-
-    ``step=None`` 取远端最新的已提交版本。读远端 L3 失败（``StorageError``）会往上抛：
-    远端不可达时下载同样不可用，这里不把它伪装成「本地没有热副本」。
+    条件：
+    1. 远端有这一代（同一 step）的 ``STATUS.committed``；
+    2. 本地 ``step_N/`` 带 ``COMMIT`` 与 ``GENERATION`` 代际标记文件，且与目标代际一致（R6）；
+    3. 本地索引完整且覆盖请求的布局。
     """
     if local_root is None or remote is None:
         return LocalCopyCheck(step, False, NO_LOCAL_COPY)
 
-    target = step if step is not None else latest_remote_step(remote)
-    if target is None:
-        # 远端一个已提交版本都没有：调用方的下一步（下载）会给出同样的错误。
-        return LocalCopyCheck(None, False, REMOTE_NOT_COMMITTED)
+    scoped_remote = run_scope(remote, run_id)
+    local_dir = local_run_root(local_root, run_id)
 
-    local = LocalStorage(local_root, direct_io=False)
-    if read_commit(local, target) is None:
+    if target_generation is None:
+        # 兼容单 rank 直接调 local_copy_available 而不传 target_generation 的情况
+        if step is None:
+            target = latest_remote_step(
+                scoped_remote, skip_corrupt_status=skip_corrupt_status
+            )
+            if target is None:
+                return LocalCopyCheck(None, False, REMOTE_NOT_COMMITTED)
+        else:
+            target = step
+        status = read_status(scoped_remote, target)
+        if status is None or status.committed is None:
+            return LocalCopyCheck(target, False, REMOTE_NOT_COMMITTED)
+        target_generation = status.committed.generation.id
+    else:
+        if step is None:
+            raise ValueError("target_generation requires explicit step")
+        target = step
+
+    local = LocalStorage(local_dir, direct_io=False)
+    try:
+        commit_record = read_commit(local, target)
+    except FormatError:
+        return LocalCopyCheck(target, False, PARTIAL_LOCAL_COPY, corrupted=True)
+    if commit_record is None:
         return LocalCopyCheck(target, False, NO_LOCAL_COPY)
-    status = read_status(remote, target)
-    if status is None or status.committed is None:
-        return LocalCopyCheck(target, False, REMOTE_NOT_COMMITTED)
+
+    # R6：纯本地比对代际标记文件
+    try:
+        marker = read_local_generation(local, target)
+    except FormatError:
+        return LocalCopyCheck(target, False, PARTIAL_LOCAL_COPY, corrupted=True)
+    if marker is None or marker.generation != target_generation:
+        return LocalCopyCheck(target, False, GENERATION_MISMATCH)
+    if run_id is not None and marker.run_id not in (None, run_id):
+        return LocalCopyCheck(target, False, GENERATION_MISMATCH)
 
     try:
         version = recover_version(local, target)
-    except (FormatError, PlanError):
-        # 本地这个版本读不出来（索引缺/坏、COMMIT 对不上、只有本 rank 的分片所以
-        # 全局覆盖校验不通过）：远端有完整版本，回落到下载。
-        return LocalCopyCheck(target, False, PARTIAL_LOCAL_COPY)
+    except (FormatError, ChecksumError, StorageError, OSError):
+        return LocalCopyCheck(target, False, PARTIAL_LOCAL_COPY, corrupted=True)
+    except PlanError:
+        return LocalCopyCheck(target, False, PARTIAL_LOCAL_COPY, corrupted=False)
 
     targets = targets_for_layout(
         version.index, tp=tp, tp_rank=tp_rank, shard_dims=shard_dims
@@ -1004,8 +1473,190 @@ def check_local_copy(
         version.index, targets, strict=False, column_strategy=column_strategy
     )
     if cover.missing or cover.incomplete:
-        return LocalCopyCheck(target, False, PARTIAL_LOCAL_COPY)
+        return LocalCopyCheck(target, False, PARTIAL_LOCAL_COPY, corrupted=False)
     return LocalCopyCheck(target, True, REUSABLE)
+
+
+def _normalize_collective(
+    collective: Collective | None, world_size: int | None
+) -> Collective:
+    if collective is None:
+        if world_size is not None and world_size > 1:
+            raise ValueError(
+                f"world_size={world_size} 但没注入 collective：多 rank 恢复必须走集群通信选版与复核"
+            )
+        return SingleRankCollective()
+    if world_size is not None and world_size != collective.world_size:
+        raise ValueError(
+            f"声明的 world_size={world_size} 与 collective.world_size={collective.world_size} 不一致"
+        )
+    return collective
+
+
+def _classify_load_error(exc: BaseException) -> int:
+    """将恢复失败编码为 R13 全归约状态码：1=版本自身损坏可回退，2=不可回退致命错误。"""
+    if isinstance(
+        exc,
+        (
+            InvalidTargetError,
+            ValueError,
+            TypeError,
+            ConditionalWritesDisabled,
+            UnsupportedConditionalWrites,
+        ),
+    ):
+        return LOAD_FATAL
+    if isinstance(exc, (FormatError, ChecksumError, PlanError, ObjectNotFoundError)):
+        return LOAD_VERSION_CORRUPT
+    return LOAD_FATAL
+
+
+def _discover_candidates_rank0(
+    remote: StorageBackend,
+    *,
+    step: int | None,
+    skip_corrupt_status: bool,
+    promote_tails: bool,
+    run_id: str | None,
+) -> dict[str, Any]:
+    """rank 0 唯一探查远端：可选提升尾巴 → 生成候选 ``(step, gen)`` 倒序列表。"""
+    try:
+        scoped = run_scope(remote, run_id)
+        if promote_tails:
+            promote_remote_tails(scoped)
+        if step is not None:
+            # 精确指定 step：严格模式，不跳过坏 STATUS，不回退
+            status = read_status(scoped, step)
+            if status is None or status.committed is None:
+                raise FormatError(
+                    f"{version_prefix(step)}: STATUS missing or uncommitted, "
+                    "this version is not recoverable"
+                )
+            commit = UploadCommit.from_committed(status.committed)
+            return {
+                "candidates": [(step, commit.generation)],
+                "skipped": [],
+                "error": None,
+            }
+
+        candidates, skipped = list_remote_candidates(
+            scoped, skip_corrupt_status=skip_corrupt_status
+        )
+        if not candidates:
+            raise FormatError(
+                f"no committed checkpoint found under {scoped!r}: "
+                "只有 STATUS.committed 非空的版本才算可恢复"
+            )
+        return {
+            "candidates": candidates,
+            "skipped": list(skipped),
+            "error": None,
+        }
+    except BaseException as exc:
+        return {"candidates": [], "skipped": [], "error": exc}
+
+
+def _try_local_hot_copy(
+    local_root: str | Path | None,
+    remote: StorageBackend,
+    *,
+    target_step: int,
+    target_gen: str,
+    run_id: str | None,
+    device: "str | Device",
+    tp: int,
+    tp_rank: int,
+    shard_dims: Mapping[str, int] | None,
+    budget_bytes: int,
+    column_strategy: str,
+    verify_crc: bool,
+    crc_padding: str,
+    crc_padding_ratio: float,
+    fallback_on_local_error: bool,
+) -> tuple[ObjectLoadReport | None, str | None]:
+    """纯本地比对热副本并尝试加载；返回 ``(report, local_fallback_reason)``。"""
+    if local_root is None:
+        return None, None
+
+    local_dir = local_run_root(local_root, run_id)
+    check = check_local_copy(
+        local_root,
+        remote,
+        step=target_step,
+        tp=tp,
+        tp_rank=tp_rank,
+        shard_dims=shard_dims,
+        column_strategy=column_strategy,
+        target_generation=target_gen,
+        run_id=run_id,
+    )
+    if not check.usable:
+        if check.corrupted:
+            msg = (
+                f"step_{target_step}: 本地热副本损坏（{check.reason}），"
+                + ("清理并回退远端下载" if fallback_on_local_error else "禁止回退")
+            )
+            logger.warning(msg)
+            warnings.warn(msg, RuntimeWarning, stacklevel=3)
+            if not fallback_on_local_error:
+                raise FormatError(msg)
+            _delete_corrupt_local_dir(local_dir, target_step)
+            return None, f"local_corrupted: {check.reason}"
+        return None, check.reason
+
+    try:
+        report = load_local(
+            local_dir,
+            step=target_step,
+            device=device,
+            tp=tp,
+            tp_rank=tp_rank,
+            shard_dims=shard_dims,
+            verify_crc=verify_crc,
+            crc_padding=crc_padding,
+            crc_padding_ratio=crc_padding_ratio,
+            budget_bytes=budget_bytes,
+            column_strategy=column_strategy,
+        )
+    except (InvalidTargetError, ValueError):
+        raise
+    except (ChecksumError, FormatError, StorageError, OSError) as exc:
+        msg = (
+            f"step_{target_step}: 读取本地热副本失败（{type(exc).__name__}: {exc}），"
+            + ("清理并回退远端下载" if fallback_on_local_error else "禁止回退")
+        )
+        logger.warning(msg)
+        warnings.warn(msg, RuntimeWarning, stacklevel=3)
+        if not fallback_on_local_error:
+            raise
+        _delete_corrupt_local_dir(local_dir, target_step)
+        return None, f"local_corrupted: {type(exc).__name__}: {exc}"
+
+    return (
+        ObjectLoadReport(
+            step=report.step,
+            device=report.device,
+            tensors=report.tensors,
+            blobs=report.blobs,
+            index=report.index,
+            requests=report.requests,
+            windows=report.windows,
+            read_bytes=report.read_bytes,
+            copied_bytes=report.copied_bytes,
+            h2d_bytes=report.h2d_bytes,
+            download_bytes=0,
+            local_staging=None,
+            crc_verified=report.crc_verified,
+            verified_blocks=report.verified_blocks,
+            io_requests=report.io_requests,
+            unverified=report.unverified,
+            unverified_bytes=report.unverified_bytes,
+            source=SOURCE_LOCAL,
+            generation=target_gen,
+            run_id=run_id,
+        ),
+        None,
+    )
 
 
 def load_checkpoint_version(
@@ -1025,80 +1676,142 @@ def load_checkpoint_version(
     io_concurrency: int = 1,
     local_staging_dir: str | Path | None = None,
     prefer_local: bool = True,
+    fallback_on_local_error: bool = True,
+    skip_corrupt_status: bool = False,
+    allow_fallback: bool = False,
+    collective: Collective | None = None,
+    world_size: int | None = None,
+    download_retries: int = DEFAULT_DOWNLOAD_RETRIES,
+    download_backoff: float = DEFAULT_DOWNLOAD_BACKOFF,
+    run_id: str | None = None,
+    source_run_id: str | None = None,
+    promote_tails: bool = False,
 ) -> ObjectLoadReport:
-    """恢复一个版本：**本地热副本优先**，本地不满足条件再走下载。
+    """统一的集群/单机恢复闭环（R5 + R6 + R7 + R8 + R9 + R13 + R14 + C4）。
 
-    ``local_root`` 是本地层 root（``step_N/`` 的父目录）。判定见
-    :func:`check_local_copy`：远端有这一代的版本 ``COMMIT`` + 本地目录带 ``COMMIT``
-    + 本地索引覆盖请求的布局，三者齐了就直接读本地（``report.source == "local"``、
-    ``download_bytes == 0``）；否则与 :func:`load_object_version` 完全一样地下载。
+    三步闭环（单 rank 经 ``SingleRankCollective`` 走同一条代码路径）：
 
-    ``prefer_local=False`` 强制走下载。``local_root=None`` 等价于旧的
-    ``load_object_version``：只从对象存储恢复。
+    1. **选版对齐**：仅 rank 0 探查远端（可选尾巴提升），生成候选 ``(step, gen)``
+       倒序列表并 ``broadcast_object`` 给全体；非 0 rank 不主动探查远端。
+    2. **热副本比对与加载**：各 rank 用锁定代际做纯本地 ``GENERATION`` 比对；本地命中
+       且健康直接零下载读取，本地损坏默认告警清理并回退远端下载。
+    3. **全归约复核与统一回退**：全员编码 ``0(OK) / 1(版本坏) / 2(致命错)`` 并做一次
+       ``all_reduce(MAX)`` —— 全员放行、全员报错、或（显式开启且未指定 step 时）
+       全员统一回退到下一个候选版本。
     """
-    if prefer_local:
-        check = check_local_copy(
-            local_root,
+    peer = _normalize_collective(collective, world_size)
+    effective_run_id = source_run_id if source_run_id is not None else run_id
+    if effective_run_id is not None:
+        validate_run_id(effective_run_id)
+    if run_id is not None:
+        validate_run_id(run_id)
+
+    # 第 1 步：选版广播（只有 rank 0 探查远端）
+    discovery = (
+        _discover_candidates_rank0(
             storage,
             step=step,
-            tp=tp,
-            tp_rank=tp_rank,
-            shard_dims=shard_dims,
-            column_strategy=column_strategy,
+            skip_corrupt_status=skip_corrupt_status,
+            promote_tails=promote_tails,
+            run_id=effective_run_id,
         )
-        if check.usable and check.step is not None and local_root is not None:
-            report = load_local(
-                local_root,
-                step=check.step,
-                device=device,
-                tp=tp,
-                tp_rank=tp_rank,
-                shard_dims=shard_dims,
-                verify_crc=verify_crc,
-                crc_padding=crc_padding,
-                crc_padding_ratio=crc_padding_ratio,
-                budget_bytes=budget_bytes,
-                column_strategy=column_strategy,
-            )
-            return ObjectLoadReport(
-                step=report.step,
-                device=report.device,
-                tensors=report.tensors,
-                blobs=report.blobs,
-                index=report.index,
-                requests=report.requests,
-                windows=report.windows,
-                read_bytes=report.read_bytes,
-                copied_bytes=report.copied_bytes,
-                h2d_bytes=report.h2d_bytes,
-                download_bytes=0,
-                local_staging=None,
-                crc_verified=report.crc_verified,
-                verified_blocks=report.verified_blocks,
-                io_requests=report.io_requests,
-                unverified=report.unverified,
-                unverified_bytes=report.unverified_bytes,
-                source=SOURCE_LOCAL,
+        if peer.rank == 0
+        else None
+    )
+    discovery = peer.broadcast_object(discovery, root=0)
+    if discovery["error"] is not None:
+        raise discovery["error"]
+
+    candidates: list[tuple[int, str]] = list(discovery["candidates"])
+    skipped_versions: list[tuple[int, str]] = list(discovery["skipped"])
+
+    # 第 2 步 & 第 3 步：尝试候选版本 → 加载后 0/1/2 全归约复核 → 统一回退或退出
+    for idx, (cand_step, cand_gen) in enumerate(candidates):
+        report: ObjectLoadReport | None = None
+        local_exc: BaseException | None = None
+        local_code = LOAD_OK
+        try:
+            fallback_reason: str | None = None
+            if prefer_local and local_root is not None:
+                report, fallback_reason = _try_local_hot_copy(
+                    local_root,
+                    storage,
+                    target_step=cand_step,
+                    target_gen=cand_gen,
+                    run_id=effective_run_id,
+                    device=device,
+                    tp=tp,
+                    tp_rank=tp_rank,
+                    shard_dims=shard_dims,
+                    budget_bytes=budget_bytes,
+                    column_strategy=column_strategy,
+                    verify_crc=verify_crc,
+                    crc_padding=crc_padding,
+                    crc_padding_ratio=crc_padding_ratio,
+                    fallback_on_local_error=fallback_on_local_error,
+                )
+            if report is None:
+                report = _load_remote_version(
+                    storage,
+                    step=cand_step,
+                    expected_generation=cand_gen,
+                    device=device,
+                    tp=tp,
+                    tp_rank=tp_rank,
+                    shard_dims=shard_dims,
+                    budget_bytes=budget_bytes,
+                    column_strategy=column_strategy,
+                    verify_crc=verify_crc,
+                    crc_padding=crc_padding,
+                    crc_padding_ratio=crc_padding_ratio,
+                    io_concurrency=io_concurrency,
+                    local_staging_dir=local_staging_dir,
+                    download_retries=download_retries,
+                    download_backoff=download_backoff,
+                    run_id=effective_run_id,
+                )
+                if fallback_reason is not None:
+                    report = replace(report, local_fallback_reason=fallback_reason)
+        except BaseException as exc:
+            local_exc = exc
+            if not fallback_on_local_error and "本地热副本" in str(exc):
+                local_code = LOAD_FATAL
+            else:
+                local_code = _classify_load_error(exc)
+
+        global_code = int(peer.all_reduce_max_int64([local_code])[0])
+
+        if global_code == LOAD_OK:
+            assert report is not None
+            return replace(report, skipped_versions=tuple(skipped_versions))
+
+        if global_code == LOAD_FATAL:
+            if local_exc is not None:
+                raise local_exc
+            raise StorageError(
+                f"step_{cand_step} ({cand_gen}): 其他 rank 遇到不可回退的致命恢复错误"
             )
 
-    return replace(
-        load_object_version(
-            storage,
-            step=step,
-            device=device,
-            tp=tp,
-            tp_rank=tp_rank,
-            shard_dims=shard_dims,
-            budget_bytes=budget_bytes,
-            column_strategy=column_strategy,
-            verify_crc=verify_crc,
-            crc_padding=crc_padding,
-            crc_padding_ratio=crc_padding_ratio,
-            io_concurrency=io_concurrency,
-            local_staging_dir=local_staging_dir,
-        ),
-        source=SOURCE_OBJECT,
-    )
+        # global_code == LOAD_VERSION_CORRUPT
+        has_next = idx + 1 < len(candidates)
+        if allow_fallback and step is None and has_next:
+            reason = (
+                f"{type(local_exc).__name__}: {local_exc}"
+                if local_exc is not None
+                else "peer rank failed version integrity check"
+            )
+            skipped_versions.append((cand_step, reason))
+            # 释放成功 rank 已加载的张量视图引用后再切到下一个候选版本
+            report = None
+            continue
+
+        if local_exc is not None:
+            raise local_exc
+        raise FormatError(
+            f"step_{cand_step} ({cand_gen}): 其他 rank 检测到版本损坏，全员一致放弃恢复"
+        )
+
+    raise FormatError("no recoverable checkpoint candidate found")
 
 
 def _version_files(index: CheckpointIndex) -> list[str]:
@@ -1110,6 +1823,47 @@ def _version_files(index: CheckpointIndex) -> list[str]:
     return sorted(files)
 
 
+def _download_single_file(
+    storage: StorageBackend,
+    version: ObjectVersion,
+    name: str,
+    target: Path,
+    *,
+    expected_size: int | None,
+    retries: int,
+    backoff: float,
+) -> int:
+    """下载单个远端数据文件：临时文件落盘 + R1 大小核对 + R2 有限次指数退避重试。"""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    object_name = version.file_key(name)
+    size_attempts = 0
+    attempt = 0
+    while True:
+        tmp_path = target.parent / f".{target.name}.dl.{uuid.uuid4().hex}"
+        try:
+            measured = storage.download(object_name, tmp_path)
+            actual = tmp_path.stat().st_size if tmp_path.exists() else measured
+            if expected_size is not None and actual != expected_size:
+                tmp_path.unlink(missing_ok=True)
+                if size_attempts < 1:
+                    size_attempts += 1
+                    continue
+                raise FormatError(
+                    f"{object_name}: downloaded {actual} bytes, "
+                    f"rank COMMIT expects {expected_size}"
+                )
+            os.replace(tmp_path, target)
+            return actual
+        except BaseException as exc:
+            tmp_path.unlink(missing_ok=True)
+            if attempt < retries and is_retryable_storage_error(exc):
+                if backoff > 0:
+                    time.sleep(backoff * (2**attempt))
+                attempt += 1
+                continue
+            raise
+
+
 def _download_files(
     storage: StorageBackend,
     version: ObjectVersion,
@@ -1117,23 +1871,56 @@ def _download_files(
     version_dir: Path,
     *,
     io_concurrency: int,
+    retries: int = DEFAULT_DOWNLOAD_RETRIES,
+    backoff: float = DEFAULT_DOWNLOAD_BACKOFF,
 ) -> dict[str, int]:
-    """把版本数据文件下载到本地目录，返回「文件 -> 字节数」。"""
+    """把版本数据文件下载到本地目录，返回「文件 -> 字节数」。
+
+    R2：单文件重试不连累已成功的并发文件；遇不可重试错误整批快速失败。
+    """
 
     def fetch(name: str) -> tuple[str, int]:
         target = version_dir / name
-        size = storage.download(version.file_key(name), target)
+        size = _download_single_file(
+            storage,
+            version,
+            name,
+            target,
+            expected_size=version.file_sizes.get(name),
+            retries=retries,
+            backoff=backoff,
+        )
         return name, size
 
-    if io_concurrency <= 1:
+    if io_concurrency <= 1 or len(files) <= 1:
         return dict(fetch(name) for name in files)
+
+    results: dict[str, int] = {}
     with ThreadPoolExecutor(max_workers=io_concurrency) as pool:
-        return dict(pool.map(fetch, files))
+        future_to_name = {pool.submit(fetch, name): name for name in files}
+        pending = set(future_to_name)
+        while pending:
+            done, pending = wait(pending, return_when=FIRST_EXCEPTION)
+            for fut in done:
+                exc = fut.exception()
+                if exc is not None:
+                    for p in pending:
+                        p.cancel()
+                    raise exc
+                name, size = fut.result()
+                results[name] = size
+    return results
 
 
 __all__ = [
     "DEFAULT_BUDGET_BYTES",
+    "DEFAULT_DOWNLOAD_BACKOFF",
+    "DEFAULT_DOWNLOAD_RETRIES",
     "DEFAULT_KEEP_VERSIONS",
+    "GENERATION_MISMATCH",
+    "LOAD_FATAL",
+    "LOAD_OK",
+    "LOAD_VERSION_CORRUPT",
     "LocalCopyCheck",
     "NO_LOCAL_COPY",
     "ObjectLoadReport",
@@ -1145,17 +1932,23 @@ __all__ = [
     "REUSABLE",
     "SOURCE_LOCAL",
     "SOURCE_OBJECT",
+    "STAGING_DIR_PREFIX",
+    "STAGING_LOCK_FILE",
     "UploadCommit",
     "check_local_copy",
+    "cleanup_stale_staging_dirs",
     "committed_remote_steps",
     "data_key",
     "finalize_upload",
     "generation_prefix",
     "index_key",
     "latest_remote_step",
+    "list_remote_candidates",
     "load_checkpoint_version",
     "load_object_version",
+    "local_run_root",
     "open_object_version",
+    "promote_remote_tails",
     "rank_commit_key",
     "rank_prefix",
     "status_key",

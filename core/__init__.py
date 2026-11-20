@@ -22,6 +22,10 @@ class MissingTensorError(CheckpointError):
 class ChecksumError(CheckpointError):
     """数据与 manifest 记录的 CRC32 不一致。"""
 
+    def __init__(self, message: str = "", *, file: str | None = None) -> None:
+        super().__init__(message)
+        self.file = file
+
 
 class UnsupportedDeviceError(CheckpointError):
     """设备没有可用的 backend（例如请求了 cuda 但既无 GPU 也无 mock）。"""
@@ -29,6 +33,10 @@ class UnsupportedDeviceError(CheckpointError):
 
 class PlanError(CheckpointError):
     """读写计划不自洽：分片重叠、覆盖不全、越界、布局与索引对不上。"""
+
+
+class InvalidTargetError(PlanError):
+    """调用方传入的目标恢复布局非法（如未知张量或越界维度，不可通过回退版本修复）。"""
 
 
 class PoolError(CheckpointError):
@@ -43,6 +51,7 @@ __all__ = [
     "CheckpointError",
     "ChecksumError",
     "FormatError",
+    "InvalidTargetError",
     "MissingTensorError",
     "PlanError",
     "PoolError",

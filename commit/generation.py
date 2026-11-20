@@ -331,19 +331,10 @@ def read_status(storage: StorageBackend, step: int) -> StepStatus | None:
     """读 ``step_N/STATUS``；不存在返回 ``None``（不是「拿着旧代继续」，由调用方裁决）。"""
     key = status_key(step)
     try:
-        payload = storage.read(key)
+        payload, meta = storage.read_with_meta(key)
     except ObjectNotFoundError:
         return None
-    etag = _etag_of(storage, key)
-    return StepStatus.loads(payload.decode("utf-8"), etag=etag)
-
-
-def _etag_of(storage: StorageBackend, key: str) -> str:
-    head = getattr(storage, "head", None)
-    if not callable(head):  # pragma: no cover - 只读兜底；写路径在 write_status 里拒绝无 ETag
-        return ""
-    meta = head(key)
-    return "" if meta is None else meta.etag
+    return StepStatus.loads(payload.decode("utf-8"), etag=meta.etag)
 
 
 def write_status(
@@ -510,6 +501,28 @@ def as_generation(spec: "Generation | str | None", *, step: int) -> "Generation 
     return Generation.parse(spec, step=step)
 
 
+_RUN_SEQ_RE = re.compile(r"^run_(\d+)(?:-[0-9a-z]+)?$")
+
+
+def new_run_id(seq: int = 1, *, token: str | None = None) -> str:
+    """生成一个可读的训练轮次标识（如 ``run_0001`` 或 ``run_0001-1f3a9c2b``）。"""
+    if seq < 1:
+        raise ValueError(f"run seq must be >= 1, got {seq}")
+    base = f"run_{seq:04d}"
+    return f"{base}-{token}" if token else base
+
+
+def next_run_id(storage: StorageBackend, *, with_token: bool = False) -> str:
+    """扫描远端已有 ``run_NNNN*`` 前缀，返回严格递增的下一个轮次标识。"""
+    best = 0
+    for key in storage.list(""):
+        head = key.split("/", 1)[0]
+        match = _RUN_SEQ_RE.match(head)
+        if match:
+            best = max(best, int(match.group(1)))
+    return new_run_id(best + 1, token=new_writer() if with_token else None)
+
+
 __all__ = [
     "CommittedState",
     "DEFAULT_ACQUIRE_RETRIES",
@@ -521,7 +534,9 @@ __all__ = [
     "acquire_generation",
     "as_generation",
     "commit_status",
+    "new_run_id",
     "new_writer",
+    "next_run_id",
     "next_seq",
     "read_status",
     "resolve_generation",

@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import enum
 from dataclasses import dataclass, field
-from typing import Callable, Protocol
+from typing import Callable, Protocol, Sequence
 
 from core import CheckpointError
 
@@ -244,6 +244,8 @@ class Trigger:
     decision: TriggerDecision
     snapshot: Snapshot | None = None
     reason: str = ""
+    reduced_extra: tuple[int, ...] = ()
+    """搭便车全归约的附加整型输出（C1，长度与 ``trigger(..., extra_reduce=...)`` 一致）。"""
 
 
 @dataclass
@@ -342,9 +344,11 @@ class SnapshotManager:
         return self._active[0] if self._active else None
 
     # --- 触发 ---------------------------------------------------------------
-    def trigger(self, step: int, nbytes: int = 0) -> Trigger:
+    def trigger(
+        self, step: int, nbytes: int = 0, *, extra_reduce: Sequence[int] = ()
+    ) -> Trigger:
         self._consume_pending_clear()
-        block, reported_by = self._resolve_block()
+        block, reported_by, reduced_extra = self._resolve_block(extra_reduce)
         decision = decide(
             block, streak=self.skipped_streak, force_after_skips=self.force_after_skips
         )
@@ -354,7 +358,11 @@ class SnapshotManager:
             else:
                 self._skipped_streak += 1
                 self.stats.skipped += 1
-            return Trigger(decision, reason=self._reason(block, reported_by))
+            return Trigger(
+                decision,
+                reason=self._reason(block, reported_by),
+                reduced_extra=reduced_extra,
+            )
 
         snapshot = Snapshot(
             step=step,
@@ -365,7 +373,11 @@ class SnapshotManager:
         )
         self._active.append(snapshot)
         self.stats.started += 1
-        return Trigger(TriggerDecision.START, snapshot=snapshot)
+        return Trigger(
+            TriggerDecision.START,
+            snapshot=snapshot,
+            reduced_extra=reduced_extra,
+        )
 
     # --- 内部 ---------------------------------------------------------------
     def _consume_pending_clear(self) -> None:
@@ -374,24 +386,29 @@ class SnapshotManager:
             self._skipped_streak = 0
             self._pending_clear = False
 
-    def _resolve_block(self) -> tuple[GateBlock, int]:
+    def _resolve_block(
+        self, extra_reduce: Sequence[int] = ()
+    ) -> tuple[GateBlock, int, tuple[int, ...]]:
         """本地原因 → 全局原因（AND 语义：任一 rank 阻塞即全体阻塞）。
 
-        返回 ``(全局原因, 报出最严重原因的那个 rank)``。归约失败直接抛错让全体放弃，
-        不降级成本地判据 —— 降级就是各 rank 重新走上不同分支。
+        可顺带把 ``extra_reduce`` 拼进同一条 ``all_reduce(MAX)``（C1 搭便车全归约）。
+        返回 ``(全局原因, 报出最严重原因的那个 rank, 归约后的 extra_reduce)``。
         """
         local = self._local_block()
+        extras = [int(value) for value in extra_reduce]
         if self._collective is None:
-            return local, self.rank
+            return local, self.rank, tuple(extras)
         packed = pack_block(local, rank=self.rank)
+        values = [packed, *extras]
         result = self._collective.all_reduce_max_int64(
-            [packed], timeout=self.collective_timeout
+            values, timeout=self.collective_timeout
         )
-        if len(result) != 1:
+        if len(result) != len(values):
             raise SnapshotError(
-                f"门闸归约返回 {len(result)} 个值，期望 1 个（检查 collective 实现）"
+                f"门闸归约返回 {len(result)} 个值，期望 {len(values)} 个（检查 collective 实现）"
             )
-        return unpack_block(int(result[0]))
+        block, reported_by = unpack_block(int(result[0]))
+        return block, reported_by, tuple(int(v) for v in result[1:])
 
     def _local_block(self) -> GateBlock:
         if len(self._active) >= self.max_inflight:

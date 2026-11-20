@@ -28,8 +28,11 @@ STEP = 1
 
 
 def blobs_for(rank: int) -> dict[str, bytes]:
-    """每个 rank 自己的小状态（RNG 位置不同，正好验证按 rank 落盘）。"""
-    return {f"rng/rank_{rank}": bytes([rank]) * 16, "lr_scheduler": b"L" * 32}
+    """每个 rank 自己的小状态（RNG 位置不同），全局小状态仅由 rank 0 写。"""
+    blobs = {f"rng/rank_{rank}": bytes([rank]) * 16}
+    if rank == 0:
+        blobs["lr_scheduler"] = b"L" * 32
+    return blobs
 
 
 def save_all_ranks(

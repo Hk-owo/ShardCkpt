@@ -28,6 +28,7 @@ import sys
 import threading
 import uuid
 import zlib
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Iterator
 from urllib.parse import parse_qs, unquote, urlparse
@@ -78,6 +79,8 @@ class ObjectStore:
         self.objects: dict[str, bytes] = {}
         # upload_id -> {part_number: bytes}，complete 后合成 objects 里的对象
         self.uploads: dict[str, dict[int, bytes]] = {}
+        # upload_id -> {"key": str, "initiated": datetime}
+        self.upload_meta: dict[str, dict[str, object]] = {}
         # (method, path, query) 的请求流水，测试用它断言走的是哪条路径
         self.requests: list[tuple[str, str, dict[str, str]]] = []
         # 测试注入：让 upload_part 返回 500，验证 abort 清理
@@ -98,6 +101,12 @@ class ObjectStore:
         # 测试注入：接下来 N 次 CompleteMultipartUpload 返回 409 ConditionalRequestConflict，
         # 且这次上传被服务端判死（客户端必须重新 CreateMultipartUpload）
         self.fail_complete_times = 0
+        # 测试注入：key -> [status_code, ...]（每次 GET 从队头弹出并返回对应 HTTP 错误，如 503）
+        self.fail_get_queue: dict[str, list[int]] = {}
+        # 测试注入：key -> N（接下来 N 次 GET 在响应体中间主动断开连接模拟断流）
+        self.drop_get_stream: dict[str, int] = {}
+        # 测试注入：key -> count（接下来 N 次 GET 在返回数据里翻 1 个 bit 且不改服务端数据）
+        self.corrupt_get_once: dict[str, int] = {}
 
 
 def _etag(payload: bytes) -> str:
@@ -179,8 +188,27 @@ def _make_handler(store: ObjectStore) -> type[BaseHTTPRequestHandler]:
             if "list-type" in query:
                 self._list(bucket, query.get("prefix", [""])[0])
                 return
+            if "uploads" in query:
+                self._list_uploads(bucket, query.get("prefix", [""])[0])
+                return
+            injected_status: int | None = None
+            drop_stream = False
+            corrupt_once = False
             with store.lock:
+                queue = store.fail_get_queue.get(key)
+                if queue:
+                    injected_status = queue.pop(0)
+                elif store.drop_get_stream.get(key, 0) > 0:
+                    store.drop_get_stream[key] -= 1
+                    drop_stream = True
+                elif store.corrupt_get_once.get(key, 0) > 0:
+                    store.corrupt_get_once[key] -= 1
+                    corrupt_once = True
                 payload = store.objects.get(key)
+            if injected_status is not None:
+                code = "ServiceUnavailable" if injected_status == 503 else "InjectedError"
+                self._error(injected_status, code, f"injected GET {injected_status}")
+                return
             if payload is None:
                 self._error(404, "NoSuchKey", key)
                 return
@@ -189,9 +217,24 @@ def _make_handler(store: ObjectStore) -> type[BaseHTTPRequestHandler]:
             if range_header:
                 self._send_range(payload, range_header)
                 return
+            if drop_stream:
+                half = max(1, len(payload) // 2)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload[:half])
+                self.wfile.flush()
+                self.close_connection = True
+                return
+            wire_payload = payload
+            if corrupt_once and len(payload) > 0:
+                mutated = bytearray(payload)
+                mutated[0] ^= 0xFF
+                wire_payload = bytes(mutated)
             self._send(
                 200,
-                payload,
+                wire_payload,
                 "application/octet-stream",
                 etag=_etag(payload),
                 extra_headers=self._checksum_response_headers(key),
@@ -228,7 +271,9 @@ def _make_handler(store: ObjectStore) -> type[BaseHTTPRequestHandler]:
             if "uploadId" in query:
                 # abort_multipart_upload
                 with store.lock:
-                    store.uploads.pop(query["uploadId"][0], None)
+                    uid = query["uploadId"][0]
+                    store.uploads.pop(uid, None)
+                    store.upload_meta.pop(uid, None)
                 self._send(204, b"")
                 return
             if_match = self.headers.get("If-Match")
@@ -298,6 +343,10 @@ def _make_handler(store: ObjectStore) -> type[BaseHTTPRequestHandler]:
             upload_id = uuid.uuid4().hex
             with store.lock:
                 store.uploads[upload_id] = {}
+                store.upload_meta[upload_id] = {
+                    "key": key,
+                    "initiated": datetime.now(timezone.utc),
+                }
             body = (
                 '<?xml version="1.0" encoding="UTF-8"?>'
                 "<InitiateMultipartUploadResult>"
@@ -372,6 +421,7 @@ def _make_handler(store: ObjectStore) -> type[BaseHTTPRequestHandler]:
                 with store.lock:
                     store.fail_complete_times -= 1
                     store.uploads.pop(upload_id, None)
+                    store.upload_meta.pop(upload_id, None)
                 self._error(409, "ConditionalRequestConflict", "injected conditional conflict")
                 return
 
@@ -382,10 +432,12 @@ def _make_handler(store: ObjectStore) -> type[BaseHTTPRequestHandler]:
             ):
                 with store.lock:
                     store.uploads.pop(upload_id, None)
+                    store.upload_meta.pop(upload_id, None)
                 return
 
             with store.lock:
                 parts = store.uploads.pop(upload_id, None)
+                store.upload_meta.pop(upload_id, None)
                 payload = b""
                 if parts is not None:
                     payload = b"".join(parts[n] for n in sorted(parts))
@@ -453,6 +505,38 @@ def _make_handler(store: ObjectStore) -> type[BaseHTTPRequestHandler]:
                     "</Contents>"
                 )
             body.append("</ListBucketResult>")
+            self._send(200, "".join(body).encode(), "application/xml")
+
+        def _list_uploads(self, bucket: str, prefix: str) -> None:
+            with store.lock:
+                entries = sorted(
+                    (
+                        str(meta["key"]),
+                        uid,
+                        meta["initiated"],
+                    )
+                    for uid, meta in store.upload_meta.items()
+                    if str(meta["key"]).startswith(prefix)
+                )
+            body = [
+                '<?xml version="1.0" encoding="UTF-8"?>',
+                '<ListMultipartUploadsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">',
+                f"<Bucket>{escape(bucket)}</Bucket>",
+                f"<Prefix>{escape(prefix)}</Prefix>",
+                "<MaxUploads>1000</MaxUploads>",
+                "<IsTruncated>false</IsTruncated>",
+            ]
+            for key, uid, initiated in entries:
+                assert isinstance(initiated, datetime)
+                iso = initiated.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+                body.append(
+                    "<Upload>"
+                    f"<Key>{escape(key)}</Key>"
+                    f"<UploadId>{escape(uid)}</UploadId>"
+                    f"<Initiated>{iso}</Initiated>"
+                    "</Upload>"
+                )
+            body.append("</ListMultipartUploadsResult>")
             self._send(200, "".join(body).encode(), "application/xml")
 
         def _error(self, status: int, code: str, message: str) -> None:

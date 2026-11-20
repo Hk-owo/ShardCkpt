@@ -60,8 +60,11 @@ def storage(s3_config) -> S3Storage:
 
 
 def blobs_for(rank: int) -> dict[str, bytes]:
-    """每个 rank 自己的小状态：RNG 位置不同，另有一个所有人相同的小状态。"""
-    return {f"rng/rank_{rank}": bytes([rank]) * 16, "lr_scheduler": b"L" * 32}
+    """每个 rank 自己的小状态：RNG 位置不同，全局小状态仅由 rank 0 写（R11）。"""
+    blobs = {f"rng/rank_{rank}": bytes([rank]) * 16}
+    if rank == 0:
+        blobs["lr_scheduler"] = b"L" * 32
+    return blobs
 
 
 def begin_version(s3_config: dict, *, step: int, ranks: list[int]) -> str:

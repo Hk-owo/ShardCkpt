@@ -42,13 +42,29 @@ from async_ import (
     register_backend,
     reset_registry,
 )
-from commit.generation import FencedError, Generation, acquire_generation, new_writer
+from commit.coordinator import (
+    CommitCoordinator,
+    CoordinatedSaveResult,
+    InflightStatus,
+    InvalidatedGeneration,
+)
+from commit.generation import (
+    FencedError,
+    Generation,
+    acquire_generation,
+    new_run_id,
+    new_writer,
+    next_run_id,
+)
 from commit.gc import (
+    AbortedUpload,
     DEFAULT_KEEP_LOCAL_VERSIONS,
     DEFAULT_KEEP_VERSIONS,
+    DEFAULT_MPU_TIMEOUT_SECONDS,
     GcReport,
     GcWorker,
     RetentionReport,
+    cleanup_stale_multipart_uploads,
     collect,
     delete_local_version,
     reclaim_stale_generations,
@@ -56,8 +72,10 @@ from commit.gc import (
 )
 from commit.local import (
     CommitRecord,
+    delete_local_generation,
     version_key,
     write_commit,
+    write_local_generation,
     write_metadata,
 )
 from core.index import BlobMeta, CheckpointIndex, ShardMeta, TensorMeta
@@ -69,11 +87,13 @@ from planner.save_plan import (
     build_save_plan,
     plan_ranks,
 )
+from storage.base import run_scope, validate_run_id
 from storage.local import DEFAULT_ALIGNMENT, LocalStorage
 from core import (
     CheckpointError,
     ChecksumError,
     FormatError,
+    InvalidTargetError,
     MissingTensorError,
     PlanError,
     UnsupportedDeviceError,
@@ -84,14 +104,20 @@ from storage.data import CheckpointData
 from storage.local_load import LoadReport, load_local
 from storage.upload import (
     DEFAULT_BUDGET_BYTES as DEFAULT_UPLOAD_BUDGET_BYTES,
+    DEFAULT_DOWNLOAD_BACKOFF,
+    DEFAULT_DOWNLOAD_RETRIES,
+    GENERATION_MISMATCH,
     LocalCopyCheck,
     ObjectLoadReport,
     ObjectVersion,
     UploadCommit,
     check_local_copy,
+    cleanup_stale_staging_dirs,
     finalize_upload as _finalize_upload,
     load_checkpoint_version,
     load_object_version,
+    local_run_root,
+    promote_remote_tails,
     upload_rank as _upload_rank,
 )
 
@@ -144,16 +170,34 @@ def load(
     )
 
 
+def _is_step_dir_name(name: str) -> bool:
+    if not name.startswith("step_"):
+        return False
+    suffix = name[len("step_") :]
+    return bool(suffix) and suffix.isdigit()
+
+
 def _is_version_dir(root: Path) -> bool:
     """本地版本目录：根目录本身就是 ``step_N``，或者根下有带 COMMIT 的 step 目录。"""
-    if (root / "COMMIT").is_file() or (root / ".metadata").is_file():
+    if (root / "COMMIT").is_file():
         return True
+    if (root / ".metadata").is_file():
+        raise FormatError(
+            f"{root.name}: COMMIT missing, this version is not recoverable"
+        )
     if not root.is_dir():
         return False
-    return any(
+    has_committed_child = any(
         child.is_dir() and (child / "COMMIT").is_file()
         for child in root.iterdir()
     )
+    if has_committed_child:
+        return True
+    if _is_step_dir_name(root.name):
+        raise FormatError(
+            f"{root.name}: COMMIT missing, this version is not recoverable"
+        )
+    return False
 
 
 def _resolve_version_root(root: Path) -> tuple[Path, int | None]:
@@ -367,56 +411,17 @@ def _clear_padding(plan: SavePlan, view: memoryview, end: int) -> None:
         view[cursor:end] = b"\x00" * (end - cursor)
 
 
-def save_local(
+def prepare_save_plan(
     tensors: Mapping[str, Tensor],
-    root: str | Path,
     *,
-    step: int,
     blobs: Mapping[str, bytes] | None = None,
-    layout: Mapping[str, int] | None = None,
     rank: int = 0,
     sources: list[ShardSource] | None = None,
     planner: str = "local",
     alignment: int = DEFAULT_ALIGNMENT,
-    engine: str = "auto",
-    direct_io: bool = True,
-    crc_chunk_max: int = CRC_CHUNK_MAX,
-    pool: PinnedBufferPool | None = None,
-    manager: SnapshotManager | None = None,
     collective: GateCollective | None = None,
-    world_size: int | None = None,
-) -> SaveReport:
-    """把一组 device 上的张量写成一份可恢复的本地 checkpoint（同步版本）。
-
-    顺序固定：plan → 取 pinned 块 → 按 ``item.byte_offset`` D2H → 写数据文件 →
-    写 ``.metadata`` → 写 ``COMMIT``，每一步都对应状态机的一条边。
-
-    ``tensors``: FQN -> ``Tensor``（真机在 GPU 上，mock 下是 host 内存）
-    ``blobs``:   小状态的**已序列化字节**（RNG / lr scheduler / dataloader 位置）
-    ``layout``:  写进索引的 ``saved_layout``，只用于诊断与快路径
-    ``planner``: ``"local"``（默认）每 rank 自己编计划；``"gathered"`` 先全员上报
-                 分片描述、由 rank 0 统一去重与分配、再 scatter 回各 rank。
-                 **两者的物理布局逐字段相同**，gathered 多出来的是写盘之前的跨 rank
-                 校验：``n_replicas`` 一致、``replica_index`` 铺满副本、全局覆盖完整。
-                 代价是每代一次 ``all_gather_objects`` + 一次 ``scatter_objects``。
-    ``crc_chunk_max``: CRC 块上限（默认 1 MiB）；块数由分片长度推导，不会截断
-    ``pool``:    pinned 块池；``None`` 时用进程级常驻池（``api.default_pool()``），
-                 同一份 checkpoint 反复保存时复用同一块，不再每次现造现弃。
-                 常驻池在每次租块前会 ``trim()`` 掉多余空闲块，稳态只占一块。
-    ``collective``: 多 rank 训练必须给（``dist.Collective`` 的任意实现）。门闸裁决由
-                 一次 ``all_reduce(MAX)`` 统一得出：任一 rank 拿不到 buffer，**全体**
-                 这一 step 都不写，不会出现「有的 rank 写、有的跳过」的残缺版本。
-                 通信世界的 rank / world_size 由 collective 自己给出。
-                 ``planner="gathered"`` 还要求它实现 ``all_gather_objects`` /
-                 ``scatter_objects``（``dist`` 的两个实现都满足）。
-    ``world_size``: 只用于**显式声明**参与通信的 rank 数；不填则按 collective 推导
-                 （没有 collective 即 1）。声明 > 1 却没给 collective 直接报错。
-    """
-    if manager is not None and collective is not None:
-        raise ValueError(
-            "manager 与 collective 只能给一个：collective 必须经 SnapshotManager 注入，"
-            "两者同时给会有一份被静默忽略"
-        )
+) -> tuple[SavePlan, int]:
+    """构造并校验保存计划，返回 ``(SavePlan, aligned_size)``。"""
     if planner not in PLANNER_MODES:
         raise ValueError(f"planner must be one of {PLANNER_MODES}, got {planner!r}")
     blob_payloads = dict(blobs or {})
@@ -444,31 +449,31 @@ def save_local(
     plan.validate()
     if plan.size == 0 and planner != "gathered":
         raise PlanError("保存计划是空的：没有分片也没有小状态")
-    # gathered 模式下空计划是**合法**的：本 rank 的分片全被去重跳过了（DP 副本里
-    # 必然有一半如此）。它仍然要参与门闸、写一份空索引与 COMMIT，这样「每个 rank
-    # 在 step_N 都有一个已提交版本」这条不变量对所有 rank 一致成立。
-
-    # O_DIRECT 要求长度对齐：文件按块边界补齐，读取端按索引里的 length 截断
     aligned_size = -(-plan.size // alignment) * alignment
+    return plan, aligned_size
 
-    if pool is None:
-        # 默认走进程级常驻池：同一份 checkpoint 反复保存时复用同一块（不再每次
-        # 「按整份大小现造、用完即弃」）。先把多出来的空闲块削掉，稳态只有一块。
-        pool = default_pool(alignment=alignment)
-        trim = getattr(pool, "trim", None)
-        if trim is not None:
-            trim(keep_bytes=aligned_size)
-    snapshot_manager = manager or SnapshotManager(
-        pool, collective=collective, world_size=world_size
-    )
 
-    reuses_before = _pool_reuses(pool)
-    trigger = snapshot_manager.trigger(step, nbytes=aligned_size)
-    if trigger.decision is not TriggerDecision.START or trigger.snapshot is None:
-        # 门闸裁决是全局统一的：这里抛错时其他 rank 也拿到同一个裁决，
-        # 于是这一 step 全体都不写，不会留下凑不齐分片的残缺版本。
-        raise PlanError(f"step {step}: 拿不到 pinned buffer（{trigger.reason}）")
-    snapshot: Snapshot = trigger.snapshot
+def persist_snapshot(
+    tensors: Mapping[str, Tensor],
+    root: str | Path,
+    *,
+    step: int,
+    plan: SavePlan,
+    aligned_size: int,
+    snapshot: Snapshot,
+    pool: PinnedBufferPool | Any,
+    blobs: Mapping[str, bytes] | None = None,
+    layout: Mapping[str, int] | None = None,
+    alignment: int = DEFAULT_ALIGNMENT,
+    engine: str = "auto",
+    direct_io: bool = True,
+    crc_chunk_max: int = CRC_CHUNK_MAX,
+    generation: "Generation | str | None" = None,
+    run_id: str | None = None,
+    reuses_before: int | None = None,
+) -> SaveReport:
+    """拿已触发的 ``Snapshot`` 完成 D2H → 数据落盘 → ``.metadata`` → 代际标记 → ``COMMIT``。"""
+    blob_payloads = dict(blobs or {})
     reuses_after = _pool_reuses(pool)
     pool_reused = (
         None
@@ -476,8 +481,14 @@ def save_local(
         else reuses_after > reuses_before
     )
 
-    storage = LocalStorage(root, direct_io=direct_io, alignment=alignment, engine=engine)
+    scoped_root = local_run_root(root, run_id)
+    storage = LocalStorage(
+        scoped_root, direct_io=direct_io, alignment=alignment, engine=engine
+    )
     key = version_key(step)
+    gen_id: str | None = None
+    if generation is not None:
+        gen_id = generation.id if isinstance(generation, Generation) else str(generation)
 
     try:
         d2h_bytes = 0
@@ -514,14 +525,8 @@ def save_local(
             layout=layout,
             crc_chunk_max=crc_chunk_max,
         )
-        # 单 rank 只看得到自己那片：`complete=False` 只做局部自检。全局覆盖由
-        # 「汇总/恢复的一方」负责——本地多 rank 汇总后，或对象存储恢复端合并索引后。
-        # 用 ``complete=True`` 会让任何带分片的保存（TP/ZeRO）直接 PlanError。
         index.validate(complete=False)
 
-        # 1) 数据文件：临时文件 -> fsync -> rename -> 目录 fsync
-        #    空计划（gathered 下全被去重跳过）不写数据文件，也不在 COMMIT 里记
-        #    任何文件 —— 只有空索引 + COMMIT 两层提交点。
         files: dict[str, int] = {}
         if aligned_size:
             storage.write_view(f"{key}/{plan.file}", view[:aligned_size])
@@ -532,11 +537,15 @@ def save_local(
                 )
             files[plan.file] = file_size
 
-        # 2) 索引，也兼作提交点之一
         metadata = write_metadata(storage, step, index)
         snapshot.persist_ok()  # 本 rank 的数据已落地
 
-        # 3) COMMIT：这一步之后这一版才可恢复（索引的长度 + CRC-32C 一起记下）
+        # R6/C2：同代落盘时同步写入本地代际标记；未指定代际的重存清理旧代际标记
+        if gen_id is not None:
+            write_local_generation(storage, step, gen_id, run_id=run_id)
+        else:
+            delete_local_generation(storage, step)
+
         record = CommitRecord.of_metadata(
             step=step,
             metadata=metadata,
@@ -545,14 +554,10 @@ def save_local(
         write_commit(storage, record)
         snapshot.commit_ok()
     except BaseException as exc:
-        # 状态机自己区分：还没写过文件 -> DROPPED；有残缺目录 -> ABORTED
         snapshot.fail(f"{type(exc).__name__}: {exc}")
         if snapshot.state is SnapshotState.ABORTED:
-            # 就地清掉残缺目录（先 COMMIT 再数据），然后把状态机的待清理标记结掉。
-            # 这样「本地无 COMMIT 的残目录」几乎只剩 SIGKILL 一种来源，定时 GC 只兜底。
-            # 清理失败不能掩盖原始异常。
             try:
-                delete_local_version(root, step)
+                delete_local_version(scoped_root, step)
                 snapshot.mark_cleaned()
             except Exception:  # pragma: no cover - 清理失败不掩盖原始异常
                 pass
@@ -573,6 +578,104 @@ def save_local(
     )
 
 
+def save_local(
+    tensors: Mapping[str, Tensor],
+    root: str | Path,
+    *,
+    step: int,
+    blobs: Mapping[str, bytes] | None = None,
+    layout: Mapping[str, int] | None = None,
+    rank: int = 0,
+    sources: list[ShardSource] | None = None,
+    planner: str = "local",
+    alignment: int = DEFAULT_ALIGNMENT,
+    engine: str = "auto",
+    direct_io: bool = True,
+    crc_chunk_max: int = CRC_CHUNK_MAX,
+    pool: PinnedBufferPool | None = None,
+    manager: SnapshotManager | None = None,
+    collective: GateCollective | None = None,
+    world_size: int | None = None,
+    generation: "Generation | str | None" = None,
+    run_id: str | None = None,
+) -> SaveReport:
+    """把一组 device 上的张量写成一份可恢复的本地 checkpoint（同步版本）。
+
+    顺序固定：plan → 取 pinned 块 → 按 ``item.byte_offset`` D2H → 写数据文件 →
+    写 ``.metadata`` → 写 ``COMMIT``，每一步都对应状态机的一条边。
+
+    ``tensors``: FQN -> ``Tensor``（真机在 GPU 上，mock 下是 host 内存）
+    ``blobs``:   小状态的**已序列化字节**（RNG / lr scheduler / dataloader 位置）
+    ``layout``:  写进索引的 ``saved_layout``，只用于诊断与快路径
+    ``planner``: ``"local"``（默认）每 rank 自己编计划；``"gathered"`` 先全员上报
+                 分片描述、由 rank 0 统一去重与分配、再 scatter 回各 rank。
+                 **两者的物理布局逐字段相同**，gathered 多出来的是写盘之前的跨 rank
+                 校验：``n_replicas`` 一致、``replica_index`` 铺满副本、全局覆盖完整。
+                 代价是每代一次 ``all_gather_objects`` + 一次 ``scatter_objects``。
+    ``crc_chunk_max``: CRC 块上限（默认 1 MiB）；块数由分片长度推导，不会截断
+    ``pool``:    pinned 块池；``None`` 时用进程级常驻池（``api.default_pool()``），
+                 同一份 checkpoint 反复保存时复用同一块，不再每次现造现弃。
+                 常驻池在每次租块前会 ``trim()`` 掉多余空闲块，稳态只占一块。
+    ``collective``: 多 rank 训练必须给（``dist.Collective`` 的任意实现）。门闸裁决由
+                 一次 ``all_reduce(MAX)`` 统一得出：任一 rank 拿不到 buffer，**全体**
+                 这一 step 都不写，不会出现「有的 rank 写、有的跳过」的残缺版本。
+                 通信世界的 rank / world_size 由 collective 自己给出。
+                 ``planner="gathered"`` 还要求它实现 ``all_gather_objects`` /
+                 ``scatter_objects``（``dist`` 的两个实现都满足）。
+    ``world_size``: 只用于**显式声明**参与通信的 rank 数；不填则按 collective 推导
+                 （没有 collective 即 1）。声明 > 1 却没给 collective 直接报错。
+    """
+    if manager is not None and collective is not None:
+        raise ValueError(
+            "manager 与 collective 只能给一个：collective 必须经 SnapshotManager 注入，"
+            "两者同时给会有一份被静默忽略"
+        )
+    if run_id is not None:
+        validate_run_id(run_id)
+    plan, aligned_size = prepare_save_plan(
+        tensors,
+        blobs=blobs,
+        rank=rank,
+        sources=sources,
+        planner=planner,
+        alignment=alignment,
+        collective=collective,
+    )
+
+    if pool is None:
+        pool = default_pool(alignment=alignment)
+        trim = getattr(pool, "trim", None)
+        if trim is not None:
+            trim(keep_bytes=aligned_size)
+    snapshot_manager = manager or SnapshotManager(
+        pool, collective=collective, world_size=world_size
+    )
+
+    reuses_before = _pool_reuses(pool)
+    trigger = snapshot_manager.trigger(step, nbytes=aligned_size)
+    if trigger.decision is not TriggerDecision.START or trigger.snapshot is None:
+        raise PlanError(f"step {step}: 拿不到 pinned buffer（{trigger.reason}）")
+
+    return persist_snapshot(
+        tensors,
+        root,
+        step=step,
+        plan=plan,
+        aligned_size=aligned_size,
+        snapshot=trigger.snapshot,
+        pool=pool,
+        blobs=blobs,
+        layout=layout,
+        alignment=alignment,
+        engine=engine,
+        direct_io=direct_io,
+        crc_chunk_max=crc_chunk_max,
+        generation=generation,
+        run_id=run_id,
+        reuses_before=reuses_before,
+    )
+
+
 # --- 对象存储上传（每 rank 独立上传，rank 0 只 list 检查） -------------------
 
 
@@ -583,6 +686,7 @@ def begin_upload(
     ranks: "list[int] | tuple[int, ...]",
     collective: "GateCollective | None" = None,
     writer: str | None = None,
+    run_id: str | None = None,
 ) -> Generation:
     """开一代（一次保存尝试）并把它广播给所有 rank。
 
@@ -598,12 +702,13 @@ def begin_upload(
     端点探针在这里跑一次（``S3Storage.ensure_conditional_writes``）：没有真正执行
     条件写的端点直接失败，不降级。
     """
-    ensure = getattr(storage, "ensure_conditional_writes", None)
+    scoped = run_scope(storage, run_id)
+    ensure = getattr(scoped, "ensure_conditional_writes", None)
     if callable(ensure):
         ensure()
     expected = tuple(int(rank) for rank in ranks)
     if collective is None or collective.world_size == 1:
-        return acquire_generation(storage, step, ranks=expected, writer=writer)
+        return acquire_generation(scoped, step, ranks=expected, writer=writer)
 
     if writer is not None and not _is_hex_writer(writer):
         raise ValueError(
@@ -611,7 +716,7 @@ def begin_upload(
         )
     if collective.rank == 0:
         mine = acquire_generation(
-            storage, step, ranks=expected, writer=writer or new_writer()
+            scoped, step, ranks=expected, writer=writer or new_writer()
         )
         seq, token = mine.seq, int(mine.writer, 16)
     else:
@@ -636,6 +741,7 @@ def upload_local(
     step: int,
     rank: int,
     generation: "Generation | str | None" = None,
+    run_id: str | None = None,
 ) -> int:
     """把本地 ``step_<step>`` 里**本 rank** 的产物上传到对象存储，返回上传字节数。
 
@@ -646,7 +752,9 @@ def upload_local(
     ``generation`` 省略时走单 rank 便利路径（复用现有 GEN 或开第一代）。**多 rank
     必须显式传入** :func:`begin_upload` 的结果，否则两次尝试的分片会混在同一代里。
     """
-    return _upload_rank(root, storage, step=step, rank=rank, generation=generation)
+    return _upload_rank(
+        root, storage, step=step, rank=rank, generation=generation, run_id=run_id
+    )
 
 
 def finalize_upload(
@@ -658,6 +766,7 @@ def finalize_upload(
     layout: Mapping[str, int] | None = None,
     keep: int | None = DEFAULT_KEEP_VERSIONS,
     reclaim_stale: bool = True,
+    run_id: str | None = None,
 ) -> UploadCommit:
     """rank 0 的提交动作：``list`` 本代前缀确认全部 rank 都传完了，再单点 CAS 更新 ``STATUS.committed``。
 
@@ -686,6 +795,7 @@ def finalize_upload(
         layout=layout,
         keep=keep,
         reclaim_stale=reclaim_stale,
+        run_id=run_id,
     )
 
 
@@ -704,6 +814,15 @@ def load_object(
     crc_padding_ratio: float = 0.125,
     io_concurrency: int = 1,
     local_staging_dir: str | Path | None = None,
+    skip_corrupt_status: bool = False,
+    allow_fallback: bool = False,
+    collective: Any = None,
+    world_size: int | None = None,
+    download_retries: int = DEFAULT_DOWNLOAD_RETRIES,
+    download_backoff: float = DEFAULT_DOWNLOAD_BACKOFF,
+    run_id: str | None = None,
+    source_run_id: str | None = None,
+    promote_tails: bool = False,
 ) -> ObjectLoadReport:
     """从对象存储恢复：整文件下载到本地临时目录 → 本地读闭环按块校验 → H2D。"""
     return load_object_version(
@@ -720,6 +839,15 @@ def load_object(
         crc_padding_ratio=crc_padding_ratio,
         io_concurrency=io_concurrency,
         local_staging_dir=local_staging_dir,
+        skip_corrupt_status=skip_corrupt_status,
+        allow_fallback=allow_fallback,
+        collective=collective,
+        world_size=world_size,
+        download_retries=download_retries,
+        download_backoff=download_backoff,
+        run_id=run_id,
+        source_run_id=source_run_id,
+        promote_tails=promote_tails,
     )
 
 
@@ -732,11 +860,14 @@ def local_copy_available(
     tp_rank: int = 0,
     shard_dims: Mapping[str, int] | None = None,
     column_strategy: str = "whole",
+    target_generation: str | None = None,
+    skip_corrupt_status: bool = False,
+    run_id: str | None = None,
 ) -> LocalCopyCheck:
     """本地热副本能不能顶替一次下载（判定，不读数据）。
 
-    条件是两条同时成立：远端有这一代的版本 ``COMMIT``，本地 ``step_N/`` 带 ``COMMIT``
-    且索引覆盖请求的布局。
+    条件是三条同时成立：远端有这一代的版本 ``COMMIT``，本地 ``step_N/`` 带 ``COMMIT``
+    与匹配的 ``GENERATION`` 代际标记，且索引覆盖请求的布局。
     """
     return check_local_copy(
         local_root,
@@ -746,6 +877,9 @@ def local_copy_available(
         tp_rank=tp_rank,
         shard_dims=shard_dims,
         column_strategy=column_strategy,
+        target_generation=target_generation,
+        skip_corrupt_status=skip_corrupt_status,
+        run_id=run_id,
     )
 
 
@@ -766,6 +900,16 @@ def load_checkpoint(
     io_concurrency: int = 1,
     local_staging_dir: str | Path | None = None,
     prefer_local: bool = True,
+    fallback_on_local_error: bool = True,
+    skip_corrupt_status: bool = False,
+    allow_fallback: bool = False,
+    collective: Any = None,
+    world_size: int | None = None,
+    download_retries: int = DEFAULT_DOWNLOAD_RETRIES,
+    download_backoff: float = DEFAULT_DOWNLOAD_BACKOFF,
+    run_id: str | None = None,
+    source_run_id: str | None = None,
+    promote_tails: bool = False,
 ) -> ObjectLoadReport:
     """恢复一个版本：**本地热副本优先**，本地不满足条件再下载（回退用这个入口）。
 
@@ -791,6 +935,16 @@ def load_checkpoint(
         io_concurrency=io_concurrency,
         local_staging_dir=local_staging_dir,
         prefer_local=prefer_local,
+        fallback_on_local_error=fallback_on_local_error,
+        skip_corrupt_status=skip_corrupt_status,
+        allow_fallback=allow_fallback,
+        collective=collective,
+        world_size=world_size,
+        download_retries=download_retries,
+        download_backoff=download_backoff,
+        run_id=run_id,
+        source_run_id=source_run_id,
+        promote_tails=promote_tails,
     )
 
 
@@ -804,6 +958,10 @@ def gc_local(
     rank: int,
     dry_run: bool = True,
     keep_local: int = DEFAULT_KEEP_LOCAL_VERSIONS,
+    run_id: str | None = None,
+    staging_dir: str | Path | None = None,
+    abort_stale_mpu: bool = True,
+    mpu_timeout_seconds: float = DEFAULT_MPU_TIMEOUT_SECONDS,
 ) -> GcReport:
     """回收本地 ``step_N/``：已上传的版本、以及被更新版本越过的残片。
 
@@ -828,26 +986,42 @@ def gc_local(
     里记原因）。周期调用用 :class:`commit.gc.GcWorker`。
     """
     return collect(
-        local_root, storage, rank=rank, dry_run=dry_run, keep_local=keep_local
+        local_root,
+        storage,
+        rank=rank,
+        dry_run=dry_run,
+        keep_local=keep_local,
+        run_id=run_id,
+        staging_dir=staging_dir,
+        abort_stale_mpu=abort_stale_mpu,
+        mpu_timeout_seconds=mpu_timeout_seconds,
     )
 
 
 __all__ = [
+    "AbortedUpload",
     "CPU",
     "BackendStats",
     "CheckpointData",
     "CheckpointError",
     "ChecksumError",
+    "CommitCoordinator",
+    "CoordinatedSaveResult",
     "CpuBackend",
     "DEFAULT_KEEP_LOCAL_VERSIONS",
     "DEFAULT_KEEP_VERSIONS",
+    "DEFAULT_MPU_TIMEOUT_SECONDS",
     "Device",
     "DeviceBackend",
     "FormatError",
+    "GENERATION_MISMATCH",
     "GcReport",
     "GcWorker",
     "GateBlock",
     "GateCollective",
+    "InflightStatus",
+    "InvalidTargetError",
+    "InvalidatedGeneration",
     "LoadReport",
     "LocalCopyCheck",
     "MissingTensorError",
@@ -864,12 +1038,16 @@ __all__ = [
     "Generation",
     "available_device_types",
     "begin_upload",
+    "cleanup_stale_multipart_uploads",
+    "cleanup_stale_staging_dirs",
     "close_default_pool",
     "configure_default_pool",
     "cuda",
     "default_pool",
     "gc_local",
     "get_backend",
+    "new_run_id",
+    "next_run_id",
     "ObjectLoadReport",
     "ObjectVersion",
     "UploadCommit",
@@ -879,10 +1057,14 @@ __all__ = [
     "load_local",
     "load_object",
     "local_copy_available",
+    "persist_snapshot",
+    "prepare_save_plan",
+    "promote_remote_tails",
     "reclaim_stale_generations",
     "register_backend",
     "reset_registry",
     "retain_remote_versions",
+    "run_scope",
     "save_async",
     "save_local",
     "upload_local",

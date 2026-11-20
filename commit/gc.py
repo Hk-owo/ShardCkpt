@@ -54,8 +54,11 @@
 from __future__ import annotations
 
 import contextlib
+import re
+import tempfile
 import threading
 from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Mapping
 
@@ -68,7 +71,13 @@ from commit.generation import (
 )
 from commit.local import COMMIT_FILE, delete_version, version_key
 from core import FormatError
-from storage.base import StorageBackend, StorageError
+from storage.base import (
+    StorageBackend,
+    StorageError,
+    run_scope,
+    unwrap_storage,
+    validate_run_id,
+)
 from storage.local import LocalStorage
 
 LOCAL = "local"
@@ -324,7 +333,10 @@ def plan(
                 )
             continue
         if gens:
-            # 还没有 L3：保留最新一次尝试（可能正在传），其余是残片
+            if superseded(step):
+                candidates.append(GcCandidate(REMOTE, step, SUPERSEDED))
+                continue
+            # 还没有 L3 且未被更新版本越过：保留最新一次尝试（可能正在传），其余是残片
             kept.append((REMOTE, step, NO_NEWER_VERSION))
             for generation in stale_prefixes(step):
                 candidates.append(
@@ -375,6 +387,15 @@ class DeletedVersion:
 
 
 @dataclass(frozen=True, slots=True)
+class AbortedUpload:
+    """R16a 被自动中止的孤儿/超时分片上传任务。"""
+
+    key: str
+    upload_id: str
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
 class GcReport:
     """一次回收的结果：删了什么、留了什么、为什么没做。"""
 
@@ -392,6 +413,10 @@ class GcReport:
     versions: frozenset[int]
     aborted: str | None = None
     """整体放弃的原因（远端不可达）。非空时本次一个都没删。"""
+    aborted_uploads: tuple[AbortedUpload, ...] = ()
+    """R16a 中止的超时/失效分片上传任务（dry_run 时为空）。"""
+    cleaned_staging: tuple[str, ...] = ()
+    """R4 清理的已死进程暂存目录路径。"""
 
     def steps_for(self, location: str) -> tuple[int, ...]:
         return tuple(item.step for item in self.deleted if item.location == location)
@@ -549,9 +574,12 @@ def _prune_remote_dirs(
     remote: StorageBackend, step: int, *, generation: str | None = None
 ) -> None:
     """本地盘后端会把空目录留下来（对象存储没有目录概念），顺手收掉。"""
-    if not isinstance(remote, LocalStorage):
+    if not isinstance(unwrap_storage(remote), LocalStorage):
         return
-    directory = remote.path_for(version_key(step))
+    path_for = getattr(remote, "path_for", None)
+    if not callable(path_for):
+        return
+    directory = path_for(version_key(step))
     if generation:
         with contextlib.suppress(OSError):  # 非空 = 有人还在写，留着
             (directory / generation).rmdir()
@@ -577,6 +605,75 @@ def _read_step_status(remote: StorageBackend, step: int) -> object:
     return _UNKNOWN_STATUS if status is None else status
 
 
+DEFAULT_MPU_TIMEOUT_SECONDS = 3600.0
+"""R16a 远端残留分片上传（MPU）的默认超时阈值（1 小时）。"""
+
+_STEP_GEN_KEY_RE = re.compile(r"^step_(\d+)/(gen_\d{4,}-[0-9a-z]{1,32})/")
+
+
+def cleanup_stale_multipart_uploads(
+    remote: StorageBackend | None,
+    *,
+    max_age_seconds: float = DEFAULT_MPU_TIMEOUT_SECONDS,
+    now: datetime | None = None,
+    dry_run: bool = False,
+    run_id: str | None = None,
+    stale_steps: Iterable[int] = (),
+    stale_generations: Mapping[int, Iterable[str]] | None = None,
+    max_committed_step: int | None = None,
+    active_generations: Mapping[int, Iterable[str]] | None = None,
+) -> tuple[AbortedUpload, ...]:
+    """R16a：列举并中止超时或所属代际已失效的未完成分片上传（MPU）。"""
+    if remote is None:
+        return ()
+    scoped = run_scope(remote, run_id)
+    if not bool(getattr(scoped, "supports_conditional_writes", True)):
+        return ()
+    list_fn = getattr(scoped, "list_multipart_uploads", None)
+    abort_fn = getattr(scoped, "abort_multipart_upload", None)
+    if not callable(list_fn) or not callable(abort_fn):
+        return ()
+
+    current_time = now if now is not None else datetime.now(timezone.utc)
+    doomed_steps = {int(s) for s in stale_steps}
+    doomed_gens = {
+        int(s): {str(g) for g in gens} for s, gens in (stale_generations or {}).items()
+    }
+    live_gens = {
+        int(s): {str(g) for g in gens if g}
+        for s, gens in (active_generations or {}).items()
+    }
+    aborted: list[AbortedUpload] = []
+    for upload in list_fn(""):
+        reason: str | None = None
+        match = _STEP_GEN_KEY_RE.match(upload.key)
+        if match:
+            up_step = int(match.group(1))
+            up_gen = match.group(2)
+            if up_step in doomed_steps or (
+                max_committed_step is not None and up_step < max_committed_step
+            ):
+                reason = SUPERSEDED
+            elif up_gen in doomed_gens.get(up_step, set()):
+                reason = STALE_GENERATION
+            elif up_step in live_gens and up_gen not in live_gens[up_step]:
+                reason = STALE_GENERATION
+        if reason is None:
+            initiated = upload.initiated
+            if initiated.tzinfo is None:
+                initiated = initiated.replace(tzinfo=timezone.utc)
+            if (current_time - initiated).total_seconds() >= max_age_seconds:
+                reason = "mpu_timeout"
+        if reason is None:
+            continue
+        if not dry_run:
+            abort_fn(upload.key, upload.upload_id)
+        aborted.append(
+            AbortedUpload(key=upload.key, upload_id=upload.upload_id, reason=reason)
+        )
+    return tuple(aborted)
+
+
 def collect(
     local_root: str | Path,
     remote: StorageBackend | None,
@@ -584,6 +681,10 @@ def collect(
     rank: int,
     dry_run: bool = True,
     keep_local: int = DEFAULT_KEEP_LOCAL_VERSIONS,
+    run_id: str | None = None,
+    staging_dir: str | Path | None = None,
+    abort_stale_mpu: bool = True,
+    mpu_timeout_seconds: float = DEFAULT_MPU_TIMEOUT_SECONDS,
 ) -> GcReport:
     """跑一次回收：一次 ``list`` + 一次目录扫描 + 按 :func:`plan` 的决策删除。
 
@@ -596,7 +697,8 @@ def collect(
     ``remote`` 不可达时**什么都不删**：本地判据依赖远端状态，「查不到」不能当成
     「可以删」。这种情况在 ``GcReport.aborted`` 里记原因，定时线程不会因此崩掉。
     """
-    root = Path(local_root)
+    base_local = Path(local_root)
+    root = base_local / validate_run_id(run_id) if run_id is not None else base_local
     if remote is None:
         return GcReport(
             dry_run=dry_run,
@@ -608,8 +710,9 @@ def collect(
             aborted="no remote storage configured",
         )
 
+    scoped = run_scope(remote, run_id)
     try:
-        keys = remote.list("")
+        keys = scoped.list("")
     except StorageError as exc:
         return GcReport(
             dry_run=dry_run,
@@ -627,7 +730,7 @@ def collect(
     pointer: dict[int, str] = {}
     unknown: set[int] = set()
     for step in sorted(layout.status_steps):
-        status = _read_step_status(remote, step)
+        status = _read_step_status(scoped, step)
         if status is _UNKNOWN_STATUS:
             unknown.add(step)
             continue
@@ -651,8 +754,18 @@ def collect(
 
     deleted: list[DeletedVersion] = []
     skipped: list[tuple[str, int, str]] = list(result.kept)
-    writable = bool(getattr(remote, "supports_conditional_writes", True))
+    aborted_uploads: tuple[AbortedUpload, ...] = ()
+    cleaned_staging: tuple[str, ...] = ()
+    writable = bool(getattr(scoped, "supports_conditional_writes", True))
     if not dry_run:
+        from storage.upload import cleanup_stale_staging_dirs
+
+        # R4：GC 时一并清理已死进程遗留的暂存目录（持锁已释放）
+        cleaned_paths = cleanup_stale_staging_dirs(
+            base_local, root, staging_dir, Path(tempfile.gettempdir())
+        )
+        cleaned_staging = tuple(str(p) for p in cleaned_paths)
+
         for candidate in result.candidates:
             if candidate.location == REMOTE:
                 if not writable:
@@ -660,7 +773,7 @@ def collect(
                     skipped.append((REMOTE, candidate.step, REMOTE_READ_ONLY))
                     continue
                 count = _delete_remote_prefix(
-                    remote, candidate.step, keys, generation=candidate.generation
+                    scoped, candidate.step, keys, generation=candidate.generation
                 )
                 deleted.append(
                     DeletedVersion(
@@ -676,6 +789,38 @@ def collect(
                 record = delete_local_version(root, candidate.step)
                 deleted.append(replace(record, reason=candidate.reason))
 
+        if abort_stale_mpu and writable:
+            stale_steps = {
+                c.step
+                for c in result.candidates
+                if c.location == REMOTE and c.generation is None
+            }
+            stale_gens: dict[int, set[str]] = {}
+            for c in result.candidates:
+                if c.location == REMOTE and c.generation is not None:
+                    stale_gens.setdefault(c.step, set()).add(c.generation)
+            active_gens: dict[int, set[str]] = {}
+            for s in set(current) | set(pointer):
+                gens_set: set[str] = set()
+                if current.get(s):
+                    gens_set.add(str(current[s]))
+                if pointer.get(s):
+                    gens_set.add(str(pointer[s]))
+                if gens_set:
+                    active_gens[s] = gens_set
+            try:
+                aborted_uploads = cleanup_stale_multipart_uploads(
+                    scoped,
+                    max_age_seconds=mpu_timeout_seconds,
+                    dry_run=False,
+                    stale_steps=stale_steps,
+                    stale_generations=stale_gens,
+                    max_committed_step=max(versions) if versions else None,
+                    active_generations=active_gens,
+                )
+            except StorageError:
+                pass
+
     return GcReport(
         dry_run=dry_run,
         planned=result.candidates,
@@ -683,6 +828,8 @@ def collect(
         skipped=tuple(skipped),
         reclaimed_bytes=sum(item.bytes for item in deleted),
         versions=result.versions,
+        aborted_uploads=aborted_uploads,
+        cleaned_staging=cleaned_staging,
     )
 
 
@@ -716,6 +863,7 @@ def retain_remote_versions(
     *,
     keep: int = DEFAULT_KEEP_VERSIONS,
     dry_run: bool = False,
+    run_id: str | None = None,
 ) -> RetentionReport:
     """有界保留：一次 ``list``，只留最新 ``keep`` 代已提交版本，从最旧的一代开始删。
 
@@ -747,8 +895,9 @@ def retain_remote_versions(
             aborted="no remote storage configured",
         )
 
+    scoped = run_scope(remote, run_id)
     try:
-        keys = remote.list("")
+        keys = scoped.list("")
     except StorageError as exc:
         return RetentionReport(
             keep=keep,
@@ -762,7 +911,7 @@ def retain_remote_versions(
     layout = _scan_remote(keys)
     committed_versions: set[int] = set()
     for step in sorted(layout.status_steps):
-        status = _read_step_status(remote, step)
+        status = _read_step_status(scoped, step)
         if status is _UNKNOWN_STATUS:
             return RetentionReport(
                 keep=keep,
@@ -783,7 +932,7 @@ def retain_remote_versions(
     if not dry_run:
         for step in doomed:
             try:
-                count = _delete_remote_prefix(remote, step, keys)
+                count = _delete_remote_prefix(scoped, step, keys)
             except StorageError as exc:  # 停在这一代，下次提交后再收敛
                 aborted = f"step_{step}: delete failed: {exc}"
                 break
@@ -867,6 +1016,10 @@ class GcWorker:
         dry_run: bool = False,
         history: int = 8,
         keep_local: int = DEFAULT_KEEP_LOCAL_VERSIONS,
+        run_id: str | None = None,
+        staging_dir: str | Path | None = None,
+        abort_stale_mpu: bool = True,
+        mpu_timeout_seconds: float = DEFAULT_MPU_TIMEOUT_SECONDS,
     ) -> None:
         if interval <= 0:
             raise ValueError(f"interval must be > 0, got {interval}")
@@ -876,6 +1029,10 @@ class GcWorker:
         self.interval = float(interval)
         self.dry_run = dry_run
         self.keep_local = int(keep_local)
+        self.run_id = run_id
+        self.staging_dir = staging_dir
+        self.abort_stale_mpu = abort_stale_mpu
+        self.mpu_timeout_seconds = float(mpu_timeout_seconds)
         self.history = max(1, int(history))
         self.reports: list[GcReport] = []
         self.last_error: str | None = None
@@ -896,6 +1053,10 @@ class GcWorker:
             rank=self.rank,
             dry_run=self.dry_run,
             keep_local=self.keep_local,
+            run_id=self.run_id,
+            staging_dir=self.staging_dir,
+            abort_stale_mpu=self.abort_stale_mpu,
+            mpu_timeout_seconds=self.mpu_timeout_seconds,
         )
         self.reports.append(report)
         del self.reports[: -self.history]
@@ -935,9 +1096,11 @@ class GcWorker:
 
 
 __all__ = [
+    "AbortedUpload",
     "COMMITTED",
     "DEFAULT_KEEP_LOCAL_VERSIONS",
     "DEFAULT_KEEP_VERSIONS",
+    "DEFAULT_MPU_TIMEOUT_SECONDS",
     "DeletedVersion",
     "GcCandidate",
     "GcPlan",
@@ -955,6 +1118,7 @@ __all__ = [
     "STALE_GENERATION",
     "SUPERSEDED",
     "UPLOADED",
+    "cleanup_stale_multipart_uploads",
     "collect",
     "delete_local_version",
     "plan",

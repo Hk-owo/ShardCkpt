@@ -276,3 +276,24 @@ def test_off_mode_never_probes_and_never_writes(s3_server) -> None:
 def test_config_rejects_unknown_conditional_mode() -> None:
     with pytest.raises(ValueError, match="conditional_writes"):
         S3Config(bucket="ckpt", conditional_writes="maybe")
+
+
+def test_read_with_meta_returns_payload_and_etag_in_one_get(
+    storage: S3Storage, s3_server
+) -> None:
+    from storage.base import ObjectNotFoundError
+
+    storage.write("step_1/blob", b"0123456789")
+    expected = storage.head("step_1/blob")
+    assert expected is not None
+
+    s3_server.store.requests.clear()
+    payload, meta = storage.read_with_meta("step_1/blob")
+
+    assert payload == b"0123456789"
+    assert meta == expected
+    methods = [method for method, _, _ in s3_server.store.requests]
+    assert methods == ["GET"], f"read_with_meta 应只发一次 GET，实际：{methods}"
+
+    with pytest.raises(ObjectNotFoundError):
+        storage.read_with_meta("step_1/missing")

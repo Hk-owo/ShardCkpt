@@ -244,18 +244,32 @@ class LocalStorage(StorageBackend):
         except OSError as exc:
             raise StorageError(f"{key}: {exc}") from exc
 
+    def read_with_meta(self, key: str) -> tuple[bytes, ObjectMeta]:
+        """读取文件并附带 ETag（条件写开启时返回内容摘要，否则为空串）。"""
+        payload = self.read(key)
+        etag = _content_etag(payload) if self._conditional else ""
+        return payload, ObjectMeta(key=key, etag=etag, size=len(payload))
+
     def download(self, key: str, path: str | Path) -> int:
-        """本地文件的整文件拷贝：不经过 bytes，直接把对象文件复制到目标路径。"""
+        """本地文件的整文件拷贝：先写临时文件再原子替换目标文件。"""
         source = self.path_for(key)
         target = Path(path)
         target.parent.mkdir(parents=True, exist_ok=True)
+        temp = _temp_path(target)
         try:
-            shutil.copyfile(source, target)
+            shutil.copyfile(source, temp)
+            size = temp.stat().st_size
+            os.replace(temp, target)
+            return size
         except FileNotFoundError as exc:
+            temp.unlink(missing_ok=True)
             raise ObjectNotFoundError(f"{key}: not found") from exc
         except OSError as exc:
+            temp.unlink(missing_ok=True)
             raise StorageError(f"{key}: {exc}") from exc
-        return target.stat().st_size
+        except BaseException:
+            temp.unlink(missing_ok=True)
+            raise
 
     def read_range(self, key: str, offset: int, length: int) -> bytes:
         if offset < 0 or length < 0:

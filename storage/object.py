@@ -36,15 +36,25 @@ download / head / list 照常，任何写动作（含 ``write`` / ``delete``）�
 
 from __future__ import annotations
 
+import errno
+import os
+import tempfile
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
 from urllib.parse import urlparse
 
 import boto3
 from botocore.config import Config
-from botocore.exceptions import BotoCoreError, ClientError
+from botocore.exceptions import (
+    BotoCoreError,
+    ClientError,
+    NoCredentialsError,
+    ParamValidationError,
+    PartialCredentialsError,
+)
 
 from storage.base import (
     ConditionalWritesDisabled,
@@ -212,6 +222,41 @@ def _make_client(config: S3Config) -> "S3Client":
     return boto3.client(**kwargs)  # type: ignore[return-value]
 
 
+_RETRYABLE_CLIENT_CODES = frozenset(
+    {
+        "BadDigest",
+        "InternalError",
+        "RequestTimeout",
+        "ServiceUnavailable",
+        "SlowDown",
+        "Throttling",
+        "ThrottlingException",
+        "TooManyRequests",
+    }
+)
+_NON_RETRYABLE_OS_ERRNOS = frozenset(
+    {errno.EACCES, errno.ENOSPC, errno.EPERM, errno.EROFS}
+)
+
+
+def _is_retryable_client_error(code: str, status: object) -> bool:
+    if isinstance(status, int) and (status >= 500 or status in (408, 429)):
+        return True
+    return code in _RETRYABLE_CLIENT_CODES
+
+
+def _is_retryable_botocore(exc: BotoCoreError) -> bool:
+    return not isinstance(
+        exc, (NoCredentialsError, PartialCredentialsError, ParamValidationError)
+    )
+
+
+def _is_retryable_os_error(exc: OSError) -> bool:
+    if isinstance(exc, PermissionError):
+        return False
+    return exc.errno not in _NON_RETRYABLE_OS_ERRNOS
+
+
 def _translate(exc: ClientError, key: str) -> StorageError:
     """把 boto3 的 ClientError 收敛成 StorageError 子类。"""
     error = exc.response.get("Error", {})
@@ -220,7 +265,8 @@ def _translate(exc: ClientError, key: str) -> StorageError:
     if code in _NOT_FOUND_CODES or status == 404:
         return ObjectNotFoundError(f"object not found: {key}")
     detail = error.get("Message") or str(exc)
-    return StorageError(f"{key}: {code or status}: {detail}")
+    retryable = _is_retryable_client_error(code, status)
+    return StorageError(f"{key}: {code or status}: {detail}", retryable=retryable)
 
 
 def _normalize_key(key: str) -> str:
@@ -803,20 +849,32 @@ class S3Storage(StorageBackend):
             raise StorageError(f"{object_key}: {exc}") from exc
 
     # --- 读 -----------------------------------------------------------------
-    def read(self, key: str) -> bytes:
+    def read_with_meta(self, key: str) -> tuple[bytes, ObjectMeta]:
+        """单次 ``get_object`` 同时取回内容与 ``ETag``，避免紧随其后的 ``HEAD``。"""
         object_key = self.object_key(key)
         try:
             response = self._client.get_object(
                 Bucket=self._config.bucket, Key=object_key, **self._checksum_mode_kwargs()
             )
-            return response["Body"].read()
+            payload = response["Body"].read()
         except ClientError as exc:
             raise _translate(exc, object_key) from exc
         except BotoCoreError as exc:
             raise StorageError(f"{object_key}: {exc}") from exc
+        content_length = response.get("ContentLength")
+        size = int(content_length) if content_length is not None else len(payload)
+        return payload, ObjectMeta(
+            key=key,
+            etag=str(response.get("ETag", "")),
+            size=size,
+        )
+
+    def read(self, key: str) -> bytes:
+        payload, _ = self.read_with_meta(key)
+        return payload
 
     def download(self, key: str, path: str | Path) -> int:
-        """流式下载整个对象到本地文件，返回字节数。
+        """流式下载整个对象：先写同目录临时文件，完成后原子替换目标路径。
 
         整对象 GET 带 ``ChecksumMode=ENABLED``，由 botocore 在读完流时回验；不把
         整个对象读进内存，峰值内存是 ``DEFAULT_DOWNLOAD_CHUNK_BYTES`` 一块。
@@ -826,26 +884,45 @@ class S3Storage(StorageBackend):
         target.parent.mkdir(parents=True, exist_ok=True)
         body = None
         written = 0
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=f".{target.name}.tmp.", dir=str(target.parent)
+        )
+        tmp_path = Path(tmp_name)
         try:
             response = self._client.get_object(
                 Bucket=self._config.bucket, Key=object_key, **self._checksum_mode_kwargs()
             )
             body = response["Body"]
-            with target.open("wb") as fh:
+            with os.fdopen(fd, "wb") as fh:
+                fd = -1
                 while True:
                     chunk = body.read(DEFAULT_DOWNLOAD_CHUNK_BYTES)
                     if not chunk:
                         break
                     fh.write(chunk)
                     written += len(chunk)
+                fh.flush()
+            os.replace(tmp_path, target)
             return written
         except ClientError as exc:
-            target.unlink(missing_ok=True)
+            tmp_path.unlink(missing_ok=True)
             raise _translate(exc, object_key) from exc
-        except (BotoCoreError, OSError) as exc:
-            target.unlink(missing_ok=True)
-            raise StorageError(f"{object_key}: {exc}") from exc
+        except BotoCoreError as exc:
+            tmp_path.unlink(missing_ok=True)
+            raise StorageError(
+                f"{object_key}: {exc}", retryable=_is_retryable_botocore(exc)
+            ) from exc
+        except OSError as exc:
+            tmp_path.unlink(missing_ok=True)
+            raise StorageError(
+                f"{object_key}: {exc}", retryable=_is_retryable_os_error(exc)
+            ) from exc
+        except BaseException:
+            tmp_path.unlink(missing_ok=True)
+            raise
         finally:
+            if fd >= 0:
+                os.close(fd)
             if body is not None:
                 body.close()
 
@@ -898,6 +975,62 @@ class S3Storage(StorageBackend):
             raise StorageError(f"{full_prefix}: {exc}") from exc
         return sorted(keys)
 
+    def list_multipart_uploads(self, prefix: str = "") -> list["MultipartUploadInfo"]:
+        """列举当前前缀下尚未合并的分片上传任务（R16a 清理孤儿 MPU 用）。"""
+        full_prefix = self._config.prefix
+        if prefix:
+            full_prefix = _join(self._config.prefix, _normalize_key(prefix))
+        if full_prefix:
+            full_prefix += "/"
+
+        uploads: list[MultipartUploadInfo] = []
+        try:
+            paginator = self._client.get_paginator("list_multipart_uploads")
+            for page in paginator.paginate(Bucket=self._config.bucket, Prefix=full_prefix):
+                for item in page.get("Uploads", []):
+                    initiated = item.get("Initiated")
+                    if isinstance(initiated, str):
+                        initiated = datetime.fromisoformat(
+                            initiated.replace("Z", "+00:00")
+                        )
+                    elif isinstance(initiated, datetime) and initiated.tzinfo is None:
+                        initiated = initiated.replace(tzinfo=timezone.utc)
+                    elif not isinstance(initiated, datetime):
+                        initiated = datetime.now(timezone.utc)
+                    uploads.append(
+                        MultipartUploadInfo(
+                            key=self._relative(item["Key"]),
+                            upload_id=str(item["UploadId"]),
+                            initiated=initiated,
+                        )
+                    )
+        except ClientError as exc:
+            raise _translate(exc, full_prefix) from exc
+        except BotoCoreError as exc:
+            raise StorageError(
+                f"{full_prefix}: {exc}", retryable=_is_retryable_botocore(exc)
+            ) from exc
+        return uploads
+
+    def abort_multipart_upload(self, key: str, upload_id: str) -> None:
+        """中止一个未完成的分片上传任务。"""
+        self._ensure_writable()
+        object_key = self.object_key(key)
+        try:
+            self._client.abort_multipart_upload(
+                Bucket=self._config.bucket, Key=object_key, UploadId=upload_id
+            )
+        except ClientError as exc:
+            error_code = str(exc.response.get("Error", {}).get("Code", ""))
+            status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+            if error_code == "NoSuchUpload" or status == 404:
+                return
+            raise _translate(exc, object_key) from exc
+        except BotoCoreError as exc:
+            raise StorageError(
+                f"{object_key}: {exc}", retryable=_is_retryable_botocore(exc)
+            ) from exc
+
     def _relative(self, object_key: str) -> str:
         root = self._config.prefix
         if not root:
@@ -905,10 +1038,20 @@ class S3Storage(StorageBackend):
         return object_key[len(root) + 1 :] if object_key.startswith(root + "/") else object_key
 
 
+@dataclass(frozen=True, slots=True)
+class MultipartUploadInfo:
+    """对象存储中尚在进行的 multipart upload 记录。"""
+
+    key: str
+    upload_id: str
+    initiated: datetime
+
+
 __all__ = [
     "CONDITIONAL_WRITE_MODES",
     "ConditionalProbe",
     "DEFAULT_CHECKSUM_ALGORITHM",
+    "MultipartUploadInfo",
     "PROBE_PREFIX",
     "SUPPORTED_CHECKSUM_ALGORITHMS",
     "S3Config",

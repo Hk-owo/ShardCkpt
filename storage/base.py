@@ -19,15 +19,40 @@ from __future__ import annotations
 
 import abc
 import enum
-from dataclasses import dataclass
+import os
+import re
+import tempfile
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
-from core import CheckpointError
+from core import CheckpointError, FormatError
 
 
 class StorageError(CheckpointError):
     """存储层失败：网络、鉴权、IO，或后端返回了不符合预期的响应。"""
+
+    def __init__(self, message: str = "", *, retryable: bool = False) -> None:
+        super().__init__(message)
+        self.retryable = bool(retryable)
+
+
+class TransientStorageError(StorageError):
+    """可重试的瞬态存储错误（断流、超时、5xx、传输校验错）。"""
+
+    def __init__(self, message: str = "") -> None:
+        super().__init__(message, retryable=True)
+
+
+def is_retryable_storage_error(exc: BaseException) -> bool:
+    """判断异常是否属于可对单文件重试的瞬态传输错误。"""
+    if isinstance(exc, (ObjectNotFoundError, ConditionalWritesDisabled, UnsupportedConditionalWrites, FormatError)):
+        return False
+    if isinstance(exc, StorageError):
+        return bool(getattr(exc, "retryable", False))
+    if isinstance(exc, (TimeoutError, ConnectionError, EOFError)):
+        return True
+    return False
 
 
 class ObjectNotFoundError(StorageError):
@@ -135,21 +160,42 @@ class StorageBackend(abc.ABC):
     def read(self, key: str) -> bytes:
         """整对象读取。"""
 
+    def read_with_meta(self, key: str) -> tuple[bytes, ObjectMeta]:
+        """整对象读取，同时返回对象元数据（``ETag`` 与大小）。
+
+        默认在 :meth:`read` 后按需 :meth:`head`；对象存储等后端可覆盖为单次
+        读取直接从响应头取 ``ETag``，避免额外的 ``HEAD`` 往返与竞态窗口。
+        """
+        payload = self.read(key)
+        head = getattr(self, "head", None)
+        if callable(head):
+            meta = head(key)
+            if meta is not None:
+                return payload, meta
+        return payload, ObjectMeta(key=key, etag="", size=len(payload))
+
     @abc.abstractmethod
     def read_range(self, key: str, offset: int, length: int) -> bytes:
         """读取 ``[offset, offset + length)`` 区间，长度不符时报错而非静默截断。"""
 
     def download(self, key: str, path: "str | Path") -> int:
-        """把整对象写到本地文件，返回字节数。
-
-        默认实现是「整对象读进内存再落盘」，只适合小对象或测试；对象存储后端覆盖
-        成流式写，避免把整个 checkpoint 数据文件读进内存。
-        """
+        """把整对象先写临时文件再原子替换到目标路径，返回字节数。"""
         target = Path(path)
         target.parent.mkdir(parents=True, exist_ok=True)
         payload = self.read(key)
-        target.write_bytes(payload)
-        return len(payload)
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=f".{target.name}.tmp.", dir=str(target.parent)
+        )
+        tmp_path = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(payload)
+                fh.flush()
+            os.replace(tmp_path, target)
+            return len(payload)
+        except BaseException:
+            tmp_path.unlink(missing_ok=True)
+            raise
 
     @abc.abstractmethod
     def rename_or_put(self, src: str, dst: str) -> None:
@@ -174,13 +220,156 @@ class StorageBackend(abc.ABC):
         """释放连接等资源；默认无操作。"""
 
 
+_RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+def validate_run_id(run_id: str) -> str:
+    """校验训练轮次标识：非空单段目录名，不与 ``step_N`` 冲突。"""
+    if not isinstance(run_id, str) or not run_id:
+        raise ValueError("run_id must be a non-empty string")
+    if run_id in (".", "..") or not _RUN_ID_RE.match(run_id) or run_id.startswith("step_"):
+        raise ValueError(
+            f"invalid run_id {run_id!r}: must be a single safe segment not starting with 'step_'"
+        )
+    return run_id
+
+
+class PrefixedStorage(StorageBackend):
+    """按轮次前缀隔离的存储包装器：所有相对 key 自动挂在 ``<prefix>/`` 下。"""
+
+    def __init__(self, inner: StorageBackend, prefix: str) -> None:
+        self._inner = inner
+        self._prefix = validate_run_id(prefix)
+
+    @property
+    def inner(self) -> StorageBackend:
+        return self._inner
+
+    @property
+    def prefix(self) -> str:
+        return self._prefix
+
+    @property
+    def supports_conditional_writes(self) -> bool:
+        return bool(getattr(self._inner, "supports_conditional_writes", False))
+
+    def _scoped(self, key: str) -> str:
+        return f"{self._prefix}/{key}" if key else self._prefix
+
+    def _strip(self, key: str) -> str:
+        head = f"{self._prefix}/"
+        return key[len(head) :] if key.startswith(head) else key
+
+    def write(self, key: str, data: bytes) -> None:
+        self._inner.write(self._scoped(key), data)
+
+    def read(self, key: str) -> bytes:
+        return self._inner.read(self._scoped(key))
+
+    def read_with_meta(self, key: str) -> tuple[bytes, ObjectMeta]:
+        payload, meta = self._inner.read_with_meta(self._scoped(key))
+        return payload, ObjectMeta(key=key, etag=meta.etag, size=meta.size)
+
+    def read_range(self, key: str, offset: int, length: int) -> bytes:
+        return self._inner.read_range(self._scoped(key), offset, length)
+
+    def download(self, key: str, path: "str | Path") -> int:
+        return self._inner.download(self._scoped(key), path)
+
+    def rename_or_put(self, src: str, dst: str) -> None:
+        self._inner.rename_or_put(self._scoped(src), self._scoped(dst))
+
+    def list(self, prefix: str = "") -> list[str]:
+        scoped = self._scoped(prefix.strip("/")) if prefix else self._prefix
+        return sorted(self._strip(k) for k in self._inner.list(scoped))
+
+    def delete(self, key: str) -> None:
+        self._inner.delete(self._scoped(key))
+
+    def put_if_absent(self, key: str, data: bytes) -> WriteOutcome:
+        return getattr(self._inner, "put_if_absent")(self._scoped(key), data)
+
+    def put_if_match(self, key: str, data: bytes, etag: str) -> WriteOutcome:
+        return getattr(self._inner, "put_if_match")(self._scoped(key), data, etag)
+
+    def head(self, key: str) -> ObjectMeta | None:
+        meta = getattr(self._inner, "head")(self._scoped(key))
+        if meta is None:
+            return None
+        return ObjectMeta(key=key, etag=meta.etag, size=meta.size)
+
+    def write_file(
+        self,
+        key: str,
+        path: "str | Path",
+        *,
+        if_none_match: bool = False,
+        if_match: str | None = None,
+    ) -> WriteOutcome:
+        return getattr(self._inner, "write_file")(
+            self._scoped(key),
+            path,
+            if_none_match=if_none_match,
+            if_match=if_match,
+        )
+
+    def ensure_conditional_writes(self) -> Any:
+        fn = getattr(self._inner, "ensure_conditional_writes", None)
+        return fn() if callable(fn) else None
+
+    def list_multipart_uploads(self, prefix: str = "") -> list[Any]:
+        fn = getattr(self._inner, "list_multipart_uploads", None)
+        if not callable(fn):
+            return []
+        scoped = self._scoped(prefix.strip("/")) if prefix else self._prefix
+        return [replace(u, key=self._strip(u.key)) for u in fn(scoped)]
+
+    def abort_multipart_upload(self, key: str, upload_id: str) -> None:
+        fn = getattr(self._inner, "abort_multipart_upload", None)
+        if callable(fn):
+            fn(self._scoped(key), upload_id)
+
+    def path_for(self, key: str) -> Path:
+        fn = getattr(self._inner, "path_for", None)
+        if not callable(fn):
+            raise AttributeError(f"{type(self._inner).__name__} has no path_for")
+        return fn(self._scoped(key))
+
+    def close(self) -> None:
+        return None
+
+    def __repr__(self) -> str:
+        return f"PrefixedStorage({self._inner!r}, prefix={self._prefix!r})"
+
+
+def run_scope(storage: StorageBackend, run_id: str | None) -> StorageBackend:
+    """若给定 ``run_id`` 则包装为轮次前缀作用域；为 ``None`` 时原样返回。"""
+    if run_id is None:
+        return storage
+    if isinstance(storage, PrefixedStorage) and storage.prefix == run_id:
+        return storage
+    return PrefixedStorage(storage, run_id)
+
+
+def unwrap_storage(storage: StorageBackend) -> StorageBackend:
+    while isinstance(storage, PrefixedStorage):
+        storage = storage.inner
+    return storage
+
+
 __all__ = [
     "ConditionalBackend",
     "ConditionalWritesDisabled",
     "ObjectMeta",
     "ObjectNotFoundError",
+    "PrefixedStorage",
     "StorageBackend",
     "StorageError",
+    "TransientStorageError",
     "UnsupportedConditionalWrites",
     "WriteOutcome",
+    "is_retryable_storage_error",
+    "run_scope",
+    "unwrap_storage",
+    "validate_run_id",
 ]

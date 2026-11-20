@@ -604,3 +604,25 @@ def test_begin_upload_uses_collective_to_broadcast() -> None:
         assert not errors, errors
         assert len(results) == 2
         assert {gen.id for gen in results} == {results[0].id}
+
+
+def test_read_status_and_recovery_issue_no_head_requests(
+    storage: S3Storage, tmp_path, s3_server
+) -> None:
+    """``read_status`` 通过单次 GET 响应头拿 ETag，恢复读路径不再额外发 HEAD。"""
+    local = tmp_path / "local"
+    save_one(local, value=3.5)
+    gen = ckpt.begin_upload(storage, step=STEP, ranks=[0])
+    ckpt.upload_local(local, storage, step=STEP, rank=0, generation=gen)
+    ckpt.finalize_upload(storage, step=STEP, ranks=[0], generation=gen)
+
+    s3_server.store.requests.clear()
+    status = read_status(storage, STEP)
+    assert status is not None and status.etag
+    assert [r[0] for r in s3_server.store.requests] == ["GET"]
+
+    s3_server.store.requests.clear()
+    report = ckpt.load_object(storage, device=DEVICE)
+    assert float(report.tensors["w"].numpy()[0, 0]) == pytest.approx(3.5)
+    heads = [r for r in s3_server.store.requests if r[0] == "HEAD"]
+    assert heads == [], f"恢复读不应发送 HEAD 请求，实际：{heads}"

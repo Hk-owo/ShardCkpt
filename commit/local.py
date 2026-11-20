@@ -41,6 +41,11 @@ COMMIT_TEMP = "COMMIT.tmp"
 COMMIT_FORMAT_VERSION = 2
 """v2 起 ``COMMIT`` 记 ``.metadata`` 的 CRC-32C；v1（只记字节数）不再兼容。"""
 
+GENERATION_FILE = "GENERATION"
+GENERATION_TEMP = "GENERATION.tmp"
+GENERATION_FORMAT_VERSION = 1
+"""本地版本目录内的代际标记文件（R6/C2）：记录该本地目录对应远端哪一代际。"""
+
 _CRC32C_RE = re.compile(r"^[0-9a-f]{8}$")
 
 
@@ -216,6 +221,101 @@ def latest_step(storage: StorageBackend) -> int | None:
     return steps[-1] if steps else None
 
 
+@dataclass(frozen=True, slots=True)
+class LocalGenerationMarker:
+    """本地代际标记文件 ``step_N/GENERATION``：用于热副本与集群锁定代际的纯本地比对（R6）。"""
+
+    step: int
+    generation: str
+    run_id: str | None = None
+    format_version: int = GENERATION_FORMAT_VERSION
+
+    def __post_init__(self) -> None:
+        if self.format_version != GENERATION_FORMAT_VERSION:
+            raise FormatError(
+                f"unsupported GENERATION format_version {self.format_version}, "
+                f"this build understands {GENERATION_FORMAT_VERSION}"
+            )
+        if self.step < 0:
+            raise FormatError(f"step must be >= 0, got {self.step}")
+        if not isinstance(self.generation, str) or not self.generation:
+            raise FormatError("GENERATION 'generation' must be a non-empty string")
+        if self.run_id is not None and not isinstance(self.run_id, str):
+            raise FormatError("GENERATION 'run_id' must be a string or null")
+
+    def dumps(self) -> str:
+        data: dict[str, object] = {
+            "format_version": self.format_version,
+            "step": self.step,
+            "generation": self.generation,
+        }
+        if self.run_id is not None:
+            data["run_id"] = self.run_id
+        return json.dumps(data, indent=2, sort_keys=True, ensure_ascii=False)
+
+    @classmethod
+    def loads(cls, text: str) -> "LocalGenerationMarker":
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise FormatError(f"GENERATION is not valid JSON: {exc}") from exc
+        if not isinstance(data, dict):
+            raise FormatError(
+                f"GENERATION must be a JSON object, got {type(data).__name__}"
+            )
+        try:
+            run_id = data.get("run_id")
+            return cls(
+                step=int(data["step"]),
+                generation=str(data["generation"]),
+                run_id=None if run_id is None else str(run_id),
+                format_version=int(data.get("format_version", GENERATION_FORMAT_VERSION)),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise FormatError(f"GENERATION is malformed: {exc}") from exc
+
+
+def write_local_generation(
+    storage: StorageBackend,
+    step: int,
+    generation: str,
+    *,
+    run_id: str | None = None,
+) -> LocalGenerationMarker:
+    """原子写入本地版本目录的代际标记文件 ``step_N/GENERATION``。"""
+    marker = LocalGenerationMarker(step=step, generation=generation, run_id=run_id)
+    key = version_key(step)
+    payload = marker.dumps().encode("utf-8")
+    storage.write(f"{key}/{GENERATION_TEMP}", payload)
+    storage.rename_or_put(f"{key}/{GENERATION_TEMP}", f"{key}/{GENERATION_FILE}")
+    return marker
+
+
+def read_local_generation(
+    storage: StorageBackend, step: int
+) -> LocalGenerationMarker | None:
+    """读本地代际标记文件；不存在返回 ``None``，格式坏抛 :class:`FormatError`。"""
+    try:
+        payload = storage.read(f"{version_key(step)}/{GENERATION_FILE}")
+    except ObjectNotFoundError:
+        return None
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise FormatError(f"{version_key(step)}/{GENERATION_FILE}: not valid UTF-8: {exc}") from exc
+    marker = LocalGenerationMarker.loads(text)
+    if marker.step != step:
+        raise FormatError(
+            f"{version_key(step)}/{GENERATION_FILE}: declares step {marker.step}, expected {step}"
+        )
+    return marker
+
+
+def delete_local_generation(storage: StorageBackend, step: int) -> None:
+    """删除本地代际标记文件（幂等），防止未关联代际的重存复用旧代标记。"""
+    storage.delete(f"{version_key(step)}/{GENERATION_FILE}")
+
+
 def delete_version(storage: StorageBackend, step: int) -> None:
     """删一个版本：先删 COMMIT（立刻不可恢复），再删数据。
 
@@ -233,12 +333,19 @@ __all__ = [
     "COMMIT_FORMAT_VERSION",
     "COMMIT_TEMP",
     "CommitRecord",
+    "GENERATION_FILE",
+    "GENERATION_FORMAT_VERSION",
+    "GENERATION_TEMP",
+    "LocalGenerationMarker",
     "check_crc32c",
     "committed_steps",
+    "delete_local_generation",
     "delete_version",
     "latest_step",
     "read_commit",
+    "read_local_generation",
     "version_key",
     "write_commit",
+    "write_local_generation",
     "write_metadata",
 ]
