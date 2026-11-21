@@ -81,7 +81,7 @@ import warnings
 from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from async_ import Tensor
 from commit.gc import (
@@ -1333,6 +1333,7 @@ def load_object_version(
     run_id: str | None = None,
     source_run_id: str | None = None,
     promote_tails: bool = False,
+    on_target_step: Callable[[int], None] | None = None,
 ) -> ObjectLoadReport:
     """从对象存储恢复：整文件下载到本地临时目录，再走本地读闭环。
 
@@ -1365,6 +1366,7 @@ def load_object_version(
         run_id=run_id,
         source_run_id=source_run_id,
         promote_tails=promote_tails,
+        on_target_step=on_target_step,
     )
 
 
@@ -1686,6 +1688,7 @@ def load_checkpoint_version(
     run_id: str | None = None,
     source_run_id: str | None = None,
     promote_tails: bool = False,
+    on_target_step: Callable[[int], None] | None = None,
 ) -> ObjectLoadReport:
     """统一的集群/单机恢复闭环（R5 + R6 + R7 + R8 + R9 + R13 + R14 + C4）。
 
@@ -1722,64 +1725,78 @@ def load_checkpoint_version(
     if discovery["error"] is not None:
         raise discovery["error"]
 
-    candidates: list[tuple[int, str]] = list(discovery["candidates"])
-    skipped_versions: list[tuple[int, str]] = list(discovery["skipped"])
+    candidates: list[tuple[int, str]] = [
+        (int(c[0]), str(c[1])) for c in discovery["candidates"]
+    ]
+    skipped_versions: list[tuple[int, str]] = [
+        (int(s[0]), str(s[1])) for s in discovery["skipped"]
+    ]
+    broadcast_protect = getattr(peer, "broadcast_protect", None)
 
     # 第 2 步 & 第 3 步：尝试候选版本 → 加载后 0/1/2 全归约复核 → 统一回退或退出
     for idx, (cand_step, cand_gen) in enumerate(candidates):
+        if on_target_step is not None:
+            on_target_step(cand_step)
+        if callable(broadcast_protect) and peer.rank == 0:
+            broadcast_protect(add_steps=[cand_step], pause_gc=True)
+
         report: ObjectLoadReport | None = None
         local_exc: BaseException | None = None
         local_code = LOAD_OK
         try:
-            fallback_reason: str | None = None
-            if prefer_local and local_root is not None:
-                report, fallback_reason = _try_local_hot_copy(
-                    local_root,
-                    storage,
-                    target_step=cand_step,
-                    target_gen=cand_gen,
-                    run_id=effective_run_id,
-                    device=device,
-                    tp=tp,
-                    tp_rank=tp_rank,
-                    shard_dims=shard_dims,
-                    budget_bytes=budget_bytes,
-                    column_strategy=column_strategy,
-                    verify_crc=verify_crc,
-                    crc_padding=crc_padding,
-                    crc_padding_ratio=crc_padding_ratio,
-                    fallback_on_local_error=fallback_on_local_error,
-                )
-            if report is None:
-                report = _load_remote_version(
-                    storage,
-                    step=cand_step,
-                    expected_generation=cand_gen,
-                    device=device,
-                    tp=tp,
-                    tp_rank=tp_rank,
-                    shard_dims=shard_dims,
-                    budget_bytes=budget_bytes,
-                    column_strategy=column_strategy,
-                    verify_crc=verify_crc,
-                    crc_padding=crc_padding,
-                    crc_padding_ratio=crc_padding_ratio,
-                    io_concurrency=io_concurrency,
-                    local_staging_dir=local_staging_dir,
-                    download_retries=download_retries,
-                    download_backoff=download_backoff,
-                    run_id=effective_run_id,
-                )
-                if fallback_reason is not None:
-                    report = replace(report, local_fallback_reason=fallback_reason)
-        except BaseException as exc:
-            local_exc = exc
-            if not fallback_on_local_error and "本地热副本" in str(exc):
-                local_code = LOAD_FATAL
-            else:
-                local_code = _classify_load_error(exc)
+            try:
+                fallback_reason: str | None = None
+                if prefer_local and local_root is not None:
+                    report, fallback_reason = _try_local_hot_copy(
+                        local_root,
+                        storage,
+                        target_step=cand_step,
+                        target_gen=cand_gen,
+                        run_id=effective_run_id,
+                        device=device,
+                        tp=tp,
+                        tp_rank=tp_rank,
+                        shard_dims=shard_dims,
+                        budget_bytes=budget_bytes,
+                        column_strategy=column_strategy,
+                        verify_crc=verify_crc,
+                        crc_padding=crc_padding,
+                        crc_padding_ratio=crc_padding_ratio,
+                        fallback_on_local_error=fallback_on_local_error,
+                    )
+                if report is None:
+                    report = _load_remote_version(
+                        storage,
+                        step=cand_step,
+                        expected_generation=cand_gen,
+                        device=device,
+                        tp=tp,
+                        tp_rank=tp_rank,
+                        shard_dims=shard_dims,
+                        budget_bytes=budget_bytes,
+                        column_strategy=column_strategy,
+                        verify_crc=verify_crc,
+                        crc_padding=crc_padding,
+                        crc_padding_ratio=crc_padding_ratio,
+                        io_concurrency=io_concurrency,
+                        local_staging_dir=local_staging_dir,
+                        download_retries=download_retries,
+                        download_backoff=download_backoff,
+                        run_id=effective_run_id,
+                    )
+                    if fallback_reason is not None:
+                        report = replace(report, local_fallback_reason=fallback_reason)
+            except BaseException as exc:
+                local_exc = exc
+                if not fallback_on_local_error and "本地热副本" in str(exc):
+                    local_code = LOAD_FATAL
+                else:
+                    local_code = _classify_load_error(exc)
 
-        global_code = int(peer.all_reduce_max_int64([local_code])[0])
+            global_code = int(peer.all_reduce_max_int64([local_code])[0])
+        finally:
+            if callable(broadcast_protect) and peer.rank == 0:
+                broadcast_protect(release_steps=[cand_step], pause_gc=False)
 
         if global_code == LOAD_OK:
             assert report is not None

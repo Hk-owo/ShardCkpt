@@ -2,7 +2,7 @@
 
 面向分布式训练的分片 Checkpoint 系统：通过规划器（`planner`）完成分片去重、对齐与重切分求交，本地走 `O_DIRECT` + `io_uring`（可纯 Python 回退）原子落盘，远端通过 S3 条件写（CAS）实现代际隔离与单点提交，并支持本地热副本优先恢复与有界垃圾回收。
 
-> **当前实现状态**：本地写/读闭环（`save_local` / `load_local` / `load`）、S3 上传与单点 `STATUS` 代际 fence（`begin_upload` / `upload_local` / `finalize_upload` / `load_object` / `load_checkpoint`）、GC 与有界保留（`gc_local` / `retain_remote_versions` / `GcWorker`）、跨 rank 一致门闸（`dist` + `SnapshotManager`）、DTensor 适配（`adapters/dtensor.py`）、C++ `io_uring` 扩展（`ckpt_native`）均已落地；后台异步保存进程（`api.save_async`）、`adapters/megatron.py`、`adapters/stateful.py`、`tiers/` 尚未实现。
+> **当前实现状态**：本地写/读闭环（`save_local` / `load_local` / `load`）、异步三层分离保存（`start_saver` / `save_async` / `close_saver` + `saver/` 存储子进程与节点通信层）、S3 上传与单点 `STATUS` 代际 fence（`begin_upload` / `upload_local` / `finalize_upload` / `load_object` / `load_checkpoint`）、GC 与有界保留（`gc_local` / `retain_remote_versions` / `GcWorker`）、跨 rank 一致门闸（`dist` + `SnapshotManager`）、DTensor 适配（`adapters/dtensor.py`）、C++ `io_uring` 扩展（`ckpt_native`）均已落地；`adapters/megatron.py`、`adapters/stateful.py`、`tiers/` 尚未实现。
 
 ## 目录
 
@@ -55,7 +55,8 @@ ShardCkpt/
 │   ├── generation.py     代际（gen_0007-xxx）与单点 STATUS CAS 状态机
 │   └── gc.py             GC 判据（纯函数）、执行器、GcWorker 线程、远端有界保留
 ├── async_/             DeviceBackend / Tensor、D2HStream、PinnedBufferPool、SnapshotManager
-├── dist/               集合通信抽象（all_reduce(MAX) 已落地；gather / broadcast 仅占位）
+├── saver/              异步保存三层分离：memfd 池、控制面协议、纯 host 落盘、存储子进程与节点通信层
+├── dist/               集合通信抽象（all_reduce(MAX) / gather / scatter / broadcast 已落地）
 ├── adapters/           框架适配（dtensor.py 已实现；megatron.py / stateful.py 未实现）
 ├── tiers/              分层存储与节点间副本（未实现，仅 docstring）
 ├── native/             ckpt_native 加载点与对齐 buffer 桥接
@@ -73,6 +74,7 @@ ShardCkpt/
 | 类别 | 组件 / 函数 | 位置 | 职责 |
 |---|---|---|---|
 | **总入口** | `save_local` / `load_local` / `load` | `api.py` | 本地保存与加载闭环（`load` 只接受本地版本目录） |
+| | `start_saver` / `save_async` / `close_saver` | `api.py` / `saver/` | 跨进程异步保存、节点独立通信协调、后台上传与对称收敛 |
 | | `begin_upload` / `upload_local` / `finalize_upload` | `api.py` | 开代广播、per-rank 上传、rank 0 单点 CAS 提交与保留 |
 | | `load_object` / `load_checkpoint` / `gc_local` | `api.py` | 远端恢复、本地热副本优先恢复、本地/残片回收 |
 | **设备与池** | `Device` / `DeviceBackend` / `register_backend()` | `core/`, `async_/` | `"cpu"` / `"cuda:N"` 抽象，默认含 `CpuBackend` 与 `MockCudaBackend` |
@@ -453,11 +455,11 @@ TMPDIR=$PWD/build/tmp ctest --test-dir build --output-on-failure
 
 | 文档 | 内容 |
 |---|---|
-| [`docs/README.md`](docs/README.md) | 设计与计划文档目录总览（按实现状态分类） |
-| [`docs/implemented/generation.md`](docs/implemented/generation.md) | S3 单点 `STATUS` 代际隔离、fence 协议与失败模式矩阵（已实现） |
-| [`docs/implemented/gc.md`](docs/implemented/gc.md) | 本地与远端 GC 判据、安全删除顺序与有界保留规格（已实现） |
-| [`docs/implemented/gate.md`](docs/implemented/gate.md) | 跨 rank 一致门闸设计与实现偏差（已实现） |
-| [`docs/planned/recovery_and_coordination.md`](docs/planned/recovery_and_coordination.md) | 崩溃恢复补全与提交协调监控统一实施计划（方案已定） |
-| [`docs/planned/save_async.md`](docs/planned/save_async.md) | 异步保存进程分离设计规格（未实现） |
+| [`docs/README.md`](docs/README.md) | 设计与计划文档目录总览（含目录分类与完成进度分类） |
+| [`docs/implemented/generation.md`](docs/implemented/generation.md) | S3 单点 `STATUS` 代际隔离、fence 协议与失败模式矩阵（已完成） |
+| [`docs/implemented/gc.md`](docs/implemented/gc.md) | 本地与远端 GC 判据、安全删除顺序与有界保留规格（已完成） |
+| [`docs/implemented/gate.md`](docs/implemented/gate.md) | 跨 rank 一致门闸设计与实现偏差（已完成） |
+| [`docs/implemented/recovery_and_coordination.md`](docs/implemented/recovery_and_coordination.md) | 崩溃恢复补全（R1-R16a）与提交协调监控（C1-C4）统一计划（已完成） |
+| [`docs/planned/save_async.md`](docs/planned/save_async.md) | 异步保存进程分离设计规格（M0–M3 已实现，M4 可选优化） |
 | [`tests/sim/README.md`](tests/sim/README.md) | 仿真测试方案、覆盖矩阵与待补全清单 |
 | [`tests/fixtures/README.md`](tests/fixtures/README.md) | 确定性测试数据集生成器用法（`make_data.py`） |

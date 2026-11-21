@@ -208,8 +208,7 @@ collective 就是死锁。现在改为**一次 `all-reduce(MAX)` 统一裁决** 
 5. **L0 契约层**：`DeviceBackend` 契约参数化 + 写侧 python/native 引擎差分。
 6. **真机切换**：`CudaBackend` 骨架 + `mark.gpu`；docker MinIO（`mark.s3_real`）；
    两台机器上的跨机读取演练。
-7. **后台保存**：`save_async` 落地后，仿真「训练不阻塞 + 上传队列重试 + 崩溃后
-   不丢已提交版本」。
+7. **后台保存（✅ 已落地）**：`tests/sim/test_async_train_loop.py`（`save_async` + `NodeComm` + `AsyncSaver` + S3 后台上传仿真；单元测试见 `tests/test_shm_probe.py`、`tests/test_save_async_local.py`、`tests/test_save_async_faults.py`、`tests/test_save_async_comm_m3.py`）。
 8. **`tiers/`**：分层存储落地后，仿真「本地命中 / 远端回源 / 副本选版本」。
 9. **规模外推表**：把 L4 的 64 MiB 实测按 `state_dict` 体量线性外推到 7B/70B，
    给出「一次检查点预计耗时/带宽」的换算表。

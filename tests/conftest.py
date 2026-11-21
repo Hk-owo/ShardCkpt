@@ -25,6 +25,7 @@ def _fresh_backends():
     ckpt.reset_registry()
     ckpt.close_default_pool()
     yield
+    ckpt.close_saver()
     ckpt.reset_registry()
     ckpt.close_default_pool()
 

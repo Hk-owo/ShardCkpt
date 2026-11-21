@@ -81,6 +81,14 @@ class PinnedBuffer:
         return not self._released
 
     @property
+    def offset(self) -> int:
+        return 0
+
+    @property
+    def nbytes(self) -> int:
+        return self.capacity
+
+    @property
     def view(self) -> memoryview:
         if self._released:
             raise RuntimeError("buffer 已归还给池，不能继续使用")

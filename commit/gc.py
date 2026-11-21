@@ -60,7 +60,7 @@ import threading
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, Mapping
+from typing import Callable, Iterable, Mapping
 
 from commit.generation import (
     STATUS_FILE,
@@ -109,6 +109,9 @@ STALE_GENERATION = "stale_generation"
 
 RECOVERY_COPY = "recovery_copy"
 """本地保留的热恢复副本：远端已有这一代的版本 ``COMMIT``，本地不删、回退时直接读。"""
+
+PROTECTED = "protected"
+"""受保护的步数（正在本地落盘 / 等待或执行远端上传 / 正在恢复读取中）：禁止删除。"""
 
 _UNRESOLVED = object()
 """判不出「最新一次尝试」的代际（坏目录名 / 既无 GEN 也无 L3）：一个代都不删。"""
@@ -180,6 +183,7 @@ def plan(
     pointer_generations: Mapping[int, str] | None = None,
     unknown_versions: Iterable[int] = (),
     keep_local: int = DEFAULT_KEEP_LOCAL_VERSIONS,
+    protected_steps: Iterable[int] = (),
 ) -> GcPlan:
     """决定删哪些版本。**纯函数**：不碰 IO、不看时间、不看进程状态。
 
@@ -218,6 +222,7 @@ def plan(
     }
     all_prefixes = {int(step) for step in prefixes}
     local = {int(step) for step in local_steps}
+    protected = frozenset(int(step) for step in protected_steps)
 
     _attempts: dict[int, object] = {}
 
@@ -309,7 +314,9 @@ def plan(
     kept: list[tuple[str, int, str]] = []
 
     for step in sorted(local):
-        if step in recovery:
+        if step in protected:
+            kept.append((LOCAL, step, PROTECTED))
+        elif step in recovery:
             kept.append((LOCAL, step, RECOVERY_COPY))
         elif int(rank) in by_step.get(step, set()):
             candidates.append(GcCandidate(LOCAL, step, UPLOADED))
@@ -319,6 +326,9 @@ def plan(
             kept.append((LOCAL, step, NOT_UPLOADED))
 
     for step in sorted(all_prefixes):
+        if step in protected:
+            kept.append((REMOTE, step, PROTECTED))
+            continue
         gens = gens_of.get(step, set())
         if step in unknown:
             kept.append((REMOTE, step, COMMITTED))
@@ -622,6 +632,7 @@ def cleanup_stale_multipart_uploads(
     stale_generations: Mapping[int, Iterable[str]] | None = None,
     max_committed_step: int | None = None,
     active_generations: Mapping[int, Iterable[str]] | None = None,
+    protected_steps: Iterable[int] = (),
 ) -> tuple[AbortedUpload, ...]:
     """R16a：列举并中止超时或所属代际已失效的未完成分片上传（MPU）。"""
     if remote is None:
@@ -643,6 +654,7 @@ def cleanup_stale_multipart_uploads(
         int(s): {str(g) for g in gens if g}
         for s, gens in (active_generations or {}).items()
     }
+    protected = {int(s) for s in protected_steps}
     aborted: list[AbortedUpload] = []
     for upload in list_fn(""):
         reason: str | None = None
@@ -650,6 +662,8 @@ def cleanup_stale_multipart_uploads(
         if match:
             up_step = int(match.group(1))
             up_gen = match.group(2)
+            if up_step in protected:
+                continue
             if up_step in doomed_steps or (
                 max_committed_step is not None and up_step < max_committed_step
             ):
@@ -685,6 +699,7 @@ def collect(
     staging_dir: str | Path | None = None,
     abort_stale_mpu: bool = True,
     mpu_timeout_seconds: float = DEFAULT_MPU_TIMEOUT_SECONDS,
+    protected_steps: Iterable[int] = (),
 ) -> GcReport:
     """跑一次回收：一次 ``list`` + 一次目录扫描 + 按 :func:`plan` 的决策删除。
 
@@ -739,6 +754,7 @@ def collect(
         if status.committed is not None:
             versions.add(step)
             current[step] = status.committed.generation.id
+    protected = frozenset(int(s) for s in protected_steps)
     result = plan(
         versions=versions,
         rank_commits=layout.rank_commits,
@@ -750,6 +766,7 @@ def collect(
         pointer_generations=pointer,
         unknown_versions=unknown,
         keep_local=keep_local,
+        protected_steps=protected,
     )
 
     deleted: list[DeletedVersion] = []
@@ -817,6 +834,7 @@ def collect(
                     stale_generations=stale_gens,
                     max_committed_step=max(versions) if versions else None,
                     active_generations=active_gens,
+                    protected_steps=protected,
                 )
             except StorageError:
                 pass
@@ -864,6 +882,7 @@ def retain_remote_versions(
     keep: int = DEFAULT_KEEP_VERSIONS,
     dry_run: bool = False,
     run_id: str | None = None,
+    protected_steps: Iterable[int] = (),
 ) -> RetentionReport:
     """有界保留：一次 ``list``，只留最新 ``keep`` 代已提交版本，从最旧的一代开始删。
 
@@ -924,7 +943,9 @@ def retain_remote_versions(
         assert isinstance(status, StepStatus)
         if status.committed is not None:
             committed_versions.add(step)
-    doomed = plan_retention(versions=committed_versions, keep=keep)
+    protected = frozenset(int(s) for s in protected_steps)
+    raw_doomed = plan_retention(versions=committed_versions, keep=keep)
+    doomed = tuple(s for s in raw_doomed if s not in protected)
     kept = tuple(sorted(committed_versions - set(doomed)))
 
     deleted: list[DeletedVersion] = []
@@ -1020,6 +1041,9 @@ class GcWorker:
         staging_dir: str | Path | None = None,
         abort_stale_mpu: bool = True,
         mpu_timeout_seconds: float = DEFAULT_MPU_TIMEOUT_SECONDS,
+        protected_steps: Iterable[int] = (),
+        get_protected_steps: Callable[[], Iterable[int]] | None = None,
+        paused: bool = False,
     ) -> None:
         if interval <= 0:
             raise ValueError(f"interval must be > 0, got {interval}")
@@ -1038,12 +1062,58 @@ class GcWorker:
         self.last_error: str | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._protect_lock = threading.Lock()
+        self._static_protected: set[int] = {int(s) for s in protected_steps}
+        self._tagged_protected: dict[str, set[int]] = {}
+        self._get_protected_steps = get_protected_steps
+        self._paused = bool(paused)
 
-    # --- 生命周期 -----------------------------------------------------------
+    # --- 生命周期与动态保护集 -----------------------------------------------
     @property
     def running(self) -> bool:
         thread = self._thread
         return thread is not None and thread.is_alive()
+
+    @property
+    def paused(self) -> bool:
+        with self._protect_lock:
+            return self._paused
+
+    def pause(self) -> None:
+        with self._protect_lock:
+            self._paused = True
+
+    def resume(self) -> None:
+        with self._protect_lock:
+            self._paused = False
+
+    def protect(self, steps: Iterable[int], *, tag: str = "default") -> None:
+        """把 step 加入指定标签的保护集（落盘中 / 上传中 / 恢复读取中）。"""
+        with self._protect_lock:
+            bucket = self._tagged_protected.setdefault(tag, set())
+            for step in steps:
+                bucket.add(int(step))
+
+    def unprotect(self, steps: Iterable[int], *, tag: str = "default") -> None:
+        """从指定标签的保护集中移除 step（不误伤其他标签的保护）。"""
+        with self._protect_lock:
+            bucket = self._tagged_protected.get(tag)
+            if not bucket:
+                return
+            for step in steps:
+                bucket.discard(int(step))
+            if not bucket:
+                self._tagged_protected.pop(tag, None)
+
+    def current_protected_steps(self) -> frozenset[int]:
+        with self._protect_lock:
+            combined = set(self._static_protected)
+            for bucket in self._tagged_protected.values():
+                combined.update(bucket)
+            getter = self._get_protected_steps
+        if getter is not None:
+            combined.update(int(s) for s in getter())
+        return frozenset(combined)
 
     def run_once(self) -> GcReport:
         """跑一次回收（不启线程时也可以直接调）。"""
@@ -1057,6 +1127,7 @@ class GcWorker:
             staging_dir=self.staging_dir,
             abort_stale_mpu=self.abort_stale_mpu,
             mpu_timeout_seconds=self.mpu_timeout_seconds,
+            protected_steps=self.current_protected_steps(),
         )
         self.reports.append(report)
         del self.reports[: -self.history]
@@ -1087,10 +1158,11 @@ class GcWorker:
     # --- 内部 ---------------------------------------------------------------
     def _loop(self) -> None:
         while not self._stop.is_set():
-            try:
-                self.run_once()
-            except Exception as exc:  # 单次失败不能让线程退出
-                self.last_error = f"{type(exc).__name__}: {exc}"
+            if not self.paused:
+                try:
+                    self.run_once()
+                except Exception as exc:  # 单次失败不能让线程退出
+                    self.last_error = f"{type(exc).__name__}: {exc}"
             if self._stop.wait(self.interval):
                 return
 
@@ -1109,6 +1181,7 @@ __all__ = [
     "LOCAL",
     "NOT_UPLOADED",
     "NO_NEWER_VERSION",
+    "PROTECTED",
     "RECOVERY_COPY",
     "REMOTE",
     "REMOTE_READ_ONLY",

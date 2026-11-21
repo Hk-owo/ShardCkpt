@@ -131,6 +131,72 @@ class _InflightTask:
         return InflightStatus.UPLOADING
 
 
+def acquire_generation_for_step(
+    scoped_remote: StorageBackend,
+    step: int,
+    *,
+    ranks: Sequence[int],
+    writer: str | None = None,
+) -> Generation:
+    """在远端为指定 ``step`` 执行端点条件写探针并 CAS 抢占新代际（可被存储侧复用）。"""
+    ensure = getattr(scoped_remote, "ensure_conditional_writes", None)
+    if callable(ensure):
+        ensure()
+    return acquire_generation(
+        scoped_remote, step, ranks=ranks, writer=writer or new_writer()
+    )
+
+
+def wait_and_finalize_generation(
+    scoped_remote: StorageBackend,
+    *,
+    step: int,
+    generation: Generation,
+    ranks: Sequence[int],
+    layout: Mapping[str, int] | None = None,
+    keep_versions: int | None = DEFAULT_KEEP_VERSIONS,
+    cancel_event: threading.Event | None = None,
+    timeout: float = 300.0,
+    poll_interval: float = 0.02,
+    deadline: float | None = None,
+) -> UploadCommit | None:
+    """主节点等待所有 rank 的 L2（``.metadata`` + ``rank_r/COMMIT``）齐备后原子落 L3。
+
+    若 ``cancel_event`` 在等待期间置位则返回 ``None``；超时则抛 ``TimeoutError``。
+    """
+    prefix = generation_prefix(step, generation)
+    expected_keys = {
+        key
+        for rank in ranks
+        for key in (
+            index_key(step, rank, generation),
+            rank_commit_key(step, rank, generation),
+        )
+    }
+    end_at = deadline if deadline is not None else (time.monotonic() + timeout)
+    while True:
+        if cancel_event is not None and cancel_event.is_set():
+            return None
+        keys = set(scoped_remote.list(prefix))
+        if expected_keys.issubset(keys):
+            return finalize_upload(
+                scoped_remote,
+                step,
+                ranks=ranks,
+                generation=generation,
+                layout=layout,
+                keep=keep_versions,
+            )
+        if time.monotonic() >= end_at:
+            raise TimeoutError(
+                f"step {step} ({generation.id}): 等待全 rank L2 齐备超时"
+            )
+        if cancel_event is not None:
+            cancel_event.wait(poll_interval)
+        else:
+            time.sleep(poll_interval)
+
+
 class CommitCoordinator:
     """嵌入式提交协调监控模块：串联开代、在途监控、异常全员作废与收尾收敛。"""
 
@@ -522,8 +588,8 @@ class CommitCoordinator:
             if callable(ensure):
                 ensure()
             if self.comm_rank == 0:
-                mine = acquire_generation(
-                    self.scoped_remote, step, ranks=self.ranks, writer=new_writer()
+                mine = acquire_generation_for_step(
+                    self.scoped_remote, step, ranks=self.ranks
                 )
                 seq, token = mine.seq, int(mine.writer, 16)
             else:
@@ -571,36 +637,20 @@ class CommitCoordinator:
     def _wait_and_finalize_rank0(self, task: _InflightTask) -> UploadCommit | None:
         """rank 0 后台见所有 rank 分片提交点齐备即直接写远端总提交点，不等训练线程。"""
         assert self.scoped_remote is not None
-        prefix = generation_prefix(task.step, task.generation)
-        expected_keys = {
-            key
-            for rank in task.ranks
-            for key in (
-                index_key(task.step, rank, task.generation),
-                rank_commit_key(task.step, rank, task.generation),
-            )
-        }
-        deadline = task.started_at + self.upload_timeout
-        while True:
-            if task.cancel_event.is_set():
-                return None
-            keys = set(self.scoped_remote.list(prefix))
-            if expected_keys.issubset(keys):
-                commit = finalize_upload(
-                    self.scoped_remote,
-                    task.step,
-                    ranks=task.ranks,
-                    generation=task.generation,
-                    layout=task.layout,
-                    keep=self.keep_versions,
-                )
-                task.committed_remote = True
-                return commit
-            if time.monotonic() >= deadline:
-                raise TimeoutError(
-                    f"step {task.step} ({task.generation.id}): 等待全 rank L2 齐备超时"
-                )
-            task.cancel_event.wait(self.poll_interval)
+        commit = wait_and_finalize_generation(
+            self.scoped_remote,
+            step=task.step,
+            generation=task.generation,
+            ranks=task.ranks,
+            layout=task.layout,
+            keep_versions=self.keep_versions,
+            cancel_event=task.cancel_event,
+            poll_interval=self.poll_interval,
+            deadline=task.started_at + self.upload_timeout,
+        )
+        if commit is not None:
+            task.committed_remote = True
+        return commit
 
     # --- C4.2：退出等待点与末尾收敛 ----------------------------------------
 
@@ -706,4 +756,6 @@ __all__ = [
     "CoordinatedSaveResult",
     "InflightStatus",
     "InvalidatedGeneration",
+    "acquire_generation_for_step",
+    "wait_and_finalize_generation",
 ]

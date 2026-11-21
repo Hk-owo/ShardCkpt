@@ -128,6 +128,10 @@ class CopyHandle(Generic[T]):
     def exception(self) -> BaseException | None:
         return self._future.exception()
 
+    def add_done_callback(self, fn: Callable[["CopyHandle[T]"], Any]) -> None:
+        """拷贝完成（成功或失败）后触发回调，入参为本 ``CopyHandle``。"""
+        self._future.add_done_callback(lambda _fut: fn(self))
+
 
 class D2HStream:
     """独立拷贝 stream：提交即返回，``max_inflight`` 限流，``synchronize`` 全部等完。

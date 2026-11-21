@@ -87,6 +87,29 @@ from planner.save_plan import (
     build_save_plan,
     plan_ranks,
 )
+from saver.client import (
+    AsyncSaver,
+    SaveHandle,
+    SaveResult,
+    close_saver,
+    save_async,
+    start_saver,
+)
+from saver.comm import (
+    CommError,
+    NodeComm,
+    NodeCommClient,
+    NodeCommProcess,
+    NodeCommServer,
+    NodeTreeConfig,
+    make_tree_configs,
+)
+from saver.config import CommEndpoint, SaverConfig, SaverDeadError, SaverFaults
+from saver.persist import (
+    build_index as _build_index,
+    clear_padding as _clear_padding,
+    persist_host_buffer,
+)
 from storage.base import run_scope, validate_run_id
 from storage.local import DEFAULT_ALIGNMENT, LocalStorage
 from core import (
@@ -215,11 +238,6 @@ def _resolve_version_root(root: Path) -> tuple[Path, int | None]:
         raise FormatError(f"{root}: cannot parse step number from {name!r}") from None
 
 
-def save_async(state_dict: Any, path: str | Path, **options: Any) -> Any:
-    """异步保存入口：后台进程 + 上传队列还没做，现在请用 :func:`save_local`。"""
-    raise NotImplementedError("save_async is not implemented yet; use save_local()")
-
-
 # --- 本地层的写闭环 ---------------------------------------------------------
 
 
@@ -263,62 +281,10 @@ def _sources_from_tensors(tensors: Mapping[str, Tensor]) -> list[ShardSource]:
     return sources
 
 
-def _as_view(buffer: Any) -> memoryview:
-    view = getattr(buffer, "view", None)
-    return view if isinstance(view, memoryview) else memoryview(buffer)
-
-
 def _pool_reuses(pool: Any) -> int | None:
     """池的累计复用次数；自定义池没有 ``stats.reuses`` 时返回 ``None``。"""
     reuses = getattr(getattr(pool, "stats", None), "reuses", None)
     return reuses if isinstance(reuses, int) else None
-
-
-def _build_index(
-    plan: SavePlan,
-    *,
-    buffer: Any,
-    step: int,
-    layout: Mapping[str, int] | None,
-    crc_chunk_max: int,
-) -> CheckpointIndex:
-    """从「已经躺在 buffer 里的字节」直接生成索引。
-
-    ``buffer``（对齐后的 pinned 块）里每个分片/小状态按 ``crc_chunk_max`` 切块，
-    每块算一次 CRC-32C 写进索引：这是本地读路径做字节级自证（``verify_crc=True``）
-    的依据。算的是 ``[byte_offset, end)`` 这段**有效字节**，不含对齐补齐（详见
-    :mod:`storage.local_load`）。
-    """
-    grouped: dict[str, list[ShardMeta]] = {}
-    shapes: dict[str, tuple[tuple[int, ...], str]] = {}
-    for item in plan.items:
-        chunk_bytes, chunks = crc32c_chunks(
-            buffer[item.byte_offset : item.end],
-            itemsize=numpy_dtype(item.dtype).itemsize,
-            max_bytes=crc_chunk_max,
-        )
-        grouped.setdefault(item.fqn, []).append(
-            item.to_shard_meta(crc_chunk_bytes=chunk_bytes, crc32c_chunks=chunks)
-        )
-        shapes[item.fqn] = (item.global_shape, item.dtype)
-
-    tensors = {
-        fqn: TensorMeta(
-            global_shape=shapes[fqn][0], dtype=shapes[fqn][1], shards=tuple(shards)
-        )
-        for fqn, shards in grouped.items()
-    }
-    blobs: dict[str, BlobMeta] = {}
-    for blob in plan.blobs:
-        chunk_bytes, chunks = crc32c_chunks(
-            buffer[blob.byte_offset : blob.end], max_bytes=crc_chunk_max
-        )
-        blobs[blob.name] = blob.to_blob_meta(
-            crc_chunk_bytes=chunk_bytes, crc32c_chunks=chunks
-        )
-    return CheckpointIndex(
-        tensors=tensors, blobs=blobs, step=step, saved_layout=dict(layout or {})
-    )
 
 
 def _require_object_collective(collective: Any, *, rank: int) -> None:
@@ -398,19 +364,6 @@ def _plan_via_rank0(
     return plan
 
 
-def _clear_padding(plan: SavePlan, view: memoryview, end: int) -> None:
-    """对齐缓冲区没初始化，必须把「不属于任何项」的字节清零，否则写盘内容不确定。"""
-    spans = [(item.byte_offset, item.end) for item in plan.items]
-    spans += [(blob.byte_offset, blob.end) for blob in plan.blobs]
-    cursor = 0
-    for start, stop in sorted(spans):
-        if start > cursor:
-            view[cursor:start] = b"\x00" * (start - cursor)
-        cursor = max(cursor, stop)
-    if cursor < end:
-        view[cursor:end] = b"\x00" * (end - cursor)
-
-
 def prepare_save_plan(
     tensors: Mapping[str, Tensor],
     *,
@@ -473,7 +426,6 @@ def persist_snapshot(
     reuses_before: int | None = None,
 ) -> SaveReport:
     """拿已触发的 ``Snapshot`` 完成 D2H → 数据落盘 → ``.metadata`` → 代际标记 → ``COMMIT``。"""
-    blob_payloads = dict(blobs or {})
     reuses_after = _pool_reuses(pool)
     pool_reused = (
         None
@@ -482,16 +434,9 @@ def persist_snapshot(
     )
 
     scoped_root = local_run_root(root, run_id)
-    storage = LocalStorage(
-        scoped_root, direct_io=direct_io, alignment=alignment, engine=engine
-    )
-    key = version_key(step)
-    gen_id: str | None = None
-    if generation is not None:
-        gen_id = generation.id if isinstance(generation, Generation) else str(generation)
 
     try:
-        d2h_bytes = 0
+        tensor_bytes = 0
         for item in plan.items:
             tensor = tensors.get(item.fqn)
             if tensor is None:
@@ -501,58 +446,28 @@ def persist_snapshot(
                     f"{item.fqn}: 本地张量 {tensor.nbytes} 字节与计划里的 "
                     f"{item.length} 不一致"
                 )
-            d2h_bytes += tensor.copy_to(snapshot.buffer, offset=item.byte_offset)
+            tensor_bytes += tensor.copy_to(snapshot.buffer, offset=item.byte_offset)
 
-        view = _as_view(snapshot.buffer)
-        for blob in plan.blobs:
-            payload = blob_payloads.get(blob.name)
-            if payload is None:
-                raise PlanError(f"{blob.name}: 缺少小状态字节")
-            if len(payload) != blob.length:
-                raise PlanError(
-                    f"{blob.name}: {len(payload)} 字节与计划里的 {blob.length} 不一致"
-                )
-            view[blob.byte_offset : blob.end] = payload
-            d2h_bytes += len(payload)
-
-        _clear_padding(plan, view, aligned_size)
-        snapshot.d2h_done()  # host 数据从这一刻起不可变
-
-        index = _build_index(
-            plan,
-            buffer=snapshot.buffer.view,
+        host_result = persist_host_buffer(
+            snapshot.buffer,
+            root,
             step=step,
+            plan=plan,
+            aligned_size=aligned_size,
+            blobs=blobs,
             layout=layout,
+            alignment=alignment,
+            engine=engine,
+            direct_io=direct_io,
             crc_chunk_max=crc_chunk_max,
+            generation=generation,
+            run_id=run_id,
+            on_d2h_done=snapshot.d2h_done,
+            on_persist_ok=snapshot.persist_ok,
+            on_commit_ok=snapshot.commit_ok,
+            write_metadata_fn=write_metadata,
+            write_commit_fn=write_commit,
         )
-        index.validate(complete=False)
-
-        files: dict[str, int] = {}
-        if aligned_size:
-            storage.write_view(f"{key}/{plan.file}", view[:aligned_size])
-            file_size = storage.path_for(f"{key}/{plan.file}").stat().st_size
-            if file_size != aligned_size:
-                raise PlanError(
-                    f"{key}/{plan.file}: 写入 {file_size} 字节，期望 {aligned_size}"
-                )
-            files[plan.file] = file_size
-
-        metadata = write_metadata(storage, step, index)
-        snapshot.persist_ok()  # 本 rank 的数据已落地
-
-        # R6/C2：同代落盘时同步写入本地代际标记；未指定代际的重存清理旧代际标记
-        if gen_id is not None:
-            write_local_generation(storage, step, gen_id, run_id=run_id)
-        else:
-            delete_local_generation(storage, step)
-
-        record = CommitRecord.of_metadata(
-            step=step,
-            metadata=metadata,
-            files=files,
-        )
-        write_commit(storage, record)
-        snapshot.commit_ok()
     except BaseException as exc:
         snapshot.fail(f"{type(exc).__name__}: {exc}")
         if snapshot.state is SnapshotState.ABORTED:
@@ -565,15 +480,15 @@ def persist_snapshot(
 
     return SaveReport(
         step=step,
-        key=key,
-        file=plan.file,
-        size=aligned_size,
-        data_bytes=plan.data_bytes,
-        engine=storage.engine,
-        index=index,
-        commit=record,
+        key=host_result.key,
+        file=host_result.file,
+        size=host_result.size,
+        data_bytes=host_result.data_bytes,
+        engine=host_result.engine,
+        index=host_result.index,
+        commit=host_result.commit,
         state=snapshot.state,
-        d2h_bytes=d2h_bytes,
+        d2h_bytes=tensor_bytes + host_result.blob_bytes,
         pool_reused=pool_reused,
     )
 
@@ -999,12 +914,15 @@ def gc_local(
 
 
 __all__ = [
+    "AsyncSaver",
     "AbortedUpload",
     "CPU",
     "BackendStats",
     "CheckpointData",
     "CheckpointError",
     "ChecksumError",
+    "CommEndpoint",
+    "CommError",
     "CommitCoordinator",
     "CoordinatedSaveResult",
     "CpuBackend",
@@ -1026,9 +944,19 @@ __all__ = [
     "LocalCopyCheck",
     "MissingTensorError",
     "MockCudaBackend",
+    "NodeComm",
+    "NodeCommClient",
+    "NodeCommProcess",
+    "NodeCommServer",
+    "NodeTreeConfig",
     "PinnedBufferPool",
     "RetentionReport",
+    "SaveHandle",
     "SaveReport",
+    "SaveResult",
+    "SaverConfig",
+    "SaverDeadError",
+    "SaverFaults",
     "SnapshotManager",
     "SnapshotState",
     "Tensor",
@@ -1041,11 +969,13 @@ __all__ = [
     "cleanup_stale_multipart_uploads",
     "cleanup_stale_staging_dirs",
     "close_default_pool",
+    "close_saver",
     "configure_default_pool",
     "cuda",
     "default_pool",
     "gc_local",
     "get_backend",
+    "make_tree_configs",
     "new_run_id",
     "next_run_id",
     "ObjectLoadReport",
@@ -1067,5 +997,6 @@ __all__ = [
     "run_scope",
     "save_async",
     "save_local",
+    "start_saver",
     "upload_local",
 ]

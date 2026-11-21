@@ -35,6 +35,7 @@ import signal
 import sys
 import tempfile
 import zlib
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -54,6 +55,8 @@ from core import FormatError, PlanError  # noqa: E402
 from core.metadata import Device, numpy_dtype  # noqa: E402
 from core.region import split  # noqa: E402
 from planner.save_plan import ShardSource  # noqa: E402
+from saver.comm import NodeComm, ROLE_TRAINER  # noqa: E402
+from saver.config import SaverConfig  # noqa: E402
 from storage.object import S3Config, S3Storage  # noqa: E402
 from storage.upload import committed_remote_steps  # noqa: E402
 
@@ -598,6 +601,69 @@ def phase_gc(sc: Scenario) -> None:
         storage.close()
 
 
+def phase_async(sc: Scenario) -> None:
+    """附加演示：AsyncSaver（memfd + 存储子进程）+ NodeComm 树形审计 + 后台上传收敛。"""
+    async_step = STEPS[-1] + 3
+    async_state = evolve(sc.states[STEPS[-1]], async_step)
+    s3_cfg = S3Config(**sc.s3)
+    run_id = "run_async_e2e"
+    print(f"\n[async] 异步保存演示：AsyncSaver + NodeComm（step {async_step}，run_id={run_id}）")
+
+    with NodeComm(world_size=sc.ranks, base_dir=sc.workdir / "comm") as comm:
+        savers = [
+            ckpt.AsyncSaver(
+                SaverConfig(
+                    local_root=sc.workdir / f"async_rank_{rank}",
+                    remote_config=s3_cfg,
+                    run_id=run_id,
+                    rank=rank,
+                    ranks=tuple(range(sc.ranks)),
+                    max_inflight=2,
+                    shutdown_timeout=20.0,
+                ),
+                comm=comm.client(rank, role=ROLE_TRAINER),
+                world_size=sc.ranks,
+            )
+            for rank in range(sc.ranks)
+        ]
+
+        def run_rank(rank: int) -> None:
+            saver = savers[rank]
+            try:
+                pieces = shard_arrays(async_state, rank=rank, tp=sc.tp)
+                tensors = {
+                    name: to_device(piece, name=name, dtype=DTYPES[name], device=sc.device)
+                    for name, piece in pieces.items()
+                }
+                handle = saver.save(
+                    tensors,
+                    step=async_step,
+                    blobs=blobs_for_rank(rank),
+                    layout={"tp": sc.tp, "world_size": sc.ranks},
+                    sources=sources_for_rank(async_state, rank=rank, tp=sc.tp),
+                    planner="gathered",
+                )
+                assert handle.wait(timeout=15.0) is not None
+            finally:
+                saver.close(timeout=20.0)
+
+        with ThreadPoolExecutor(max_workers=sc.ranks) as pool:
+            for fut in [pool.submit(run_rank, r) for r in range(sc.ranks)]:
+                fut.result(timeout=30.0)
+
+    storage = sc.storage()
+    try:
+        restored = ckpt.load_object(storage, step=async_step, device=sc.device, run_id=run_id)
+        assert_same_state(
+            {k: v.numpy() for k, v in restored.tensors.items()},
+            async_state,
+            what=f"异步保存 S3 step {async_step}",
+        )
+        print(f"    step {async_step} 异步落盘 + 后台上传 + 远端恢复逐字节一致")
+    finally:
+        storage.close()
+
+
 # --- 入口 -------------------------------------------------------------------
 
 
@@ -643,6 +709,7 @@ def run(*, ranks: int, tp: int | None, workdir: Path | None, keep: bool, s3: dic
             print(f"\n    · 训练继续：step {CRASH_STEP} 崩溃后由下一轮 step {STEPS[-1]} 补上")
             phase_save(sc, STEPS[-1])
             phase_gc(sc)
+            phase_async(sc)
         except BaseException:
             # 失败时把工作目录留下来，方便看残缺目录 / 提交点
             print(f"\n失败：工作目录保留在 {workdir}")
